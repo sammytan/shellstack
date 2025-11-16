@@ -519,37 +519,82 @@ setup_geoip_updates() {
 
         # 安装 Go 语言环境
         log "安装 Go 语言环境..."
+        INSTALL_GO_FROM_SOURCE=0
+        
         if ! command -v go >/dev/null 2>&1; then
           # 尝试通过包管理器安装
+          log "通过包管理器安装 Go..."
           apt-get install -y golang || {
             # 如果包管理器安装失败，从源码安装
             log "通过包管理器安装 Go 失败，尝试从源码安装..."
-            wget "https://go.dev/dl/go1.21.0.linux-amd64.tar.gz"
-            rm -rf /usr/local/go && tar -C /usr/local -xzf go1.21.0.linux-amd64.tar.gz
-            ln -sf /usr/local/go/bin/go /usr/bin/go
-            ln -sf /usr/local/go/bin/gofmt /usr/bin/gofmt
+            INSTALL_GO_FROM_SOURCE=1
           }
-        else
-          # 检查当前 Go 版本
-          CURRENT_GO_VERSION=$(go version | awk '{print $3}' | sed 's/go//')
+        fi
+        
+        # 检查当前 Go 版本（无论从哪个分支安装的）
+        if command -v go >/dev/null 2>&1; then
+          CURRENT_GO_VERSION=$(go version 2>/dev/null | awk '{print $3}' | sed 's/go//' || echo "0.0")
           REQUIRED_GO_VERSION="1.19"
-          if [ "$(printf '%s\n' "$REQUIRED_GO_VERSION" "$CURRENT_GO_VERSION" | sort -V | head -n1)" != "$REQUIRED_GO_VERSION" ]; then
-            log "当前 Go 版本 ($CURRENT_GO_VERSION) 不兼容，需要 Go 1.19+，安装 Go 1.21.0..."
-            wget "https://go.dev/dl/go1.21.0.linux-amd64.tar.gz"
-            rm -rf /usr/local/go && tar -C /usr/local -xzf go1.21.0.linux-amd64.tar.gz
-            ln -sf /usr/local/go/bin/go /usr/bin/go
-            ln -sf /usr/local/go/bin/gofmt /usr/bin/gofmt
+          
+          # 比较版本
+          if [ -z "$CURRENT_GO_VERSION" ] || [ "$(printf '%s\n' "$REQUIRED_GO_VERSION" "$CURRENT_GO_VERSION" | sort -V | head -n1)" != "$REQUIRED_GO_VERSION" ]; then
+            log "当前 Go 版本 ($CURRENT_GO_VERSION) 不兼容，需要 Go 1.19+，从源码安装 Go 1.21.0..."
+            INSTALL_GO_FROM_SOURCE=1
+          else
+            log "当前 Go 版本 ($CURRENT_GO_VERSION) 满足要求"
           fi
         fi
+        
+        # 如果需要从源码安装 Go
+        if [ "$INSTALL_GO_FROM_SOURCE" = "1" ]; then
+          log "从源码安装 Go 1.21.0..."
+          cd /tmp
+          rm -f go1.21.0.linux-amd64.tar.gz
+          wget "https://go.dev/dl/go1.21.0.linux-amd64.tar.gz" || error "下载 Go 1.21.0 失败"
+          
+          # 移除旧版本的 Go（如果存在）
+          rm -rf /usr/local/go
+          # 移除包管理器安装的 go（如果存在）
+          rm -f /usr/bin/go /usr/bin/gofmt /usr/local/bin/go /usr/local/bin/gofmt
+          
+          # 安装新版本
+          tar -C /usr/local -xzf go1.21.0.linux-amd64.tar.gz
+          
+          # 创建符号链接，确保优先使用新版本
+          ln -sf /usr/local/go/bin/go /usr/local/bin/go
+          ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+          ln -sf /usr/local/go/bin/go /usr/bin/go || true
+          ln -sf /usr/local/go/bin/gofmt /usr/bin/gofmt || true
+          
+          rm -f go1.21.0.linux-amd64.tar.gz
+          cd "$BUILD_DIR"
+        fi
 
-        # 验证 Go 安装
+        # 验证 Go 安装并确认版本
         if ! command -v go >/dev/null 2>&1; then
           error "Go 语言环境安装失败"
+        fi
+        
+        # 确保使用正确的 Go 版本（优先使用 /usr/local/go/bin）
+        export PATH="/usr/local/go/bin:/usr/local/bin:$PATH"
+        
+        # 再次验证版本
+        FINAL_GO_VERSION=$(go version 2>/dev/null | awk '{print $3}' | sed 's/go//' || echo "unknown")
+        log "确认 Go 版本: $FINAL_GO_VERSION"
+        
+        if [ "$FINAL_GO_VERSION" = "unknown" ] || [ -z "$FINAL_GO_VERSION" ]; then
+          error "无法获取 Go 版本信息"
+        fi
+        
+        # 验证版本是否满足要求
+        REQUIRED_GO_VERSION="1.19"
+        if [ "$(printf '%s\n' "$REQUIRED_GO_VERSION" "$FINAL_GO_VERSION" | sort -V | head -n1)" != "$REQUIRED_GO_VERSION" ]; then
+          error "Go 版本 ($FINAL_GO_VERSION) 仍然不满足要求 (需要 1.19+)"
         fi
 
         # 设置 Go 环境变量
         export GOPATH="$HOME/go"
-        export PATH="$PATH:/usr/local/go/bin:$GOPATH/bin"
+        export PATH="/usr/local/go/bin:$GOPATH/bin:$PATH"
         export GO111MODULE=on
         export GOPROXY=direct
 
@@ -560,6 +605,21 @@ setup_geoip_updates() {
 
         tar xzf "v${GEOIPUPDATE_VERSION}.tar.gz"
         cd "geoipupdate-${GEOIPUPDATE_VERSION}"
+
+        # 在构建前再次验证 Go 版本
+        log "构建前验证 Go 版本..."
+        export PATH="/usr/local/go/bin:/usr/local/bin:$PATH"
+        BUILD_GO_VERSION=$(go version 2>/dev/null | awk '{print $3}' | sed 's/go//' || echo "unknown")
+        log "构建使用的 Go 版本: $BUILD_GO_VERSION"
+        
+        if [ "$BUILD_GO_VERSION" = "unknown" ] || [ -z "$BUILD_GO_VERSION" ]; then
+          error "无法获取 Go 版本信息，无法继续构建"
+        fi
+        
+        REQUIRED_GO_VERSION="1.19"
+        if [ "$(printf '%s\n' "$REQUIRED_GO_VERSION" "$BUILD_GO_VERSION" | sort -V | head -n1)" != "$REQUIRED_GO_VERSION" ]; then
+          error "Go 版本 ($BUILD_GO_VERSION) 不满足要求 (需要 1.19+)，无法构建 geoipupdate"
+        fi
 
         # 清理 Go 模块缓存
         go clean -modcache
@@ -616,32 +676,90 @@ setup_geoip_updates() {
 
         # 安装 Go 语言环境
         log "安装 Go 语言环境..."
-        if command -v dnf >/dev/null 2>&1; then
-          dnf install -y golang pandoc || {
-            log "通过包管理器安装 Go 失败，尝试从源码安装..."
-            wget "https://go.dev/dl/go1.21.0.linux-amd64.tar.gz"
-            rm -rf /usr/local/go && tar -C /usr/local -xzf go1.21.0.linux-amd64.tar.gz
-            ln -sf /usr/local/go/bin/go /usr/bin/go
-            ln -sf /usr/local/go/bin/gofmt /usr/bin/gofmt
-          }
-        else
-          yum install -y golang pandoc || {
-            log "通过包管理器安装 Go 失败，尝试从源码安装..."
-            wget "https://go.dev/dl/go1.21.0.linux-amd64.tar.gz"
-            rm -rf /usr/local/go && tar -C /usr/local -xzf go1.21.0.linux-amd64.tar.gz
-            ln -sf /usr/local/go/bin/go /usr/bin/go
-            ln -sf /usr/local/go/bin/gofmt /usr/bin/gofmt
-          }
+        INSTALL_GO_FROM_SOURCE=0
+        
+        if ! command -v go >/dev/null 2>&1; then
+          # 尝试通过包管理器安装
+          log "通过包管理器安装 Go..."
+          if command -v dnf >/dev/null 2>&1; then
+            dnf install -y golang pandoc || {
+              log "通过包管理器安装 Go 失败，尝试从源码安装..."
+              INSTALL_GO_FROM_SOURCE=1
+            }
+          else
+            yum install -y golang pandoc || {
+              log "通过包管理器安装 Go 失败，尝试从源码安装..."
+              INSTALL_GO_FROM_SOURCE=1
+            }
+          fi
+        fi
+        
+        # 检查当前 Go 版本（无论从哪个分支安装的）
+        if command -v go >/dev/null 2>&1; then
+          CURRENT_GO_VERSION=$(go version 2>/dev/null | awk '{print $3}' | sed 's/go//' || echo "0.0")
+          REQUIRED_GO_VERSION="1.19"
+          
+          # 比较版本
+          if [ -z "$CURRENT_GO_VERSION" ] || [ "$(printf '%s\n' "$REQUIRED_GO_VERSION" "$CURRENT_GO_VERSION" | sort -V | head -n1)" != "$REQUIRED_GO_VERSION" ]; then
+            log "当前 Go 版本 ($CURRENT_GO_VERSION) 不兼容，需要 Go 1.19+，从源码安装 Go 1.21.0..."
+            INSTALL_GO_FROM_SOURCE=1
+          else
+            log "当前 Go 版本 ($CURRENT_GO_VERSION) 满足要求"
+          fi
+        fi
+        
+        # 如果需要从源码安装 Go
+        if [ "$INSTALL_GO_FROM_SOURCE" = "1" ]; then
+          log "从源码安装 Go 1.21.0..."
+          cd /tmp
+          rm -f go1.21.0.linux-amd64.tar.gz
+          wget "https://go.dev/dl/go1.21.0.linux-amd64.tar.gz" || error "下载 Go 1.21.0 失败"
+          
+          # 移除旧版本的 Go（如果存在）
+          rm -rf /usr/local/go
+          # 移除包管理器安装的 go（如果存在）
+          rm -f /usr/bin/go /usr/bin/gofmt /usr/local/bin/go /usr/local/bin/gofmt
+          
+          # 安装新版本
+          tar -C /usr/local -xzf go1.21.0.linux-amd64.tar.gz
+          
+          # 创建符号链接，确保优先使用新版本
+          ln -sf /usr/local/go/bin/go /usr/local/bin/go
+          ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+          ln -sf /usr/local/go/bin/go /usr/bin/go || true
+          ln -sf /usr/local/go/bin/gofmt /usr/bin/gofmt || true
+          
+          rm -f go1.21.0.linux-amd64.tar.gz
+          cd "$BUILD_DIR"
         fi
 
-        # 验证 Go 安装
+        # 验证 Go 安装并确认版本
         if ! command -v go >/dev/null 2>&1; then
           error "Go 语言环境安装失败"
+        fi
+        
+        # 确保使用正确的 Go 版本（优先使用 /usr/local/go/bin）
+        export PATH="/usr/local/go/bin:/usr/local/bin:$PATH"
+        
+        # 再次验证版本
+        FINAL_GO_VERSION=$(go version 2>/dev/null | awk '{print $3}' | sed 's/go//' || echo "unknown")
+        log "确认 Go 版本: $FINAL_GO_VERSION"
+        
+        if [ "$FINAL_GO_VERSION" = "unknown" ] || [ -z "$FINAL_GO_VERSION" ]; then
+          error "无法获取 Go 版本信息"
+        fi
+        
+        # 验证版本是否满足要求
+        REQUIRED_GO_VERSION="1.19"
+        if [ "$(printf '%s\n' "$REQUIRED_GO_VERSION" "$FINAL_GO_VERSION" | sort -V | head -n1)" != "$REQUIRED_GO_VERSION" ]; then
+          error "Go 版本 ($FINAL_GO_VERSION) 仍然不满足要求 (需要 1.19+)"
         fi
 
         # 设置 Go 环境变量
         export GOPATH="$HOME/go"
-        export PATH="$PATH:/usr/local/go/bin:$GOPATH/bin"
+        export PATH="/usr/local/go/bin:$GOPATH/bin:$PATH"
+        export GO111MODULE=on
+        export GOPROXY=direct
 
         # 下载源码包
         if ! wget "https://github.com/maxmind/geoipupdate/archive/refs/tags/v${GEOIPUPDATE_VERSION}.tar.gz"; then
@@ -650,6 +768,21 @@ setup_geoip_updates() {
 
         tar xzf "v${GEOIPUPDATE_VERSION}.tar.gz"
         cd "geoipupdate-${GEOIPUPDATE_VERSION}"
+
+        # 在构建前再次验证 Go 版本
+        log "构建前验证 Go 版本..."
+        export PATH="/usr/local/go/bin:/usr/local/bin:$PATH"
+        BUILD_GO_VERSION=$(go version 2>/dev/null | awk '{print $3}' | sed 's/go//' || echo "unknown")
+        log "构建使用的 Go 版本: $BUILD_GO_VERSION"
+        
+        if [ "$BUILD_GO_VERSION" = "unknown" ] || [ -z "$BUILD_GO_VERSION" ]; then
+          error "无法获取 Go 版本信息，无法继续构建"
+        fi
+        
+        REQUIRED_GO_VERSION="1.19"
+        if [ "$(printf '%s\n' "$REQUIRED_GO_VERSION" "$BUILD_GO_VERSION" | sort -V | head -n1)" != "$REQUIRED_GO_VERSION" ]; then
+          error "Go 版本 ($BUILD_GO_VERSION) 不满足要求 (需要 1.19+)，无法构建 geoipupdate"
+        fi
 
         # 清理 Go 模块缓存
         go clean -modcache
@@ -1080,13 +1213,6 @@ install_basic_tools() {
   # 检测系统类型
   if [ -f /etc/debian_version ]; then
     log "检测到 Debian/Ubuntu 系统"
-    
-    # 修复可能的 dpkg 中断问题
-    log "检查并修复 dpkg 状态..."
-    if ! dpkg --configure -a 2>&1 | tee -a "$LOG_FILE"; then
-      warn "dpkg --configure -a 执行时出现警告，继续尝试..."
-    fi
-    
     apt-get update
     apt-get install -y build-essential wget tar gzip git gcc g++
     # 检查 gcc 版本
