@@ -6,27 +6,86 @@
 # =====================================================================
 
 # 获取脚本目录（robust 方法，处理当前目录无效的情况）
-# 使用 readlink -f 或 realpath 来获取绝对路径，避免依赖 cd/pwd
-if command -v realpath >/dev/null 2>&1; then
-  SCRIPT_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}" 2>/dev/null)")"
-elif command -v readlink >/dev/null 2>&1; then
-  SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null)")"
-else
-  # 回退方法：使用 cd，但先保存当前目录状态
-  SCRIPT_PATH="${BASH_SOURCE[0]}"
-  if [[ "$SCRIPT_PATH" == /* ]]; then
-    # 已经是绝对路径
-    SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
-  else
-    # 相对路径，尝试解析
-    # 使用 subshell 避免影响当前 shell 的工作目录
-    SCRIPT_DIR="$( (cd "$(dirname "$SCRIPT_PATH")" 2>/dev/null && pwd) || dirname "$SCRIPT_PATH" )"
+# 使用多种方法尝试获取脚本的绝对路径
+_get_script_dir() {
+  local script_path="${BASH_SOURCE[0]}"
+  
+  # 方法1: 如果已经是绝对路径
+  if [[ "$script_path" == /* ]]; then
+    echo "$(dirname "$script_path")"
+    return 0
   fi
-fi
+  
+  # 方法2: 使用 realpath
+  if command -v realpath >/dev/null 2>&1; then
+    local resolved="$(realpath "$script_path" 2>/dev/null)"
+    if [[ -n "$resolved" ]] && [[ "$resolved" == /* ]]; then
+      echo "$(dirname "$resolved")"
+      return 0
+    fi
+  fi
+  
+  # 方法3: 使用 readlink -f
+  if command -v readlink >/dev/null 2>&1; then
+    local resolved="$(readlink -f "$script_path" 2>/dev/null)"
+    if [[ -n "$resolved" ]] && [[ "$resolved" == /* ]]; then
+      echo "$(dirname "$resolved")"
+      return 0
+    fi
+  fi
+  
+  # 方法4: Linux 特有 - 使用 /proc/self/fd/ (当当前目录无效时很有用)
+  if [[ -L /proc/self/fd/255 ]] 2>/dev/null; then
+    local resolved="$(readlink /proc/self/fd/255 2>/dev/null)"
+    if [[ -n "$resolved" ]] && [[ "$resolved" == /* ]]; then
+      echo "$(dirname "$resolved")"
+      return 0
+    fi
+  fi
+  
+  # 方法5: 尝试通过 $0 获取（如果通过绝对路径调用）
+  if [[ "$0" == /* ]]; then
+    echo "$(dirname "$0")"
+    return 0
+  fi
+  
+  # 方法6: 尝试使用 cd（在 subshell 中，避免影响当前 shell）
+  local dir_part="$(dirname "$script_path")"
+  if [[ "$dir_part" != "." ]] && [[ "$dir_part" != "$script_path" ]]; then
+    local resolved="$( (cd "$dir_part" 2>/dev/null && pwd) 2>/dev/null )"
+    if [[ -n "$resolved" ]] && [[ "$resolved" == /* ]]; then
+      echo "$resolved"
+      return 0
+    fi
+  fi
+  
+  # 方法7: 如果 script_path 是相对路径，尝试从 PATH 查找
+  if command -v "$script_path" >/dev/null 2>&1; then
+    local full_path="$(command -v "$script_path")"
+    if [[ -n "$full_path" ]] && [[ "$full_path" == /* ]]; then
+      echo "$(dirname "$full_path")"
+      return 0
+    fi
+  fi
+  
+  # 如果所有方法都失败，返回空
+  return 1
+}
+
+SCRIPT_DIR="$(_get_script_dir)"
 # 验证脚本目录是否有效
 if [[ -z "$SCRIPT_DIR" ]] || [[ ! -d "$SCRIPT_DIR" ]]; then
-  echo "错误: 无法确定脚本目录。请使用绝对路径运行脚本，例如:" >&2
-  echo "  bash /完整路径/mosecurity/main.sh -h" >&2
+  echo "错误: 无法确定脚本目录（当前工作目录可能无效）" >&2
+  echo "" >&2
+  echo "解决方案:" >&2
+  echo "  1. 使用绝对路径运行脚本:" >&2
+  echo "     bash /data/wwwroot/shellstack/shellstack/mosecurity/main.sh" >&2
+  echo "" >&2
+  echo "  2. 或者先切换到有效目录:" >&2
+  echo "     cd / && bash /data/wwwroot/shellstack/shellstack/mosecurity/main.sh" >&2
+  echo "" >&2
+  echo "  3. 或者使用 run.sh wrapper（如果可用）:" >&2
+  echo "     bash /data/wwwroot/shellstack/shellstack/mosecurity/run.sh" >&2
   exit 1
 fi
 
