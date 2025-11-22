@@ -173,6 +173,14 @@ parse_args() {
         ENABLE_TERMINAL=0
         shift
         ;;
+      --jobs=*)
+        MAKE_JOBS="${1#*=}"
+        shift
+        ;;
+      --jobs)
+        MAKE_JOBS="$2"
+        shift 2
+        ;;
       --help|-h)
         # 加载帮助模块
         source "$INCLUDES_DIR/help.sh"

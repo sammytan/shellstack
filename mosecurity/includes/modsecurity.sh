@@ -105,8 +105,34 @@ build_modsecurity() {
   ./configure "${configure_opts[@]}" \
               CXXFLAGS="-std=c++17 -fpermissive" >> "$LOG_FILE" 2>&1 || error "配置失败，请检查日志: $LOG_FILE"
 
-  log "编译 ModSecurity..."
-  make -j"$MAKE_JOBS" >> "$LOG_FILE" 2>&1 || error "编译失败，请检查日志: $LOG_FILE"
+  log "编译 ModSecurity (并行任务数: $MAKE_JOBS)..."
+  
+  # 检查日志中是否有内存不足的错误
+  if ! make -j"$MAKE_JOBS" >> "$LOG_FILE" 2>&1; then
+    # 检查是否是内存不足导致的错误
+    if grep -qi "Killed\|signal terminated\|out of memory\|cannot allocate memory" "$LOG_FILE" 2>/dev/null; then
+      warn "编译失败，疑似内存不足"
+      warn "当前并行任务数: $MAKE_JOBS"
+      
+      # 尝试减少并行任务数重试
+      local retry_jobs=$((MAKE_JOBS / 2))
+      if [[ "$retry_jobs" -lt 1 ]]; then
+        retry_jobs=1
+      fi
+      
+      if [[ "$retry_jobs" -lt "$MAKE_JOBS" ]]; then
+        warn "尝试使用更少的并行任务数重试: $retry_jobs"
+        log "重新编译 ModSecurity (并行任务数: $retry_jobs)..."
+        if ! make -j"$retry_jobs" >> "$LOG_FILE" 2>&1; then
+          error "编译失败（即使使用 $retry_jobs 个并行任务）。请检查日志: $LOG_FILE\n建议:\n  1. 使用 --jobs=1 进行单线程编译\n  2. 增加系统交换空间 (swap)\n  3. 关闭其他占用内存的程序"
+        fi
+      else
+        error "编译失败，疑似内存不足。请检查日志: $LOG_FILE\n建议:\n  1. 使用 --jobs=1 进行单线程编译: bash main.sh --jobs=1\n  2. 增加系统交换空间 (swap)\n  3. 关闭其他占用内存的程序\n  4. 检查系统内存: free -h"
+      fi
+    else
+      error "编译失败，请检查日志: $LOG_FILE"
+    fi
+  fi
 
   log "安装 ModSecurity..."
   make install >> "$LOG_FILE" 2>&1 || error "安装失败，请检查日志: $LOG_FILE"
