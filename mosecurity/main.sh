@@ -86,6 +86,8 @@ parse_args() {
         shift
         ;;
       --help|-h)
+        # 加载帮助模块
+        source "$INCLUDES_DIR/help.sh"
         show_help
         exit 0
         ;;
