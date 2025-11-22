@@ -132,7 +132,18 @@ load_module() {
   fi
 }
 
-# 获取脚本目录
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# 获取脚本目录（robust 方法，处理当前目录无效的情况）
+if command -v realpath >/dev/null 2>&1; then
+  SCRIPT_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}" 2>/dev/null)")"
+elif command -v readlink >/dev/null 2>&1; then
+  SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null)")"
+else
+  SCRIPT_PATH="${BASH_SOURCE[0]}"
+  if [[ "$SCRIPT_PATH" == /* ]]; then
+    SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+  else
+    SCRIPT_DIR="$( (cd "$(dirname "$SCRIPT_PATH")" 2>/dev/null && pwd) || dirname "$SCRIPT_PATH" )"
+  fi
+fi
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 

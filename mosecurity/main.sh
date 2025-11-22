@@ -5,9 +5,38 @@
 # 支持多系统多版本的 ModSecurity 安装
 # =====================================================================
 
-# 获取脚本目录
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 获取脚本目录（robust 方法，处理当前目录无效的情况）
+# 使用 readlink -f 或 realpath 来获取绝对路径，避免依赖 cd/pwd
+if command -v realpath >/dev/null 2>&1; then
+  SCRIPT_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}" 2>/dev/null)")"
+elif command -v readlink >/dev/null 2>&1; then
+  SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null)")"
+else
+  # 回退方法：使用 cd，但先保存当前目录状态
+  SCRIPT_PATH="${BASH_SOURCE[0]}"
+  if [[ "$SCRIPT_PATH" == /* ]]; then
+    # 已经是绝对路径
+    SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+  else
+    # 相对路径，尝试解析
+    # 使用 subshell 避免影响当前 shell 的工作目录
+    SCRIPT_DIR="$( (cd "$(dirname "$SCRIPT_PATH")" 2>/dev/null && pwd) || dirname "$SCRIPT_PATH" )"
+  fi
+fi
+# 验证脚本目录是否有效
+if [[ -z "$SCRIPT_DIR" ]] || [[ ! -d "$SCRIPT_DIR" ]]; then
+  echo "错误: 无法确定脚本目录。请使用绝对路径运行脚本，例如:" >&2
+  echo "  bash /完整路径/mosecurity/main.sh -h" >&2
+  exit 1
+fi
+
 INCLUDES_DIR="$SCRIPT_DIR/includes"
+
+# 验证 includes 目录是否存在
+if [[ ! -d "$INCLUDES_DIR" ]]; then
+  echo "错误: 找不到 includes 目录: $INCLUDES_DIR" >&2
+  exit 1
+fi
 
 # 加载共享配置和工具函数
 source "$INCLUDES_DIR/shared.sh"
