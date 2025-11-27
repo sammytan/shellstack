@@ -202,9 +202,28 @@ curl https://shellstack.910918920801.xyz/shellstack.sh | bash -s modsecurity
 
 本项目遵循原模块的许可证。
 
+## 🔧 故障排除
+
+如果遇到问题，请查看 [TROUBLESHOOTING.md](./TROUBLESHOOTING.md)
+
+**快速诊断**:
+```bash
+# 运行诊断脚本
+./diagnose.sh
+
+# 或手动部署
+./deploy-manual.sh
+```
+
+**常见问题**:
+- **404 错误**: 文件尚未部署或 Web 服务器配置不正确
+- **权限错误**: 检查文件执行权限和 Web 服务器用户权限
+- **模块下载失败**: 检查模块目录是否存在
+
 ## 📞 支持
 
 如有问题，请：
+- 查看 [TROUBLESHOOTING.md](./TROUBLESHOOTING.md)
 - 查看模块的 README.md
 - 提交 GitHub Issue
 - 查看安装日志
