@@ -1,0 +1,28 @@
+# 日志文件
+*.log
+*.log.*
+
+# 临时文件
+*.tmp
+*.temp
+/tmp/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# IDE 文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 构建目录
+build/
+dist/
+
+# 环境变量文件
+.env
+.env.local
+

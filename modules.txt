@@ -1,0 +1,5 @@
+# ShellStack 模块列表
+# 此文件由 generate-modules-list.sh 自动生成
+# 每行一个模块名，以 # 开头的行为注释
+
+modsecurity

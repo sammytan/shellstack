@@ -1,0 +1,57 @@
+name: Deploy to Server
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Generate modules list
+        run: |
+          chmod +x generate-modules-list.sh
+          ./generate-modules-list.sh
+      
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+      
+      - name: Deploy to server
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          # 创建部署目录
+          ssh ${SSH_USER}@${SSH_HOST} "mkdir -p ${DEPLOY_PATH}"
+          
+          # 同步文件到服务器
+          rsync -avz --delete \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.DS_Store' \
+            --exclude='*.log' \
+            ./ ${SSH_USER}@${SSH_HOST}:${DEPLOY_PATH}/
+          
+          # 设置执行权限
+          ssh ${SSH_USER}@${SSH_HOST} "chmod +x ${DEPLOY_PATH}/shellstack.sh"
+          ssh ${SSH_USER}@${SSH_HOST} "find ${DEPLOY_PATH} -name '*.sh' -type f -exec chmod +x {} \;"
+      
+      - name: Verify deployment
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          ssh ${SSH_USER}@${SSH_HOST} "test -f ${DEPLOY_PATH}/shellstack.sh && echo 'Deployment successful' || exit 1"
+

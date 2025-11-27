@@ -12,7 +12,7 @@ install_basic_tools() {
 
   case "$SYSTEM_TYPE" in
     debian)
-      eval "$PKG_INSTALL build-essential wget tar gzip git gcc g++" >> "$LOG_FILE" 2>&1
+      eval "$PKG_INSTALL build-essential wget tar gzip git gcc g++ ifupdown" >> "$LOG_FILE" 2>&1
       GCC_VERSION=$(gcc --version 2>/dev/null | head -n1 | awk '{print $3}' | cut -d. -f1 || echo "unknown")
       log "检测到 GCC 版本: $GCC_VERSION"
       ;;

@@ -1214,7 +1214,7 @@ install_basic_tools() {
   if [ -f /etc/debian_version ]; then
     log "检测到 Debian/Ubuntu 系统"
     apt-get update
-    apt-get install -y build-essential wget tar gzip git gcc g++
+    apt-get install -y build-essential wget tar gzip git gcc g++ ifupdown
     # 检查 gcc 版本
     GCC_VERSION=$(gcc --version | head -n1 | awk '{print $3}' | cut -d. -f1)
     log "检测到 GCC 版本: $GCC_VERSION"
