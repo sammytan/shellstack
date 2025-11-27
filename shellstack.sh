@@ -213,6 +213,50 @@ get_module_entry() {
   fi
 }
 
+# 下载模块的依赖文件（如 includes 目录）
+download_module_dependencies() {
+  local module_name="$1"
+  local temp_dir="$2"
+  local base_url="${BASE_URL}/${module_name}"
+  
+  # 尝试下载 includes 目录
+  local includes_url="${base_url}/includes"
+  local includes_dir="${temp_dir}/includes"
+  mkdir -p "${includes_dir}"
+  
+  log "正在下载模块依赖文件..."
+  
+  # 尝试下载常见的 includes 文件
+  local include_files=(
+    "shared.sh"
+    "os_check.sh"
+    "require_packages.sh"
+    "modsecurity.sh"
+    "geoip.sh"
+    "google_bbr_kernel.sh"
+    "terminal.sh"
+    "fail2ban.sh"
+    "openresty.sh"
+    "help.sh"
+  )
+  
+  local downloaded=0
+  for file in "${include_files[@]}"; do
+    if curl -fsSL "${includes_url}/${file}" -o "${includes_dir}/${file}" 2>/dev/null; then
+      chmod +x "${includes_dir}/${file}" 2>/dev/null || true
+      downloaded=$((downloaded + 1))
+    fi
+  done
+  
+  if [[ $downloaded -gt 0 ]]; then
+    log "成功下载 $downloaded 个依赖文件"
+    return 0
+  else
+    warn "未找到 includes 目录或依赖文件"
+    return 1
+  fi
+}
+
 # 远程下载并执行模块
 download_and_execute_module() {
   local module_name="$1"
@@ -221,35 +265,82 @@ download_and_execute_module() {
   
   log "正在从远程服务器下载模块: $module_name"
   
-  # 尝试下载模块的主脚本
-  local temp_script=$(mktemp)
-  local module_url="${BASE_URL}/${module_name}/main.sh"
+  # 创建临时目录来存放整个模块
+  local temp_dir=$(mktemp -d)
+  trap "rm -rf '$temp_dir'" EXIT
+  
+  local entry_file=""
+  local module_url=""
   
   # 尝试不同的入口文件名
   for entry in "main.sh" "run.sh" "install.sh"; do
     module_url="${BASE_URL}/${module_name}/${entry}"
-    if curl -fsSL "$module_url" -o "$temp_script" 2>/dev/null; then
+    if curl -fsSL "$module_url" -o "${temp_dir}/${entry}" 2>/dev/null; then
+      entry_file="${entry}"
       log "成功下载模块脚本: $module_url"
-      chmod +x "$temp_script"
-      
-      # 设置环境变量，让子脚本知道它在远程模式下运行
-      export SHELLSTACK_REMOTE=1
-      export SHELLSTACK_BASE_URL="$BASE_URL"
-      export SHELLSTACK_MODULE_DIR="${BASE_URL}/${module_name}"
-      
-      # 执行脚本并传递参数
-      bash "$temp_script" "${args[@]}"
-      local exit_code=$?
-      
-      # 清理临时文件
-      rm -f "$temp_script"
-      
-      return $exit_code
+      chmod +x "${temp_dir}/${entry}"
+      break
     fi
   done
   
-  # 如果所有尝试都失败
-  error "无法下载模块 $module_name，请检查模块名称是否正确"
+  if [[ -z "$entry_file" ]]; then
+    rm -rf "$temp_dir"
+    error "无法下载模块 $module_name，请检查模块名称是否正确"
+  fi
+  
+  # 下载模块依赖文件（如 includes 目录）
+  download_module_dependencies "$module_name" "$temp_dir"
+  
+  # 设置环境变量，让子脚本知道它在远程模式下运行
+  export SHELLSTACK_REMOTE=1
+  export SHELLSTACK_BASE_URL="$BASE_URL"
+  export SHELLSTACK_MODULE_DIR="${BASE_URL}/${module_name}"
+  export SHELLSTACK_TEMP_DIR="$temp_dir"
+  
+  # 在脚本开头注入代码来设置 SCRIPT_DIR
+  # 创建一个修改后的脚本版本
+  local modified_script="${temp_dir}/.${entry_file}"
+  
+  # 创建临时文件来处理脚本内容
+  local temp_script_content="${temp_dir}/.script_content.tmp"
+  
+  # 跳过原脚本的 shebang（如果存在）
+  if head -1 "${temp_dir}/${entry_file}" | grep -q "^#!/"; then
+    tail -n +2 "${temp_dir}/${entry_file}" > "$temp_script_content"
+  else
+    cat "${temp_dir}/${entry_file}" > "$temp_script_content"
+  fi
+  
+  # 替换 SCRIPT_DIR 的定义行
+  sed -i.tmp \
+    -e "s|^SCRIPT_DIR=\$(_get_script_dir)|# SCRIPT_DIR 已在远程模式下设置（见上方）|" \
+    -e "s|^SCRIPT_DIR=\"\$(_get_script_dir)\"|# SCRIPT_DIR 已在远程模式下设置（见上方）|" \
+    "$temp_script_content" 2>/dev/null || true
+  rm -f "${temp_script_content}.tmp" 2>/dev/null || true
+  
+  # 组合最终脚本
+  {
+    echo "#!/bin/bash"
+    echo "# 远程模式注入: 设置 SCRIPT_DIR"
+    echo "SCRIPT_DIR=\"$temp_dir\""
+    echo "export SCRIPT_DIR"
+    echo ""
+    cat "$temp_script_content"
+  } > "$modified_script"
+  
+  chmod +x "$modified_script"
+  rm -f "$temp_script_content"
+  
+  # 切换到临时目录并执行修改后的脚本
+  cd "$temp_dir"
+  bash "$modified_script" "${args[@]}"
+  local exit_code=$?
+  
+  # 清理临时目录
+  cd /
+  rm -rf "$temp_dir"
+  
+  return $exit_code
 }
 
 # 本地执行模块
