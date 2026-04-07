@@ -232,6 +232,7 @@ download_module_dependencies() {
     "os_check.sh"
     "require_packages.sh"
     "cxx17_toolchain.sh"
+    "modsecurity_clone.sh"
     "modsecurity.sh"
     "geoip.sh"
     "google_bbr_kernel.sh"

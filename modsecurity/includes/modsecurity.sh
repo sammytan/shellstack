@@ -8,6 +8,8 @@
 # C++17 / EL7 工具链：见 cxx17_toolchain.sh
 # shellcheck source=./cxx17_toolchain.sh
 source "$(dirname "${BASH_SOURCE[0]}")/cxx17_toolchain.sh"
+# shellcheck source=./modsecurity_clone.sh
+source "$(dirname "${BASH_SOURCE[0]}")/modsecurity_clone.sh"
 
 # 编译安装 ModSecurity
 build_modsecurity() {
@@ -18,15 +20,11 @@ build_modsecurity() {
   cd "$BUILD_DIR"
 
   log "克隆 ModSecurity 仓库..."
-  if [ -d ModSecurity ]; then
-    rm -rf ModSecurity
-  fi
-
-  git clone --depth 1 https://github.com/SpiderLabs/ModSecurity.git >> "$LOG_FILE" 2>&1 || error "无法克隆 ModSecurity 仓库"
+  clone_modsecurity_source
   cd ModSecurity
 
   # 获取所有可用的版本标签
-  git fetch --tags >> "$LOG_FILE" 2>&1 || warn "获取标签失败"
+  _modsecurity_git_fetch_tags || warn "获取标签失败"
 
   # 检查并切换到指定版本
   log "检查版本: $MODSECURITY_VERSION..."
@@ -54,7 +52,7 @@ build_modsecurity() {
   fi
 
   log "初始化子模块..."
-  git submodule update --init --recursive >> "$LOG_FILE" 2>&1 || warn "子模块初始化可能不完整"
+  _modsecurity_git_submodules || warn "子模块初始化可能不完整"
 
   log "运行构建脚本..."
   if [ -f ./build.sh ]; then

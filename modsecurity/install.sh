@@ -360,11 +360,15 @@ build_modsecurity() {
   # shellcheck source=includes/cxx17_toolchain.sh
   source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/includes/cxx17_toolchain.sh"
   ensure_modsecurity_cxx17_toolchain
+  # shellcheck source=includes/modsecurity_clone.sh
+  source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/includes/modsecurity_clone.sh"
   cd "$BUILD_DIR"
 
   log "克隆ModSecurity仓库..."
-  git clone --depth 1 https://github.com/SpiderLabs/ModSecurity.git >> "$LOG_FILE" 2>&1 || error "无法克隆ModSecurity仓库"
+  clone_modsecurity_source
   cd ModSecurity
+
+  _modsecurity_git_fetch_tags || warn "获取标签失败"
 
   # 检查是否指定了版本
   if [ "$MODSECURITY_VERSION" != "3.0.10" ]; then
@@ -380,7 +384,7 @@ build_modsecurity() {
   fi
 
   log "初始化子模块..."
-  git submodule update --init >> "$LOG_FILE" 2>&1 || warn "子模块初始化可能不完整"
+  _modsecurity_git_submodules || warn "子模块初始化可能不完整"
 
   log "运行构建脚本..."
   ./build.sh >> "$LOG_FILE" 2>&1 || error "构建脚本运行失败"
