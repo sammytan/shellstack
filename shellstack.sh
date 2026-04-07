@@ -231,6 +231,7 @@ download_module_dependencies() {
     "shared.sh"
     "os_check.sh"
     "require_packages.sh"
+    "cxx17_toolchain.sh"
     "modsecurity.sh"
     "geoip.sh"
     "google_bbr_kernel.sh"

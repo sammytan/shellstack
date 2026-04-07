@@ -5,11 +5,16 @@
 # 默认安装，支持多版本选择
 # =====================================================================
 
+# C++17 / EL7 工具链：见 cxx17_toolchain.sh
+# shellcheck source=./cxx17_toolchain.sh
+source "$(dirname "${BASH_SOURCE[0]}")/cxx17_toolchain.sh"
+
 # 编译安装 ModSecurity
 build_modsecurity() {
   log "开始编译安装 ModSecurity $MODSECURITY_VERSION..."
 
   mkdir -p "$BUILD_DIR"
+  ensure_modsecurity_cxx17_toolchain
   cd "$BUILD_DIR"
 
   log "克隆 ModSecurity 仓库..."

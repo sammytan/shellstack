@@ -357,6 +357,9 @@ install_dependencies() {
 build_modsecurity() {
   log "创建构建目录..."
   mkdir -p "$BUILD_DIR"
+  # shellcheck source=includes/cxx17_toolchain.sh
+  source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/includes/cxx17_toolchain.sh"
+  ensure_modsecurity_cxx17_toolchain
   cd "$BUILD_DIR"
 
   log "克隆ModSecurity仓库..."

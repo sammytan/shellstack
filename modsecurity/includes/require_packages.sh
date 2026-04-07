@@ -30,8 +30,8 @@ install_basic_tools() {
       ;;
   esac
 
-  # 验证基础工具安装
-  for cmd in gcc make wget tar gzip git; do
+  # 验证基础工具安装（g++ 对 ModSecurity v3 必需，单独检查而非仅 gcc）
+  for cmd in gcc g++ make wget tar gzip git; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
       error "基础工具 $cmd 安装失败"
     fi
