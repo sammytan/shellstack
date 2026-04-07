@@ -42,19 +42,22 @@ clone_modsecurity_source() {
     warn "MODSECURITY_GIT_URL 克隆失败，尝试内置镜像列表..."
   fi
 
-  # 设为 1 时先走 Gitee，避免 github.com 多次连接超时占用数分钟
-  if [[ "${MODSECURITY_PREFER_GITEE:-}" == "1" ]]; then
+  # 默认优先 Gitee（国内访问 GitHub 常超时）；须先 GitHub 时请设 MODSECURITY_PREFER_GITHUB=1
+  # 兼容旧变量：MODSECURITY_PREFER_GITEE=0 等价于先 GitHub
+  if [[ "${MODSECURITY_PREFER_GITHUB:-}" == "1" ]] || [[ "${MODSECURITY_PREFER_GITEE:-}" == "0" ]]; then
+    log "克隆顺序: GitHub 优先（MODSECURITY_PREFER_GITHUB=1）"
     mirrors=(
-      "$MODSECURITY_GITEE_URL"
       "https://github.com/SpiderLabs/ModSecurity.git"
+      "$MODSECURITY_GITEE_URL"
       "https://ghproxy.net/https://github.com/SpiderLabs/ModSecurity.git"
       "https://mirror.ghproxy.com/https://github.com/SpiderLabs/ModSecurity.git"
       "https://gitclone.com/github.com/SpiderLabs/ModSecurity.git"
     )
   else
+    log "克隆顺序: Gitee 优先（$MODSECURITY_GITEE_URL）"
     mirrors=(
-      "https://github.com/SpiderLabs/ModSecurity.git"
       "$MODSECURITY_GITEE_URL"
+      "https://github.com/SpiderLabs/ModSecurity.git"
       "https://ghproxy.net/https://github.com/SpiderLabs/ModSecurity.git"
       "https://mirror.ghproxy.com/https://github.com/SpiderLabs/ModSecurity.git"
       "https://gitclone.com/github.com/SpiderLabs/ModSecurity.git"
