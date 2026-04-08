@@ -87,8 +87,8 @@ clone_modsecurity_source() {
   error "无法克隆 ModSecurity 仓库。请检查网络/DNS/防火墙，或设置 MODSECURITY_GIT_URL / MODSECURITY_GITEE_URL 为可访问的镜像后再运行。完整日志: $LOG_FILE"
 }
 
-# 主仓库来自 Gitee 或显式要求时，将构建必需的子模块指到 Gitee mirrors（避免仍连 github.com）。
-# 默认只改 libinjection / mbedtls；另两个仓库在 Gitee 上不一定有 mirrors，如需一并改写可设 MODSECURITY_GITEE_ALL_SUBMODULES=1
+# 主仓库来自 Gitee（或显式要求）时，将所有子模块 URL 指到 Gitee mirrors。
+# 若未全部重写，git submodule update --recursive 会先拉到 bindings/python 等仍指向 GitHub 的模块并超时，导致 libinjection/mbedtls 永远拉不下来。
 _modsecurity_apply_gitee_submodule_mirrors() {
   local origin
   MODSECURITY_ORIGIN_IS_GITEE=0
@@ -99,13 +99,11 @@ _modsecurity_apply_gitee_submodule_mirrors() {
   if [[ "$MODSECURITY_ORIGIN_IS_GITEE" != "1" && "${MODSECURITY_USE_GITEE_SUBMODULES}" != "1" ]]; then
     return 0
   fi
-  log "子模块 libinjection、mbedtls 使用 Gitee 镜像..."
+  log "子模块统一改为 Gitee mirrors（含 Python 绑定与测试数据，避免仍访问 github.com）..."
   git config submodule.others/libinjection.url "$MODSECURITY_GITEE_LIBINJECTION_URL"
   git config submodule.others/mbedtls.url "$MODSECURITY_GITEE_MBEDTLS_URL"
-  if [[ "${MODSECURITY_GITEE_ALL_SUBMODULES:-}" == "1" ]]; then
-    git config submodule.test/test-cases/secrules-language-tests.url "$MODSECURITY_GITEE_SECRULES_URL"
-    git config submodule.bindings/python.url "$MODSECURITY_GITEE_PYTHON_BINDINGS_URL"
-  fi
+  git config submodule.test/test-cases/secrules-language-tests.url "$MODSECURITY_GITEE_SECRULES_URL"
+  git config submodule.bindings/python.url "$MODSECURITY_GITEE_PYTHON_BINDINGS_URL"
 }
 
 # 拉取标签（失败时用 ghproxy 重写再试）
@@ -120,26 +118,28 @@ _modsecurity_git_fetch_tags() {
     fetch --tags >>"$LOG_FILE" 2>&1
 }
 
-# 初始化子模块（mbedtls、libinjection 等为必需）
+# 初始化子模块：必须先拉 others/libinjection、others/mbedtls（configure 硬性依赖），
+# 再拉可选子模块；切勿一上来就对全仓库 recursive，否则 git 会先克隆 bindings/python 等并因 GitHub 超时而中断。
 _modsecurity_git_submodules() {
   _modsecurity_apply_gitee_submodule_mirrors
 
-  # 若使用 Gitee，先保证构建必需的子模块（configure 会检查这两棵树）
-  if [[ "$MODSECURITY_ORIGIN_IS_GITEE" == "1" ]] || [[ "${MODSECURITY_USE_GITEE_SUBMODULES}" == "1" ]]; then
-    if ! git submodule update --init --recursive others/libinjection others/mbedtls >>"$LOG_FILE" 2>&1; then
-      warn "Gitee 子模块 (libinjection/mbedtls) 首次拉取失败，将尝试 ghproxy 回退..."
+  log "拉取构建必需子模块: others/libinjection、others/mbedtls..."
+  if ! git submodule update --init --recursive others/libinjection others/mbedtls >>"$LOG_FILE" 2>&1; then
+    log "必需子模块直连失败，尝试经 ghproxy 拉取 libinjection / mbedtls..."
+    if ! GIT_TERMINAL_PROMPT=0 git \
+      -c "http.postBuffer=524288000" \
+      -c "url.https://ghproxy.net/https://github.com/.insteadof=https://github.com/" \
+      submodule update --init --recursive others/libinjection others/mbedtls >>"$LOG_FILE" 2>&1; then
+      error "无法拉取子模块 libinjection 或 mbedtls，configure 无法继续。请确认 Gitee 上 mirrors 齐全或网络可访问 GitHub。日志: $LOG_FILE"
     fi
   fi
 
-  if git submodule update --init --recursive >>"$LOG_FILE" 2>&1; then
-    return 0
+  log "拉取可选子模块: bindings/python、test/test-cases/secrules-language-tests（失败一般不影响核心库编译）..."
+  if ! git submodule update --init --recursive bindings/python test/test-cases/secrules-language-tests >>"$LOG_FILE" 2>&1; then
+    GIT_TERMINAL_PROMPT=0 git \
+      -c "http.postBuffer=524288000" \
+      -c "url.https://ghproxy.net/https://github.com/.insteadof=https://github.com/" \
+      submodule update --init --recursive bindings/python test/test-cases/secrules-language-tests >>"$LOG_FILE" 2>&1 \
+      || warn "可选子模块未完全拉取（仅影响 Python 绑定或部分测试，可忽略）。"
   fi
-  log "子模块直连失败，尝试 sync 后经 ghproxy 拉取..."
-  GIT_TERMINAL_PROMPT=0 git \
-    -c "url.https://ghproxy.net/https://github.com/.insteadof=https://github.com/" \
-    submodule sync --recursive >>"$LOG_FILE" 2>&1 || true
-  GIT_TERMINAL_PROMPT=0 git \
-    -c "http.postBuffer=524288000" \
-    -c "url.https://ghproxy.net/https://github.com/.insteadof=https://github.com/" \
-    submodule update --init --recursive >>"$LOG_FILE" 2>&1
 }
