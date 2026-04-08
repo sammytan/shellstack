@@ -60,13 +60,8 @@ EOF
 
   if [[ "$sys_type" == "redhat" && "$is_el7" -eq 1 ]]; then
     log "在 EL 7 上安装 devtoolset-9（GCC 9）以提供 C++17..."
-    # yum 解析到仅 IPv6 的镜像且本机无 IPv6 时会失败；强制 IPv4
-    local yum4=""
-    if [[ "$pkg_install" == yum\ install\ -y ]]; then
-      yum4="--setopt=ip_resolve=4"
-    fi
-    eval "$pkg_install $yum4 centos-release-scl" >> "$LOG_FILE" 2>&1 || true
-    if ! eval "$pkg_install $yum4 devtoolset-9-gcc devtoolset-9-gcc-c++ devtoolset-9-binutils devtoolset-9-make" >> "$LOG_FILE" 2>&1; then
+    eval "$pkg_install centos-release-scl" >> "$LOG_FILE" 2>&1 || true
+    if ! eval "$pkg_install devtoolset-9-gcc devtoolset-9-gcc-c++ devtoolset-9-binutils devtoolset-9-make" >> "$LOG_FILE" 2>&1; then
       error "无法安装 devtoolset-9。CentOS/RHEL 7 自带的 GCC 4.8 无法编译 ModSecurity v3。请确保已启用 Software Collections 仓库后手动安装: yum install -y devtoolset-9-gcc-c++，执行 source /opt/rh/devtoolset-9/enable 后重试本脚本。"
     fi
     if [[ -f /opt/rh/devtoolset-9/enable ]]; then

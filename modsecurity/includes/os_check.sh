@@ -116,14 +116,21 @@ get_package_manager() {
       PKG_INSTALL="apt-get install -y"
       ;;
     redhat)
+      # 镜像/CDN 只返回 IPv6 而本机无 IPv6 时，yum/dnf 会报 curl#7 网络不可达；强制仅用 IPv4。
+      # 需要恢复默认解析时可设: export MODSECURITY_REPOS_IPV4_ONLY=0
+      local _ip4=""
+      if [[ "${MODSECURITY_REPOS_IPV4_ONLY:-1}" == "1" ]]; then
+        _ip4="--setopt=ip_resolve=4 "
+        log "yum/dnf 使用 IPv4 访问软件源 (ip_resolve=4)"
+      fi
       if check_command dnf; then
         PKG_CMD="dnf"
-        PKG_UPDATE="dnf check-update || true"
-        PKG_INSTALL="dnf install -y"
+        PKG_UPDATE="dnf ${_ip4}check-update || true"
+        PKG_INSTALL="dnf ${_ip4}install -y"
       else
         PKG_CMD="yum"
-        PKG_UPDATE="yum check-update || true"
-        PKG_INSTALL="yum install -y"
+        PKG_UPDATE="yum ${_ip4}check-update || true"
+        PKG_INSTALL="yum ${_ip4}install -y"
       fi
       ;;
     arch)
