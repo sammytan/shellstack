@@ -106,6 +106,12 @@ ENABLE_SECURITY=0
 ENABLE_OPENRESTY=0
 ENABLE_KERNEL_OPT=1
 ENABLE_TERMINAL=1
+# 宝塔：从站点下载 btwaf.tar.gz 覆盖 /www/server/btwaf
+EXTEND_BTWAF_CACHE=0
+# 宝塔：部署 nginx.conf / CRS / 自定义规则（需配合 --deploy-conf）
+DEPLOY_MODSEC_CONF=0
+# 宝塔 nginx.sh 的 OpenResty 版本参数：openresty | openresty127 等
+BT_OPENRESTY_VERSION="${BT_OPENRESTY_VERSION:-openresty127}"
 
 # 解析命令行参数
 parse_args() {
@@ -179,6 +185,24 @@ parse_args() {
         ;;
       --jobs)
         MAKE_JOBS="$2"
+        shift 2
+        ;;
+      --extend-btwaf-cache)
+        EXTEND_BTWAF_CACHE=1
+        shift
+        ;;
+      --deploy-conf)
+        DEPLOY_MODSEC_CONF=1
+        shift
+        ;;
+      --bt-openresty=*)
+        BT_OPENRESTY_VERSION="${1#*=}"
+        export BT_OPENRESTY_VERSION
+        shift
+        ;;
+      --bt-openresty)
+        BT_OPENRESTY_VERSION="$2"
+        export BT_OPENRESTY_VERSION
         shift 2
         ;;
       --help|-h)
@@ -278,28 +302,48 @@ main_install() {
   log "检测系统环境..."
   init_os_check
   
-  # 检查是否已安装
+  # 是否重新编译 libmodsecurity（否：沿用现有库，仍继续宝塔连接器与可选 --deploy-conf）
+  SKIP_LIB_REINSTALL=0
   if [ -f "$MODSECURITY_PREFIX/lib/libmodsecurity.so" ] || [ -f "$MODSECURITY_PREFIX/lib/libmodsecurity.so.3" ]; then
-    log "检测到已安装的 ModSecurity"
-    read -p "是否重新安装？[y/N] " -n 1 -r
+    log "检测到已安装的 ModSecurity 核心库"
+    read -p "是否重新编译安装 libmodsecurity？[y/N] " -n 1 -r
     echo
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-      log "操作已取消，退出"
-      exit 0
+      SKIP_LIB_REINSTALL=1
+      log "跳过 libmodsecurity 重新编译，继续后续步骤（宝塔 OpenResty / ModSecurity-nginx / --deploy-conf）"
     fi
   fi
-  
-  # 安装基础工具
-  install_basic_tools
-  
-  # 安装系统依赖
-  install_system_dependencies
-  
-  # 编译安装依赖库
-  compile_dependencies
-  
-  # 安装 ModSecurity 核心库
-  install_modsecurity
+
+  if [ "$SKIP_LIB_REINSTALL" != "1" ]; then
+    install_basic_tools
+    install_system_dependencies
+    compile_dependencies
+    install_modsecurity
+  else
+    install_basic_tools
+    install_system_dependencies
+  fi
+
+  # 宝塔：升级 OpenResty 并编译 ModSecurity-nginx 连接器（非宝塔环境自动跳过）
+  source "$INCLUDES_DIR/baota_modsec_connector.sh"
+  baota_install_openresty_with_modsecurity_connector
+
+  if [ "$DEPLOY_MODSEC_CONF" = "1" ]; then
+    log "=========================================="
+    log "--deploy-conf：写入 Nginx ModSecurity / CRS 配置"
+    log "=========================================="
+    source "$INCLUDES_DIR/baota_modsec_deploy.sh"
+    baota_deploy_modsecurity_conf
+  else
+    log "未使用 --deploy-conf，跳过 Nginx / CRS 配置文件写入"
+  fi
+
+  if [ "$EXTEND_BTWAF_CACHE" = "1" ]; then
+    source "$INCLUDES_DIR/btwaf_extend.sh"
+    extend_btwaf_cache_bundle
+  else
+    log "未使用 --extend-btwaf-cache，跳过 BTwaf 包覆盖"
+  fi
   
   # 可选功能安装
   if [ "$ENABLE_GEOIP" = "1" ]; then

@@ -1,0 +1,279 @@
+#!/bin/bash
+# 宝塔：部署 modsecurity.conf、OWASP CRS、modsec_includes.conf、custom_modsec_rules.conf、whitelist、nginx.conf 中的 modsecurity 指令
+# 依赖 shared.sh: log warn error LOG_FILE
+
+BT_NGINX_CONF_DIR="${BT_NGINX_CONF_DIR:-/www/server/nginx/conf}"
+BT_WHITELIST_FILE="${BT_WHITELIST_FILE:-/www/server/whitelist.txt}"
+CRS_GIT_BRANCH="${CRS_GIT_BRANCH:-v3.3.5}"
+CRS_GIT_URL="${CRS_GIT_URL:-https://github.com/coreruleset/coreruleset.git}"
+CRS_GIT_URL_FALLBACK="${CRS_GIT_URL_FALLBACK:-https://github.com/SpiderLabs/owasp-modsecurity-crs.git}"
+
+_baota_git_clone_shallow() {
+  local url="$1"
+  local dest="$2"
+  local branch="$3"
+  rm -rf "$dest"
+  if [[ -n "$branch" ]]; then
+    GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch "$branch" "$url" "$dest" >>"$LOG_FILE" 2>&1
+  else
+    GIT_TERMINAL_PROMPT=0 git clone --depth 1 "$url" "$dest" >>"$LOG_FILE" 2>&1
+  fi
+}
+
+_baota_deploy_clone_modsecurity_core_for_samples() {
+  local tmp_base="$1"
+  local dest="$tmp_base/ModSecurity"
+  local urls=(
+    "https://github.com/SpiderLabs/ModSecurity.git"
+    "https://gitee.com/mirrors/ModSecurity.git"
+  )
+  local u
+  for u in "${urls[@]}"; do
+    rm -rf "$dest"
+    if _baota_git_clone_shallow "$u" "$dest" ""; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+_baota_deploy_clone_crs() {
+  local dest="$1"
+  if [[ -d "$dest/.git" ]]; then
+    log "CRS 目录已存在: $dest（保留现有克隆，请手动 git pull 如需更新）"
+    return 0
+  fi
+  rm -rf "$dest"
+  if _baota_git_clone_shallow "$CRS_GIT_URL" "$dest" "$CRS_GIT_BRANCH"; then
+    return 0
+  fi
+  warn "CRS 主仓库失败，尝试: $CRS_GIT_URL_FALLBACK"
+  rm -rf "$dest"
+  _baota_git_clone_shallow "$CRS_GIT_URL_FALLBACK" "$dest" ""
+}
+
+# 在 http 块中加入 fastcgi_cache 共享区（与 enable-php 中的 fastcgi_cache fastcgi_cache; 对应）
+_baota_ensure_fastcgi_cache_zone_in_nginx_conf() {
+  local ngx="$BT_NGINX_CONF_DIR/nginx.conf"
+  [[ -f "$ngx" ]] || return 0
+  if grep -q 'fastcgi_cache_path' "$ngx" 2>/dev/null; then
+    log "nginx.conf 已包含 fastcgi_cache_path，跳过共享区注入"
+    return 0
+  fi
+  mkdir -p /www/wwwlogs/fastcgi_cache
+  local zonef
+  zonef="$(mktemp)"
+  cat > "$zonef" <<'ZONE'
+        fastcgi_cache_path /www/wwwlogs/fastcgi_cache levels=1:2 keys_zone=fastcgi_cache:10m max_size=10g inactive=60m use_temp_path=off;
+        fastcgi_cache_key "$scheme$request_method$host$request_uri";
+ZONE
+  if grep -q 'include proxy.conf;' "$ngx"; then
+    sed -i '/include proxy.conf;/r '"$zonef" "$ngx"
+    log "已向 nginx.conf 注入 fastcgi_cache_path / fastcgi_cache_key（锚点: include proxy.conf）"
+  elif grep -q 'default_type' "$ngx"; then
+    sed -i '/default_type[[:space:]]/r '"$zonef" "$ngx"
+    log "已向 nginx.conf 注入 fastcgi_cache（锚点: default_type）"
+  else
+    warn "无法在 nginx.conf 中自动插入 fastcgi_cache_path，请手工在 http{} 内添加"
+  fi
+  rm -f "$zonef"
+}
+
+# 在 enable-php-*.conf 的 PHP location 内开启 FastCGI 缓存（默认宝塔未写这些指令）
+_baota_inject_fastcgi_cache_into_enable_php_confs() {
+  local snip
+  snip="$(mktemp)"
+  cat > "$snip" <<'SNIP'
+
+        # FastCGI 缓存（shellstack / --deploy-conf 注入）
+        fastcgi_cache fastcgi_cache;
+        fastcgi_cache_valid 200 301 302 3m;
+        fastcgi_cache_valid 404 1m;
+        fastcgi_cache_use_stale error timeout invalid_header updating http_500 http_503;
+        fastcgi_cache_min_uses 1;
+        fastcgi_cache_lock on;
+        fastcgi_cache_bypass $skip_cache;
+        fastcgi_no_cache $skip_cache;
+        set $skip_cache 0;
+        if ($request_method = POST) {
+            set $skip_cache 1;
+        }
+        if ($query_string != "") {
+            set $skip_cache 1;
+        }
+        if ($http_cookie ~* "wordpress_logged_in_|wp-postpass_|wordpress_no_cache|comment_author") {
+            set $skip_cache 1;
+        }
+SNIP
+
+  local f
+  for f in "$BT_NGINX_CONF_DIR"/enable-php-*.conf; do
+    [[ -f "$f" ]] || continue
+    case "$(basename "$f")" in
+      enable-php-00.conf) continue ;;
+    esac
+    grep -q 'fastcgi_pass' "$f" 2>/dev/null || continue
+    grep -q 'fastcgi_cache fastcgi_cache' "$f" 2>/dev/null && continue
+    if grep -q 'include pathinfo.conf;' "$f"; then
+      sed -i "/include pathinfo.conf;/r $snip" "$f"
+      log "已为 $(basename "$f") 开启 FastCGI 缓存（after pathinfo.conf）"
+    elif grep -q 'include fastcgi.conf;' "$f"; then
+      sed -i "/include fastcgi.conf;/r $snip" "$f"
+      log "已为 $(basename "$f") 开启 FastCGI 缓存（after fastcgi.conf）"
+    else
+      warn "未找到 pathinfo.conf / fastcgi.conf 引用，跳过: $(basename "$f")"
+    fi
+  done
+  rm -f "$snip"
+}
+
+_baota_crs_rule_files() {
+  # 与 CRS 3.3.x rules/ 下文件名一致（不存在则稍后在写入 includes 时跳过）
+  echo "REQUEST-901-INITIALIZATION.conf"
+  echo "REQUEST-903.9002-WORDPRESS-EXCLUSION-RULES.conf"
+  echo "REQUEST-905-COMMON-EXCEPTIONS.conf"
+  echo "REQUEST-910-IP-REPUTATION.conf"
+  echo "REQUEST-911-METHOD-ENFORCEMENT.conf"
+  echo "REQUEST-912-DOS-PROTECTION.conf"
+  echo "REQUEST-913-SCANNER-DETECTION.conf"
+  echo "REQUEST-920-PROTOCOL-ENFORCEMENT.conf"
+  echo "REQUEST-921-PROTOCOL-ATTACK.conf"
+  echo "REQUEST-930-APPLICATION-ATTACK-LFI.conf"
+  echo "REQUEST-931-APPLICATION-ATTACK-RFI.conf"
+  echo "REQUEST-932-APPLICATION-ATTACK-RCE.conf"
+  echo "REQUEST-933-APPLICATION-ATTACK-PHP.conf"
+  echo "REQUEST-941-APPLICATION-ATTACK-XSS.conf"
+  echo "REQUEST-942-APPLICATION-ATTACK-SQLI.conf"
+  echo "REQUEST-943-APPLICATION-ATTACK-SESSION-FIXATION.conf"
+  echo "REQUEST-949-BLOCKING-EVALUATION.conf"
+  echo "RESPONSE-950-DATA-LEAKAGES.conf"
+  echo "RESPONSE-951-DATA-LEAKAGES-SQL.conf"
+  echo "RESPONSE-952-DATA-LEAKAGES-JAVA.conf"
+  echo "RESPONSE-953-DATA-LEAKAGES-PHP.conf"
+  echo "RESPONSE-954-DATA-LEAKAGES-IIS.conf"
+  echo "RESPONSE-959-BLOCKING-EVALUATION.conf"
+  echo "RESPONSE-980-CORRELATION.conf"
+}
+
+baota_deploy_modsecurity_conf() {
+  if [[ ! -d "$BT_NGINX_CONF_DIR" ]]; then
+    error "配置目录不存在: $BT_NGINX_CONF_DIR"
+  fi
+
+  log "=========================================="
+  log "部署 ModSecurity / CRS 配置到 $BT_NGINX_CONF_DIR"
+  log "=========================================="
+
+  local tmp_core
+  tmp_core="$(mktemp -d /tmp/shellstack-modsec-core.XXXXXX)"
+  if ! _baota_deploy_clone_modsecurity_core_for_samples "$tmp_core/ModSecurity"; then
+    rm -rf "$tmp_core"
+    error "无法克隆 ModSecurity 主仓库以获取 modsecurity.conf-recommended / unicode.mapping"
+  fi
+  \cp -a "$tmp_core/ModSecurity/modsecurity.conf-recommended" "$BT_NGINX_CONF_DIR/modsecurity.conf"
+  \cp -a "$tmp_core/ModSecurity/unicode.mapping" "$BT_NGINX_CONF_DIR/"
+  rm -rf "$tmp_core"
+
+  sed -i 's/^SecRuleEngine DetectionOnly/SecRuleEngine On/' "$BT_NGINX_CONF_DIR/modsecurity.conf"
+  sed -i 's/^SecStatusEngine Off/SecStatusEngine On/' "$BT_NGINX_CONF_DIR/modsecurity.conf"
+  sed -i 's@#SecDebugLog /opt/modsecurity/var/log/debug.log@SecDebugLog /var/log/modsec_debug.log@' "$BT_NGINX_CONF_DIR/modsecurity.conf"
+  sed -i 's/^#SecDebugLogLevel 3/SecDebugLogLevel 3/' "$BT_NGINX_CONF_DIR/modsecurity.conf"
+
+  local crs_dir="$BT_NGINX_CONF_DIR/owasp-modsecurity-crs"
+  if ! _baota_deploy_clone_crs "$crs_dir"; then
+    error "无法克隆 OWASP CRS（coreruleset）到 $crs_dir"
+  fi
+
+  if [[ -f "$crs_dir/crs-setup.conf.example" ]]; then
+    \cp -a "$crs_dir/crs-setup.conf.example" "$crs_dir/crs-setup.conf"
+  elif [[ -f "$crs_dir/crs-setup.conf" ]]; then
+    log "crs-setup.conf 已存在"
+  else
+    warn "未找到 crs-setup.conf.example，请检查 CRS 版本"
+  fi
+
+  if [[ -f "$crs_dir/crs-setup.conf" ]]; then
+    sed -i 's/^SecDefaultAction "phase:1,log,auditlog,pass"/#SecDefaultAction "phase:1,log,auditlog,pass"/' "$crs_dir/crs-setup.conf"
+    sed -i 's/^SecDefaultAction "phase:2,log,auditlog,pass"/#SecDefaultAction "phase:2,log,auditlog,pass"/' "$crs_dir/crs-setup.conf"
+    sed -i 's/^#.*SecDefaultAction "phase:1,log,auditlog,deny,status:403"/SecDefaultAction "phase:1,log,auditlog,deny,status:403"/' "$crs_dir/crs-setup.conf"
+    sed -i 's/^# SecDefaultAction "phase:2,log,auditlog,deny,status:403"/SecDefaultAction "phase:2,log,auditlog,deny,status:403"/' "$crs_dir/crs-setup.conf"
+  fi
+
+  local crs_rel="owasp-modsecurity-crs"
+  local inc="$BT_NGINX_CONF_DIR/modsec_includes.conf"
+  {
+    echo "include modsecurity.conf"
+    echo "include custom_modsec_rules.conf"
+    echo "include ${crs_rel}/crs-setup.conf"
+    local rf
+    while IFS= read -r rf; do
+      [[ -z "$rf" ]] && continue
+      if [[ -f "$BT_NGINX_CONF_DIR/${crs_rel}/rules/$rf" ]]; then
+        echo "include ${crs_rel}/rules/${rf}"
+      else
+        warn "跳过不存在的 CRS 规则文件: ${crs_rel}/rules/$rf"
+      fi
+    done < <(_baota_crs_rule_files)
+  } > "$inc"
+  log "已写入 $inc"
+
+  touch "$BT_WHITELIST_FILE"
+
+  cat > "$BT_NGINX_CONF_DIR/custom_modsec_rules.conf" <<'RULES'
+SecGeoLookupDB /var/lib/GeoIP/GeoLite2-Country.mmdb
+SecRule REMOTE_ADDR "@geoLookup" "id:10001,phase:1,pass,log"
+SecRule REQUEST_URI "@beginsWith /vts_status" "id:10002,phase:1,nolog,pass,ctl:ruleEngine=Off"
+SecRule REQUEST_URI "@beginsWith /e/e_DliR28KktG1dpud/" "id:10003,phase:1,nolog,pass,ctl:ruleEngine=Off"
+
+SecRule REMOTE_ADDR "@ipMatchFromFile /www/server/whitelist.txt" \
+    "id:999,phase:1,allow,msg:'Allow access from whitelist IP'"
+
+SecRule REQUEST_URI "@rx ^/e/member/" \
+    "id:11000,phase:1,deny,status:403,msg:'Access to /e/member/ is denied'"
+
+SecRule REQUEST_URI "@rx ^//e/ShopSys/" \
+    "id:11001,phase:1,deny,status:403,msg:'Access to //e/ShopSys/ is denied'"
+
+SecRule ARGS "^([A-Za-z0-9+/]{64,}=*)$" \
+    "phase:2,deny,id:10004,log,msg:'参数值疑似Base64编码且长度超过64'"
+
+SecRule ARGS "^[A-Fa-f0-9]{64,}$" \
+    "phase:2,deny,id:10005,log,msg:'参数值疑似十六进制编码且长度超过64'"
+
+SecAction "id:1001,phase:1,nolog,pass,setvar:tx.html_rate_limit=2"
+SecRule REQUEST_URI "@endsWith .html" "id:1002,phase:2,t:none,pass,nolog,setvar:ip.html_request_counter=+1,expirevar:ip.html_request_counter=2"
+SecRule IP:html_request_counter "@gt 2" "id:1003,phase:2,log,deny,status:429,msg:'Too many requests for .html files from this IP',setvar:ip.html_exceed_counter=+1,expirevar:ip.html_exceed_counter=3600"
+
+SecRule IP:html_exceed_counter "@ge 3" "id:1004,phase:2,log,deny,status:403,msg:'IP temporarily banned for excessive requests to .html files',setvar:ip.block_time=+1,expirevar:ip.block_time=300,setvar:ip.html_exceed_counter=0"
+SecRule IP:block_time "@ge 2" "id:1005,phase:1,log,deny,status:403,msg:'IP is banned for 5 minutes'"
+
+SecRule RESPONSE_STATUS "@in 400,403,404,405,429,503" \
+    "id:2001,phase:3,pass,nolog,setvar:ip.error_request_counter=+1,expirevar:ip.error_request_counter=180"
+
+SecRule IP:error_request_counter "@gt 15" \
+    "id:2002,phase:3,log,deny,status:403,msg:'Too many error requests in 3 minutes , IP temporarily banned',setvar:ip.block_time=+1,expirevar:ip.block_time=3600,setvar:ip.error_request_counter=0"
+
+SecRule IP:block_time "@ge 1" \
+    "id:2003,phase:1,log,deny,status:403,msg:'IP is banned for 1 hour due to excessive error requests'"
+RULES
+  log "已写入 $BT_NGINX_CONF_DIR/custom_modsec_rules.conf"
+
+  local ngx_conf="$BT_NGINX_CONF_DIR/nginx.conf"
+  if [[ ! -f "$ngx_conf" ]]; then
+    warn "未找到 $ngx_conf，跳过 nginx.conf 注入"
+  elif grep -q 'modsecurity_rules_file' "$ngx_conf"; then
+    log "nginx.conf 已含 modsecurity 指令，跳过注入"
+  else
+    if sed -i '/real_ip_recursive on;/a\        modsecurity on;' "$ngx_conf" 2>>"$LOG_FILE" \
+      && sed -i '/modsecurity on;/a\        modsecurity_rules_file /www/server/nginx/conf/modsec_includes.conf;' "$ngx_conf" 2>>"$LOG_FILE"; then
+      log "已向 nginx.conf 注入 modsecurity 指令"
+    else
+      warn "sed 注入 modsecurity 失败，请手工在 http 块中加入 modsecurity on 与 modsecurity_rules_file"
+    fi
+  fi
+
+  _baota_ensure_fastcgi_cache_zone_in_nginx_conf
+  _baota_inject_fastcgi_cache_into_enable_php_confs
+
+  log "配置部署完成。请确认 GeoIP 数据库路径、执行 nginx -t 后重载 Nginx。"
+}

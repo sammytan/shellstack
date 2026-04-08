@@ -194,6 +194,9 @@ ModSecurity 核心库安装脚本
   --disable-kernel-opt   禁用 Google BBR 内核优化
   --disable-terminal     禁用终端配置
   --jobs=N               设置并行编译任务数 (默认: 自动检测，根据内存和CPU核心数)
+  --extend-btwaf-cache   下载 btwaf.tar.gz（默认 \$SHELLSTACK_BASE_URL/btwaf/btwaf.tar.gz）并覆盖 /www/server/btwaf
+  --deploy-conf          宝塔环境：部署 ModSecurity / OWASP CRS / custom 规则、nginx.conf 引用，并在 nginx.conf 与 enable-php-*.conf 中开启 FastCGI 缓存（需宝塔 Nginx）
+  --bt-openresty=VER    宝塔 nginx.sh 的 OpenResty 版本键（默认 openresty127，可选 openresty 等）
   --help                 显示此帮助信息
   --verify               验证已安装的 ModSecurity
   --info                 显示安装信息
@@ -226,6 +229,15 @@ ModSecurity 核心库安装脚本
 
   # 手动设置并行任务数（例如：2个任务）
   $0 --jobs=2
+
+  # 宝塔：同步 BTwaf 资源包并部署 WAF/ModSecurity 配置
+  $0 --extend-btwaf-cache --deploy-conf
+
+  # 宝塔面板：安装 libmodsecurity、升级 OpenResty 并编译 ModSecurity-nginx，并下发 CRS/自定义规则
+  $0 --deploy-conf
+
+  # 指定宝塔 OpenResty 版本键（与 /www/server/panel/install/nginx.sh 一致，如 openresty）
+  $0 --bt-openresty=openresty --deploy-conf
 
 支持的系统:
   - Ubuntu/Debian

@@ -239,6 +239,9 @@ download_module_dependencies() {
     "terminal.sh"
     "fail2ban.sh"
     "openresty.sh"
+    "baota_modsec_connector.sh"
+    "baota_modsec_deploy.sh"
+    "btwaf_extend.sh"
     "help.sh"
   )
   
