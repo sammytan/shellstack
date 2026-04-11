@@ -118,31 +118,47 @@ _modsecurity_submodule_url_for_path() {
   esac
 }
 
-# 主仓库来自 Gitee（或显式要求）时，将所有子模块 URL 指到 Gitee mirrors。
-# 若未全部重写，git submodule update --recursive 会先拉到 bindings/python 等仍指向 GitHub 的模块并超时，导致 libinjection/mbedtls 永远拉不下来。
-_modsecurity_apply_gitee_submodule_mirrors() {
-  local origin
+# 是否「先」用 Gitee 拉 others/libinjection、others/mbedtls（默认 0：与旧版一致，先 GitHub+代理，失败再 Gitee）
+MODSECURITY_OTHERS_SUBMODULES_GITEE_FIRST="${MODSECURITY_OTHERS_SUBMODULES_GITEE_FIRST:-0}"
+
+_modsecurity_origin_is_gitee_or_force_submodules() {
   MODSECURITY_ORIGIN_IS_GITEE=0
+  local origin
   origin=$(git remote get-url origin 2>/dev/null || echo "")
   if [[ "$origin" == *gitee.com* ]]; then
     MODSECURITY_ORIGIN_IS_GITEE=1
   fi
-  if [[ "$MODSECURITY_ORIGIN_IS_GITEE" != "1" && "${MODSECURITY_USE_GITEE_SUBMODULES}" != "1" ]]; then
-    return 0
-  fi
-  log "子模块统一改为 Gitee mirrors（含 Python 绑定与测试数据，避免仍访问 github.com）..."
+  [[ "$MODSECURITY_ORIGIN_IS_GITEE" == "1" || "${MODSECURITY_USE_GITEE_SUBMODULES}" == "1" ]]
+}
+
+# 将 others/* 指到环境变量中的 Gitee 镜像（无 origin 判断；由调用方决定何时使用）
+_modsecurity_set_gitee_urls_for_others_submodules() {
   if git config -f .gitmodules --get 'submodule.others/libinjection.url' &>/dev/null; then
     git config submodule.others/libinjection.url "$MODSECURITY_GITEE_LIBINJECTION_URL"
   fi
   if git config -f .gitmodules --get 'submodule.others/mbedtls.url' &>/dev/null; then
     git config submodule.others/mbedtls.url "$MODSECURITY_GITEE_MBEDTLS_URL"
   fi
+}
+
+# 仅将可选子模块指到 Gitee（避免 bindings/python 等仍走 GitHub 导致超时）
+_modsecurity_apply_gitee_submodule_mirrors_optional() {
+  if ! _modsecurity_origin_is_gitee_or_force_submodules; then
+    return 0
+  fi
+  log "可选子模块使用 Gitee 镜像（Python 绑定、secrules 测试数据）..."
   if git config -f .gitmodules --get 'submodule.test/test-cases/secrules-language-tests.url' &>/dev/null; then
     git config submodule.test/test-cases/secrules-language-tests.url "$MODSECURITY_GITEE_SECRULES_URL"
   fi
   if git config -f .gitmodules --get 'submodule.bindings/python.url' &>/dev/null; then
     git config submodule.bindings/python.url "$MODSECURITY_GITEE_PYTHON_BINDINGS_URL"
   fi
+}
+
+# 兼容旧逻辑：others + 可选 均改为 Gitee URL（不执行 submodule update）
+_modsecurity_apply_gitee_submodule_mirrors() {
+  _modsecurity_set_gitee_urls_for_others_submodules
+  _modsecurity_apply_gitee_submodule_mirrors_optional
 }
 
 # 将 others/* 子模块 URL 设为「前缀 + 上游 GitHub URL」（前缀可为 ghproxy 等镜像根）
@@ -191,11 +207,52 @@ _modsecurity_submodule_update_paths() {
   git submodule update --init --recursive "$@" >>"$LOG_FILE" 2>&1
 }
 
-# 初始化子模块：必须先拉 others/*（configure 硬性依赖，常见为 libinjection，新版本可能含 mbedtls），
-# 再拉可选子模块；切勿一上来就对全仓库 recursive，否则 git 会先克隆 bindings/python 等并因 GitHub 超时而中断。
+# 假定 others/* 已恢复为 .gitmodules 中的 GitHub URL；依次尝试直连、ghproxy、gitclone 等
+_modsecurity_fetch_others_with_github_mirror_ladder() {
+  local -a ms_paths=("$@")
+  if _modsecurity_submodule_update_paths "${ms_paths[@]}"; then
+    return 0
+  fi
+  if GIT_TERMINAL_PROMPT=0 git \
+    -c "http.postBuffer=524288000" \
+    -c "url.https://ghproxy.net/https://github.com/.insteadof=https://github.com/" \
+    submodule update --init --recursive "${ms_paths[@]}" >>"$LOG_FILE" 2>&1; then
+    return 0
+  fi
+  if GIT_TERMINAL_PROMPT=0 git \
+    -c "http.postBuffer=524288000" \
+    -c "url.https://mirror.ghproxy.com/https://github.com/.insteadof=https://github.com/" \
+    submodule update --init --recursive "${ms_paths[@]}" >>"$LOG_FILE" 2>&1; then
+    return 0
+  fi
+  log "insteadOf 仍失败，尝试将子模块 URL 设为 ghproxy 完整路径..."
+  _modsecurity_set_others_submodule_urls_prefixed "https://ghproxy.net/"
+  if _modsecurity_submodule_update_paths "${ms_paths[@]}"; then
+    return 0
+  fi
+  _modsecurity_set_others_submodule_urls_prefixed "https://mirror.ghproxy.com/"
+  if _modsecurity_submodule_update_paths "${ms_paths[@]}"; then
+    return 0
+  fi
+  _modsecurity_reset_others_submodule_urls_to_upstream
+  log "尝试经 gitclone.com 访问 GitHub..."
+  if GIT_TERMINAL_PROMPT=0 git \
+    -c "http.postBuffer=524288000" \
+    -c "url.https://gitclone.com/github.com/.insteadof=https://github.com/" \
+    submodule update --init --recursive "${ms_paths[@]}" >>"$LOG_FILE" 2>&1; then
+    return 0
+  fi
+  _modsecurity_reset_others_submodule_urls_to_upstream
+  if _modsecurity_submodule_update_paths "${ms_paths[@]}"; then
+    return 0
+  fi
+  return 1
+}
+
+# 初始化子模块：必须先拉 others/*（configure 硬性依赖），再拉可选子模块。
 #
-# 注意：主仓来自 Gitee 时子模块 URL 会被指到 Gitee；若 Gitee 失败，原先仅用「insteadOf 重写 github.com」无效（URL 仍是 gitee.com）。
-# 因此失败后会先恢复为官方 GitHub URL，再依次尝试 ghproxy / 完整 ghproxy URL / gitclone / 直连 GitHub。
+# 主仓库用 Gitee 只解决「主仓克隆」；others/libinjection 默认仍用 .gitmodules 里的 GitHub URL + 代理（与直接克隆 GitHub 主仓时一致）。
+# 若先改写成 Gitee 子模块镜像，Gitee 上 libinjection 常不可用，会白白失败一轮。最后才回退到 Gitee 上的 others 镜像。
 _modsecurity_git_submodules() {
   local -a ms_paths=()
   local paths_label
@@ -210,63 +267,40 @@ _modsecurity_git_submodules() {
   paths_label="${ms_paths[*]}"
   paths_label="${paths_label// /、}"
 
-  _modsecurity_apply_gitee_submodule_mirrors
-
-  log "拉取构建必需子模块: $paths_label..."
-  if _modsecurity_submodule_update_paths "${ms_paths[@]}"; then
-    :
-  else
-    log "必需子模块（当前远程 URL）失败，恢复为 GitHub 官方 URL 并经 ghproxy.net 拉取..."
-    _modsecurity_reset_others_submodule_urls_to_upstream
-    if GIT_TERMINAL_PROMPT=0 git \
-      -c "http.postBuffer=524288000" \
-      -c "url.https://ghproxy.net/https://github.com/.insteadof=https://github.com/" \
-      submodule update --init --recursive "${ms_paths[@]}" >>"$LOG_FILE" 2>&1; then
-      :
-    elif GIT_TERMINAL_PROMPT=0 git \
-      -c "http.postBuffer=524288000" \
-      -c "url.https://mirror.ghproxy.com/https://github.com/.insteadof=https://github.com/" \
-      submodule update --init --recursive "${ms_paths[@]}" >>"$LOG_FILE" 2>&1; then
+  if [[ "${MODSECURITY_OTHERS_SUBMODULES_GITEE_FIRST}" == "1" ]] || [[ "${MODSECURITY_USE_GITEE_SUBMODULES}" == "1" ]]; then
+    log "拉取构建必需子模块（先试 Gitee：MODSECURITY_OTHERS_SUBMODULES_GITEE_FIRST=1 或 MODSECURITY_USE_GITEE_SUBMODULES=1）: $paths_label..."
+    _modsecurity_set_gitee_urls_for_others_submodules
+    if _modsecurity_submodule_update_paths "${ms_paths[@]}"; then
       :
     else
-      log "insteadOf 仍失败，尝试将子模块 URL 设为 ghproxy 完整路径..."
-      _modsecurity_set_others_submodule_urls_prefixed "https://ghproxy.net/"
-      if _modsecurity_submodule_update_paths "${ms_paths[@]}"; then
-        :
-      else
-        _modsecurity_set_others_submodule_urls_prefixed "https://mirror.ghproxy.com/"
-        if _modsecurity_submodule_update_paths "${ms_paths[@]}"; then
-          :
-        else
-          _modsecurity_reset_others_submodule_urls_to_upstream
-          log "尝试经 gitclone.com 访问 GitHub..."
-          if GIT_TERMINAL_PROMPT=0 git \
-            -c "http.postBuffer=524288000" \
-            -c "url.https://gitclone.com/github.com/.insteadof=https://github.com/" \
-            submodule update --init --recursive "${ms_paths[@]}" >>"$LOG_FILE" 2>&1; then
-            :
-          else
-            _modsecurity_reset_others_submodule_urls_to_upstream
-            if _modsecurity_submodule_update_paths "${ms_paths[@]}"; then
-              :
-            else
-              error "无法拉取必需子模块（$paths_label）。请检查网络，或手动设置可访问的镜像（MODSECURITY_GITEE_LIBINJECTION_URL / MODSECURITY_GITEE_MBEDTLS_URL / MODSECURITY_UPSTREAM_*）。日志: $LOG_FILE"
-            fi
-          fi
-        fi
+      log "Gitee 拉取 others 失败，恢复为 GitHub 官方 URL 并重试..."
+      _modsecurity_reset_others_submodule_urls_to_upstream
+      if ! _modsecurity_fetch_others_with_github_mirror_ladder "${ms_paths[@]}"; then
+        log "GitHub/代理仍失败，最后再次尝试 Gitee 上的 others 镜像..."
+        _modsecurity_set_gitee_urls_for_others_submodules
+        _modsecurity_submodule_update_paths "${ms_paths[@]}" \
+          || error "无法拉取必需子模块（$paths_label）。请检查网络或设置 MODSECURITY_GITEE_LIBINJECTION_URL / MODSECURITY_UPSTREAM_*。日志: $LOG_FILE"
+      fi
+    fi
+  else
+    _modsecurity_reset_others_submodule_urls_to_upstream
+    log "拉取构建必需子模块（优先 GitHub / 代理；主仓来自 Gitee 时亦如此）: $paths_label..."
+    if ! _modsecurity_fetch_others_with_github_mirror_ladder "${ms_paths[@]}"; then
+      log "GitHub 与常用代理均失败，最后尝试 Gitee 上的 libinjection/mbedtls 镜像..."
+      _modsecurity_set_gitee_urls_for_others_submodules
+      if ! _modsecurity_submodule_update_paths "${ms_paths[@]}"; then
+        error "无法拉取必需子模块（$paths_label）。请检查网络，或设置 MODSECURITY_PREFER_GITHUB=1 克隆主仓、或配置可访问的 MODSECURITY_GITEE_LIBINJECTION_URL / MODSECURITY_UPSTREAM_*。日志: $LOG_FILE"
       fi
     fi
   fi
 
   log "拉取可选子模块: bindings/python、test/test-cases/secrules-language-tests（失败一般不影响核心库编译）..."
+  _modsecurity_apply_gitee_submodule_mirrors_optional
   if ! git submodule update --init --recursive bindings/python test/test-cases/secrules-language-tests >>"$LOG_FILE" 2>&1; then
-    _modsecurity_apply_gitee_submodule_mirrors
-    if ! git submodule update --init --recursive bindings/python test/test-cases/secrules-language-tests >>"$LOG_FILE" 2>&1; then
-      GIT_TERMINAL_PROMPT=0 git \
-        -c "http.postBuffer=524288000" \
-        -c "url.https://ghproxy.net/https://github.com/.insteadof=https://github.com/" \
-        submodule update --init --recursive bindings/python test/test-cases/secrules-language-tests >>"$LOG_FILE" 2>&1 \
-        || warn "可选子模块未完全拉取（仅影响 Python 绑定或部分测试，可忽略）。"
-    fi
+    GIT_TERMINAL_PROMPT=0 git \
+      -c "http.postBuffer=524288000" \
+      -c "url.https://ghproxy.net/https://github.com/.insteadof=https://github.com/" \
+      submodule update --init --recursive bindings/python test/test-cases/secrules-language-tests >>"$LOG_FILE" 2>&1 \
+      || warn "可选子模块未完全拉取（仅影响 Python 绑定或部分测试，可忽略）。"
   fi
 }
