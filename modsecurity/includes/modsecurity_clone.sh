@@ -202,9 +202,9 @@ _modsecurity_git_fetch_tags() {
     fetch --tags >>"$LOG_FILE" 2>&1
 }
 
-# 运行 git submodule update；参数为子模块路径列表
+# 运行 git submodule update；参数为子模块路径列表（非交互：绝不弹出用户名密码）
 _modsecurity_submodule_update_paths() {
-  git submodule update --init --recursive "$@" >>"$LOG_FILE" 2>&1
+  GIT_TERMINAL_PROMPT=0 git submodule update --init --recursive "$@" >>"$LOG_FILE" 2>&1
 }
 
 # 假定 others/* 已恢复为 .gitmodules 中的 GitHub URL；依次尝试直连、ghproxy、gitclone 等
@@ -295,12 +295,24 @@ _modsecurity_git_submodules() {
   fi
 
   log "拉取可选子模块: bindings/python、test/test-cases/secrules-language-tests（失败一般不影响核心库编译）..."
-  _modsecurity_apply_gitee_submodule_mirrors_optional
-  if ! git submodule update --init --recursive bindings/python test/test-cases/secrules-language-tests >>"$LOG_FILE" 2>&1; then
-    GIT_TERMINAL_PROMPT=0 git \
-      -c "http.postBuffer=524288000" \
-      -c "url.https://ghproxy.net/https://github.com/.insteadof=https://github.com/" \
-      submodule update --init --recursive bindings/python test/test-cases/secrules-language-tests >>"$LOG_FILE" 2>&1 \
+  # 先恢复为 .gitmodules 中的官方 URL 再拉取；若先改 Gitee，部分环境会弹出 Gitee 登录（非交互安装不应出现）。
+  GIT_TERMINAL_PROMPT=0 git submodule sync bindings/python test/test-cases/secrules-language-tests >>"$LOG_FILE" 2>&1 || true
+  if GIT_TERMINAL_PROMPT=0 git submodule update --init --recursive bindings/python test/test-cases/secrules-language-tests >>"$LOG_FILE" 2>&1; then
+    :
+  elif GIT_TERMINAL_PROMPT=0 git \
+    -c "http.postBuffer=524288000" \
+    -c "url.https://ghproxy.net/https://github.com/.insteadof=https://github.com/" \
+    submodule update --init --recursive bindings/python test/test-cases/secrules-language-tests >>"$LOG_FILE" 2>&1; then
+    :
+  elif GIT_TERMINAL_PROMPT=0 git \
+    -c "http.postBuffer=524288000" \
+    -c "url.https://mirror.ghproxy.com/https://github.com/.insteadof=https://github.com/" \
+    submodule update --init --recursive bindings/python test/test-cases/secrules-language-tests >>"$LOG_FILE" 2>&1; then
+    :
+  else
+    log "可选子模块经 GitHub/代理失败，尝试 Gitee 镜像（失败可忽略）..."
+    _modsecurity_apply_gitee_submodule_mirrors_optional
+    GIT_TERMINAL_PROMPT=0 git submodule update --init --recursive bindings/python test/test-cases/secrules-language-tests >>"$LOG_FILE" 2>&1 \
       || warn "可选子模块未完全拉取（仅影响 Python 绑定或部分测试，可忽略）。"
   fi
 }
