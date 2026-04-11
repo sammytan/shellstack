@@ -22,6 +22,8 @@ SHELLSTACK_BTWAF_LEGACY_TARBALL="${SHELLSTACK_BTWAF_LEGACY_TARBALL:-0}"
 # 为 0 时跳过宝塔 install_soft 安装 Redis
 SHELLSTACK_INSTALL_REDIS="${SHELLSTACK_INSTALL_REDIS:-1}"
 SHELLSTACK_REDIS_VER="${SHELLSTACK_REDIS_VER:-8.0}"
+# _btwaf_fetch_overlay_via_http 成功时写入临时目录路径（勿用 $(...) 捕获，log() 会污染 stdout）
+_SHELLSTACK_BTWAF_HTTP_STAGE=""
 
 _btwaf_resolve_extracted_root() {
   local stage="$1"
@@ -233,7 +235,12 @@ _btwaf_cache_lua_looks_valid() {
   local f="$1"
   [[ -s "$f" ]] || return 1
   grep -qi '<!DOCTYPE\|<html' "$f" 2>/dev/null && return 1
-  grep -qE 'resty\.redis|schedule_body_page_cache|require\s*\(?[\"'\'']resty\.redis' "$f" 2>/dev/null
+  if grep -qE 'resty\.redis|schedule_body_page_cache|require\s*\(?[\"'\'']resty\.redis' "$f" 2>/dev/null; then
+    return 0
+  fi
+  # 兜底：避免 grep 因环境差异失败，但明显为 Lua 脚本
+  [[ $(wc -c <"$f" 2>/dev/null | tr -d ' ') -ge 500 ]] && head -n 3 "$f" | grep -qE '^local |^--' && return 0
+  return 1
 }
 
 # 从站点拉取与仓库同路径的扩展文件（至少 lib/cache.lua）
@@ -271,12 +278,13 @@ _btwaf_fetch_overlay_via_http() {
       if _btwaf_try_download_to "$b/waf.lua" "$stage/waf.lua" && [[ -s "$stage/waf.lua" ]]; then
         log "已下载 waf.lua"
       fi
-      echo "$stage"
+      _SHELLSTACK_BTWAF_HTTP_STAGE="$stage"
       return 0
     fi
   done
-  warn "HTTP 未成功拉取 lib/cache.lua（请确认站点已发布 btwaf-ext，且 URL 返回纯 Lua 非 HTML）"
+  warn "HTTP 未成功拉取 lib/cache.lua。请确认：① 站点已发布 btwaf-ext；② URL 返回 200 且为 Lua 非 HTML；③ 若 Nginx 对 .lua 统一 return 403，请增加 location ^~ /btwaf-ext/ { ... } 优先于「禁止 .lua」正则（见仓库 nginx-config-example.conf / TROUBLESHOOTING.md）"
   rm -rf "$stage"
+  _SHELLSTACK_BTWAF_HTTP_STAGE=""
   return 1
 }
 
@@ -290,7 +298,9 @@ _btwaf_overlay_repo_lua_files() {
     log "使用本地扩展源: $src"
   else
     log "未找到本地 btwaf-ext/btwaf（或 SHELLSTACK_BTWAF_OVERLAY_SRC），尝试从 HTTP 下载扩展 Lua..."
-    if tmp_stage="$(_btwaf_fetch_overlay_via_http)"; then
+    if _btwaf_fetch_overlay_via_http; then
+      tmp_stage="${_SHELLSTACK_BTWAF_HTTP_STAGE}"
+      _SHELLSTACK_BTWAF_HTTP_STAGE=""
       src="$tmp_stage"
     fi
   fi
@@ -452,7 +462,7 @@ extend_btwaf_cache_bundle() {
   if [[ ! -f "$BTWAF_INSTALL_DIR/lib/cache.lua" ]]; then
     local _bu="${SHELLSTACK_BASE_URL:-${BASE_URL:-https://shellstack.910918920801.xyz}}"
     _bu="${_bu%/}"
-    warn "未找到 $BTWAF_INSTALL_DIR/lib/cache.lua。远程脚本默认从站点拉取扩展，基址为: ${_bu}（与 curl 管道执行时一致，可用环境变量 SHELLSTACK_BASE_URL 覆盖）。请保证可访问: ${_bu}/btwaf-ext/btwaf/lib/cache.lua（把仓库中的 btwaf-ext 目录按此路径发布到站点根目录）。也可设 SHELLSTACK_BTWAF_OVERLAY_SRC=/本机路径/btwaf 或 SHELLSTACK_BTWAF_CACHE_LUA_URL=单文件直链。"
+    warn "未找到 $BTWAF_INSTALL_DIR/lib/cache.lua。请保证可访问: ${_bu}/btwaf-ext/btwaf/lib/cache.lua（返回 200）。若 wget 为 403，多为 Nginx 拦截 .lua，需配置 location ^~ /btwaf-ext/。也可 SHELLSTACK_BTWAF_OVERLAY_SRC=/本机路径/btwaf 或 SHELLSTACK_BTWAF_CACHE_LUA_URL=直链。"
   fi
 
   log "BTwaf 扩展步骤完成（含 access 阶段 Redis 命中 + body 阶段写入）。升级官方 WAF 后若丢失扩展，请重新执行 --extend-btwaf-cache。"

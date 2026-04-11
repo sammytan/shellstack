@@ -56,6 +56,29 @@ ssh root@shellstack.910918920801.xyz "find /var/www/shellstack -name '*.sh' -typ
 ssh root@shellstack.910918920801.xyz "ls -la /var/www/shellstack/shellstack.sh"
 ```
 
+### 3a. `wget .../btwaf-ext/btwaf/lib/cache.lua` 返回 403 Forbidden
+
+**原因**: Nginx 使用了类似 `location ~ \.(php|lua|pl|cgi)$ { return 403; }` 的规则，所有 `.lua` 请求都会被拒绝；`--extend-btwaf-cache` 用 curl/wget 拉取扩展 Lua 时同样会 403。
+
+**解决**: 为静态仓库目录增加 **`^~` 前缀 location**，使其优先于上述正则（官方文档：带 `^~` 的最长前缀匹配成功后不再尝试正则）：
+
+```nginx
+# 写在「禁止 .lua」的 location 之前或同一 server 内；root 与站点一致即可继承
+location ^~ /btwaf-ext/ {
+    autoindex on;
+    autoindex_exact_size off;
+    autoindex_localtime on;
+    charset utf-8,gbk;
+}
+```
+
+然后 `nginx -t && nginx -s reload`，再验证：
+
+```bash
+curl -fsSL -o /dev/null -w '%{http_code}\n' https://你的域名/btwaf-ext/btwaf/lib/cache.lua
+# 应输出 200
+```
+
 ### 3. Web 服务器无法访问文件
 
 **问题**: Nginx/Apache 返回 403 Forbidden
