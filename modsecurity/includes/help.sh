@@ -197,6 +197,7 @@ ModSecurity 核心库安装脚本
   --extend-btwaf-cache   下载 btwaf.tar.gz（默认 \$SHELLSTACK_BASE_URL/btwaf/btwaf.tar.gz）并覆盖 /www/server/btwaf
   --deploy-conf          宝塔环境：部署 ModSecurity / OWASP CRS / custom 规则、nginx.conf 引用，并在 nginx.conf 与 enable-php-*.conf 中开启 FastCGI 缓存（需宝塔 Nginx）
   --bt-openresty=VER    宝塔 nginx.sh 的 OpenResty 版本键（默认 openresty127，可选 openresty 等）
+  说明: 使用 --extend-btwaf-cache、--deploy-conf 或 --bt-openresty 时，须已安装宝塔面板与「宝塔网站防火墙」(BTwaf)；否则脚本会退出并提示。
   --help                 显示此帮助信息
   --verify               验证已安装的 ModSecurity
   --info                 显示安装信息

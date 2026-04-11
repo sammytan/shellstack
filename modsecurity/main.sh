@@ -112,6 +112,8 @@ EXTEND_BTWAF_CACHE=0
 DEPLOY_MODSEC_CONF=0
 # 宝塔 nginx.sh 的 OpenResty 版本参数：openresty | openresty127 等
 BT_OPENRESTY_VERSION="${BT_OPENRESTY_VERSION:-openresty127}"
+# 是否从命令行传入 --bt-openresty（用于与默认区分，触发宝塔环境预检）
+BT_OPENRESTY_FROM_CLI=0
 
 # 解析命令行参数
 parse_args() {
@@ -197,11 +199,13 @@ parse_args() {
         ;;
       --bt-openresty=*)
         BT_OPENRESTY_VERSION="${1#*=}"
+        BT_OPENRESTY_FROM_CLI=1
         export BT_OPENRESTY_VERSION
         shift
         ;;
       --bt-openresty)
         BT_OPENRESTY_VERSION="$2"
+        BT_OPENRESTY_FROM_CLI=1
         export BT_OPENRESTY_VERSION
         shift 2
         ;;
@@ -403,6 +407,11 @@ main_install() {
 main() {
   # 解析命令行参数
   parse_args "$@"
+
+  # 宝塔相关参数需已安装宝塔面板与 BTwaf
+  # shellcheck source=includes/baota_require_check.sh
+  source "$INCLUDES_DIR/baota_require_check.sh"
+  shellstack_require_baota_btwaf_for_modsecurity_flags
   
   # 检查特殊命令（如 --help, --verify 等）
   # 这些命令在 parse_args 中已处理并退出
