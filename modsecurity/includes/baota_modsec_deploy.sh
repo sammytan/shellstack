@@ -3,6 +3,11 @@
 # 依赖 shared.sh: log warn error LOG_FILE
 
 BT_NGINX_CONF_DIR="${BT_NGINX_CONF_DIR:-/www/server/nginx/conf}"
+BT_NGINX_BIN="${BT_NGINX_BIN:-/www/server/nginx/sbin/nginx}"
+# 为 0 时不写入 nginx.conf 的 fastcgi_cache 共享区，且不向 enable-php 注入 fastcgi_cache（仅 ModSecurity / real_ip 等）
+SHELLSTACK_DEPLOY_FASTCGI_CACHE="${SHELLSTACK_DEPLOY_FASTCGI_CACHE:-1}"
+# 为 1 时先删除 # shellstack-http-includes-begin … end 旧块再按当前环境重新注入（例如编译 modsecurity-nginx 后补全）
+SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK="${SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK:-0}"
 BT_WHITELIST_FILE="${BT_WHITELIST_FILE:-/www/server/whitelist.txt}"
 CRS_GIT_BRANCH="${CRS_GIT_BRANCH:-v3.3.5}"
 CRS_GIT_URL="${CRS_GIT_URL:-https://github.com/coreruleset/coreruleset.git}"
@@ -52,31 +57,78 @@ _baota_deploy_clone_crs() {
   _baota_git_clone_shallow "$CRS_GIT_URL_FALLBACK" "$dest" ""
 }
 
-# 在 http 块中加入 fastcgi_cache 共享区（与 enable-php 中的 fastcgi_cache fastcgi_cache; 对应）
-_baota_ensure_fastcgi_cache_zone_in_nginx_conf() {
+_baota_nginx_has_modsecurity_module() {
+  [[ -x "$BT_NGINX_BIN" ]] || return 1
+  "$BT_NGINX_BIN" -V 2>&1 | grep -qi modsecurity
+}
+
+# 在 http{} 内注入：real_ip 始终写入；modsecurity 仅当 nginx 已编进 modsecurity-nginx；fastcgi 共享区仅当开启 SHELLSTACK_DEPLOY_FASTCGI_CACHE 且尚未存在 keys_zone
+_baota_inject_shellstack_http_block_in_nginx_conf() {
   local ngx="$BT_NGINX_CONF_DIR/nginx.conf"
   [[ -f "$ngx" ]] || return 0
-  if grep -q 'fastcgi_cache_path' "$ngx" 2>/dev/null; then
-    log "nginx.conf 已包含 fastcgi_cache_path，跳过共享区注入"
+
+  local begin='# shellstack-http-includes-begin'
+  local ending='# shellstack-http-includes-end'
+
+  if grep -qF "$begin" "$ngx" 2>/dev/null && [[ "${SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK:-0}" != "1" ]]; then
+    log "nginx.conf 已包含 shellstack http 块（$begin），跳过。若已新编译 modsecurity-nginx 需补全指令，请设置 SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK=1 后重跑 --deploy-conf"
     return 0
   fi
-  mkdir -p /www/wwwlogs/fastcgi_cache
-  local zonef
-  zonef="$(mktemp)"
-  cat > "$zonef" <<'ZONE'
-        fastcgi_cache_path /www/wwwlogs/fastcgi_cache levels=1:2 keys_zone=fastcgi_cache:10m max_size=10g inactive=60m use_temp_path=off;
-        fastcgi_cache_key "$scheme$request_method$host$request_uri";
-ZONE
-  if grep -q 'include proxy.conf;' "$ngx"; then
-    sed -i '/include proxy.conf;/r '"$zonef" "$ngx"
-    log "已向 nginx.conf 注入 fastcgi_cache_path / fastcgi_cache_key（锚点: include proxy.conf）"
-  elif grep -q 'default_type' "$ngx"; then
-    sed -i '/default_type[[:space:]]/r '"$zonef" "$ngx"
-    log "已向 nginx.conf 注入 fastcgi_cache（锚点: default_type）"
-  else
-    warn "无法在 nginx.conf 中自动插入 fastcgi_cache_path，请手工在 http{} 内添加"
+
+  if grep -qF "$begin" "$ngx" 2>/dev/null && [[ "${SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK:-0}" == "1" ]]; then
+    sed -i '/# shellstack-http-includes-begin/,/# shellstack-http-includes-end/d' "$ngx"
+    log "已按 SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK=1 移除旧 shellstack http 块"
   fi
-  rm -f "$zonef"
+
+  mkdir -p /www/wwwlogs/fastcgi_cache
+
+  local has_ms=0
+  if _baota_nginx_has_modsecurity_module; then
+    has_ms=1
+  else
+    warn "当前 $BT_NGINX_BIN 未包含 modsecurity 模块，将不写入 modsecurity on / modsecurity_rules_file（仅 real_ip 等）。请先完成 ModSecurity-nginx 编译后再设置 SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK=1 并重跑 --deploy-conf。"
+  fi
+
+  local want_fc_zone=0
+  if [[ "${SHELLSTACK_DEPLOY_FASTCGI_CACHE:-1}" == "1" ]] && ! grep -q 'fastcgi_cache_path' "$ngx" 2>/dev/null; then
+    want_fc_zone=1
+  elif [[ "${SHELLSTACK_DEPLOY_FASTCGI_CACHE:-1}" != "1" ]]; then
+    log "SHELLSTACK_DEPLOY_FASTCGI_CACHE=0，跳过 nginx.conf 中的 fastcgi_cache_path / fastcgi_cache_key"
+  fi
+
+  local snip
+  snip="$(mktemp)"
+  {
+    echo "        $begin"
+    echo '        # shellstack-real-ip'
+    echo '        set_real_ip_from  0.0.0.0/0;'
+    echo '        real_ip_header    X-Forwarded-For;'
+    echo '        real_ip_recursive on;'
+    if [[ "$has_ms" -eq 1 ]]; then
+      echo '        # shellstack-modsecurity'
+      echo '        # 只有当安装了 modsecurity-nginx 才能启用以下配置;'
+      echo '        modsecurity on;'
+      echo '        modsecurity_rules_file /www/server/nginx/conf/modsec_includes.conf;'
+    fi
+    if [[ "$want_fc_zone" -eq 1 ]]; then
+      echo '        # shellstack-fastcgi-cache-zone'
+      echo '        # 只有开启了 fastcgi 缓存才能启用这些配置;'
+      echo '        fastcgi_cache_path /www/wwwlogs/fastcgi_cache levels=1:2 keys_zone=fastcgi_cache:10m max_size=10g inactive=60m use_temp_path=off;'
+      echo '        fastcgi_cache_key "$scheme$request_method$host$request_uri";'
+    fi
+    echo "        $ending"
+  } > "$snip"
+
+  if grep -q 'include proxy.conf;' "$ngx"; then
+    sed -i '/include proxy.conf;/r '"$snip" "$ngx"
+    log "已向 nginx.conf 注入 shellstack http 块（锚点: include proxy.conf）"
+  elif grep -q 'default_type' "$ngx"; then
+    sed -i '/default_type[[:space:]]/r '"$snip" "$ngx"
+    log "已向 nginx.conf 注入 shellstack http 块（锚点: default_type）"
+  else
+    warn "无法在 nginx.conf 中找到 include proxy.conf 或 default_type，请手工在 http{} 内加入相关配置"
+  fi
+  rm -f "$snip"
 }
 
 # 在 enable-php-*.conf 的 PHP location 内开启 FastCGI 缓存（默认宝塔未写这些指令）
@@ -258,22 +310,12 @@ SecRule IP:block_time "@ge 1" \
 RULES
   log "已写入 $BT_NGINX_CONF_DIR/custom_modsec_rules.conf"
 
-  local ngx_conf="$BT_NGINX_CONF_DIR/nginx.conf"
-  if [[ ! -f "$ngx_conf" ]]; then
-    warn "未找到 $ngx_conf，跳过 nginx.conf 注入"
-  elif grep -q 'modsecurity_rules_file' "$ngx_conf"; then
-    log "nginx.conf 已含 modsecurity 指令，跳过注入"
+  _baota_inject_shellstack_http_block_in_nginx_conf
+  if [[ "${SHELLSTACK_DEPLOY_FASTCGI_CACHE:-1}" == "1" ]]; then
+    _baota_inject_fastcgi_cache_into_enable_php_confs
   else
-    if sed -i '/real_ip_recursive on;/a\        modsecurity on;' "$ngx_conf" 2>>"$LOG_FILE" \
-      && sed -i '/modsecurity on;/a\        modsecurity_rules_file /www/server/nginx/conf/modsec_includes.conf;' "$ngx_conf" 2>>"$LOG_FILE"; then
-      log "已向 nginx.conf 注入 modsecurity 指令"
-    else
-      warn "sed 注入 modsecurity 失败，请手工在 http 块中加入 modsecurity on 与 modsecurity_rules_file"
-    fi
+    log "SHELLSTACK_DEPLOY_FASTCGI_CACHE=0，跳过 enable-php 中的 FastCGI 缓存片段"
   fi
-
-  _baota_ensure_fastcgi_cache_zone_in_nginx_conf
-  _baota_inject_fastcgi_cache_into_enable_php_confs
 
   log "配置部署完成。请确认 GeoIP 数据库路径、执行 nginx -t 后重载 Nginx。"
 }

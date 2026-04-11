@@ -127,34 +127,38 @@ show_info() {
     log "链接选项: $libs"
   fi
 
-  # GeoIP 信息
+  # GeoIP 信息（默认目录可自动创建；未启用 --enable-geoip 时不告警）
   echo
   log "GeoIP 信息:"
-  if [ -d "$GEOIP_DIR" ]; then
+  GEOIP_DIR="${GEOIP_DIR:-/usr/local/share/GeoIP}"
+  if ! mkdir -p "$GEOIP_DIR" 2>/dev/null; then
+    warn "无法创建 GeoIP 目录: $GEOIP_DIR"
+  else
     log "数据库目录: $GEOIP_DIR"
-    local db_files=$(find "$GEOIP_DIR" -name "*.mmdb" 2>/dev/null | wc -l)
+    local db_files
+    db_files=$(find "$GEOIP_DIR" -name "*.mmdb" 2>/dev/null | wc -l | tr -d '[:space:]')
+    db_files=${db_files:-0}
     log "数据库文件数量: $db_files"
-    
-    if [ $db_files -gt 0 ]; then
-      # 检查 DB-IP Lite
+
+    if [ "$db_files" -gt 0 ]; then
       if [ -f "${GEOIP_DIR}/dbip-country-lite.mmdb" ]; then
         local db_size=$(ls -lh "${GEOIP_DIR}/dbip-country-lite.mmdb" 2>/dev/null | awk '{print $5}')
         local db_date=$(stat -c %y "${GEOIP_DIR}/dbip-country-lite.mmdb" 2>/dev/null | cut -d' ' -f1 || stat -f "%Sm" -t "%Y-%m-%d" "${GEOIP_DIR}/dbip-country-lite.mmdb" 2>/dev/null || echo "未知")
         log "  - DB-IP Lite: dbip-country-lite.mmdb ($db_size, 更新日期: $db_date)"
       fi
-      
-      # 检查 MaxMind GeoLite2
       find "$GEOIP_DIR" -name "GeoLite2-*.mmdb" 2>/dev/null | while read -r db_file; do
         local db_size=$(ls -lh "$db_file" 2>/dev/null | awk '{print $5}')
         local db_date=$(stat -c %y "$db_file" 2>/dev/null | cut -d' ' -f1 || stat -f "%Sm" -t "%Y-%m-%d" "$db_file" 2>/dev/null || echo "未知")
         log "  - MaxMind: $(basename "$db_file") ($db_size, 更新日期: $db_date)"
       done
     else
-      warn "未找到 GeoIP 数据库文件"
-      log "提示: 使用 --enable-geoip 安装 GeoIP 支持"
+      if [ "${ENABLE_GEOIP:-0}" = "1" ]; then
+        warn "未找到 GeoIP 数据库文件（.mmdb）"
+        log "提示: 检查 GeoIP 安装步骤或手动将 .mmdb 放入 $GEOIP_DIR"
+      else
+        log "尚未安装 GeoIP 数据库（未使用 --enable-geoip 时可忽略）"
+      fi
     fi
-  else
-    warn "GeoIP 数据库目录不存在"
   fi
 
   # 使用示例
@@ -198,6 +202,7 @@ ModSecurity 核心库安装脚本
   --deploy-conf          宝塔环境：部署 ModSecurity / OWASP CRS / custom 规则、nginx.conf 引用，并在 nginx.conf 与 enable-php-*.conf 中开启 FastCGI 缓存（需宝塔 Nginx）
   --bt-openresty=VER    宝塔 nginx.sh 的 OpenResty 版本键（默认 openresty127，可选 openresty 等）
   说明: 使用 --extend-btwaf-cache、--deploy-conf 或 --bt-openresty 时，须已安装宝塔面板与「宝塔网站防火墙」(BTwaf)；否则脚本会退出并提示。
+  说明: --deploy-conf 写入 nginx.conf 时仅在 \`nginx -V\` 含 modsecurity 时注入 modsecurity 指令；SHELLSTACK_DEPLOY_FASTCGI_CACHE=0 可关闭 fastcgi 共享区与 enable-php 缓存；编译 ModSecurity-nginx 后可用 SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK=1 删除旧块并重注入。
   说明: 若 Nginx 已含 ModSecurity 且与当前 --bt-openresty 版本一致，将跳过重复编译；强制重编可设 MODSECURITY_FORCE_BT_NGINX_REBUILD=1。
   --help                 显示此帮助信息
   --verify               验证已安装的 ModSecurity
