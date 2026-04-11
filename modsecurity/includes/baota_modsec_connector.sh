@@ -5,6 +5,8 @@
 MODSECURITY_NGX_CONNECTOR_DIR="${MODSECURITY_NGX_CONNECTOR_DIR:-/www/server/modsecurity-nginx}"
 BT_PANEL_NGINX_SH="${BT_PANEL_NGINX_SH:-/www/server/panel/install/nginx.sh}"
 BT_OPENRESTY_VERSION="${BT_OPENRESTY_VERSION:-openresty127}"
+# 设为 1 时强制执行宝塔 nginx.sh update（跳过「已就绪」检测）
+MODSECURITY_FORCE_BT_NGINX_REBUILD="${MODSECURITY_FORCE_BT_NGINX_REBUILD:-0}"
 
 _baota_panel_present() {
   [[ -f "$BT_PANEL_NGINX_SH" ]] && [[ -f /www/server/panel/install/public.sh ]]
@@ -74,10 +76,54 @@ _baota_append_nginx_configure_modsecurity() {
   log "已追加到 nginx_configure.pl: $flag"
 }
 
+# 当前 Nginx 是否已是「目标 OpenResty 键 + 已编进 ModSecurity-nginx」，可跳过重复 nginx.sh update
+_baota_skip_openresty_rebuild_if_current() {
+  [[ "${MODSECURITY_FORCE_BT_NGINX_REBUILD}" == "1" ]] && return 1
+
+  local nginx_bin="/www/server/nginx/sbin/nginx"
+  local cfg="/www/server/panel/install/nginx_configure.pl"
+  local vchk="/www/server/nginx/version_check.pl"
+  local want="${BT_OPENRESTY_VERSION:-openresty127}"
+
+  [[ -x "$nginx_bin" ]] || return 1
+  if ! "$nginx_bin" -V 2>&1 | grep -qi modsecurity; then
+    return 1
+  fi
+  [[ -f "$cfg" ]] && grep -qF -- "--add-module=${MODSECURITY_NGX_CONNECTOR_DIR}" "$cfg" 2>/dev/null || return 1
+  [[ -f "$vchk" ]] || return 1
+
+  local line
+  line=$(head -1 "$vchk" | tr -d '[:space:]')
+
+  case "$want" in
+    openresty127)
+      [[ "$line" == *openresty-1.27* ]] || [[ "$line" == *openresty-1.28* ]] || [[ "$line" == *openresty-1.29* ]] || return 1
+      ;;
+    openresty)
+      [[ "$line" == *openresty-1.25* ]] || [[ "$line" == *openresty-1.24* ]] || [[ "$line" == *openresty-1.23* ]] || [[ "$line" == *openresty-1.26* ]] || return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  return 0
+}
+
 # 检测宝塔并升级/重编译 OpenResty，静态链接 ModSecurity-nginx 连接器
 baota_install_openresty_with_modsecurity_connector() {
   if ! _baota_panel_present; then
     warn "未检测到宝塔面板（缺少 $BT_PANEL_NGINX_SH），跳过 OpenResty + ModSecurity-nginx 编译。"
+    return 0
+  fi
+
+  if _baota_skip_openresty_rebuild_if_current; then
+    log "当前 OpenResty（version_check.pl: $(head -1 /www/server/nginx/version_check.pl 2>/dev/null | tr -d '\n')）已包含 ModSecurity，且与 --bt-openresty=${BT_OPENRESTY_VERSION} 一致，跳过重复执行 nginx.sh update。"
+    log "若需强制重新编译 Nginx，请设置: export MODSECURITY_FORCE_BT_NGINX_REBUILD=1 后重跑。"
+    if nginx -V 2>&1 | grep -qi modsecurity; then
+      log "验证: nginx -V 已包含 modsecurity"
+    fi
+    log "宝塔 OpenResty 与 ModSecurity-nginx 无需变更。请按需: nginx -t && /etc/init.d/nginx restart"
     return 0
   fi
 
