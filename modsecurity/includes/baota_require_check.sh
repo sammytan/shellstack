@@ -34,11 +34,20 @@ shellstack_require_baota_btwaf_for_modsecurity_flags() {
     lines+=("请先安装宝塔 Linux 面板后再使用 --bt-openresty / --deploy-conf / --extend-btwaf-cache。")
   fi
 
+  # --extend-btwaf-cache 会在安装流程中执行面板 BTwaf 安装脚本并下发扩展文件，不要求事先已部署 /www/server/btwaf
+  if [[ "${EXTEND_BTWAF_CACHE:-0}" == "1" ]]; then
+    if [[ ${#lines[@]} -gt 0 ]]; then
+      error "$(printf '%s\n' "${lines[@]}")"
+    fi
+    log "环境检查: 已检测到宝塔面板；--extend-btwaf-cache 将安装/同步 BTwaf 与 Redis 扩展。"
+    return 0
+  fi
+
   if ! _shellstack_detect_btwaf_installed; then
     lines+=("未检测到宝塔网站防火墙（BTwaf）：")
     lines+=("  - 期望 /www/server/btwaf 下存在 waf.lua 或 init.lua（面板已部署 WAF），或")
     lines+=("  - 已安装面板插件目录 /www/server/panel/plugin/btwaf")
-    lines+=("请在宝塔「软件商店」安装「宝塔网站防火墙」并完成部署后再执行上述参数。")
+    lines+=("请在宝塔「软件商店」安装「宝塔网站防火墙」并完成部署后再执行上述参数；或先使用 --extend-btwaf-cache 自动安装扩展。")
   fi
 
   if [[ ${#lines[@]} -gt 0 ]]; then

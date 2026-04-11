@@ -13,8 +13,6 @@
 
 local body_filter={}
 
-local cjson = require "cjson"
-
 function body_filter.check_type()
   if ngx.header.content_type== nil then return false end
   if string.find(ngx.header.content_type, "text/html") ~= nil then
@@ -69,16 +67,6 @@ function body_filter.browser()
     end 
 end
 
-local function build_cache_key()
-    local uri = ngx.var.uri or ""
-    local args = ngx.var.args or ""
-    local ua = ngx.req.get_headers()["user-agent"] or ""
-    local accept_encoding = ngx.req.get_headers()["accept-encoding"] or ""
-    local raw = uri .. "|" .. args .. "|" .. ua .. "|" .. accept_encoding
-    local key = "php_cache:" .. ngx.md5(raw)
-    return key
-end
-
 --替换body中的敏感词
 function body_filter.run_body()
     if BTWAF_RULES.body_character_len==0 and ngx.ctx.crawler_html==false then return false end
@@ -126,45 +114,9 @@ function body_filter.run_body()
             ngx.arg[1]=whole
         end
 
-        -- ====== Redis 缓存异步写入 ======
-        if ngx.req.get_method() == "GET" and ngx.status == 200 and not ngx.ctx.white_rule then
-            local headers = {}
-            for k, v in pairs(ngx.header) do
-                headers[k] = v
-            end
-            local cache_key = build_cache_key()
-            local ttl = 180  -- 可根据需要调整
-            local cache_data = cjson.encode({
-                content = whole,
-                headers = headers,
-                url = ngx.var.uri,
-                args = ngx.var.args,
-                user_agent = ngx.req.get_headers()["user-agent"]
-            })
-            local function async_write(premature, key, ttl, value)
-                if premature then return end
-                local redis = require("resty.redis")
-                local red = redis:new()
-                red:set_timeout(1000)
-                local ok, err = red:connect("127.0.0.1", 6379)
-                if not ok then
-                    ngx.log(ngx.ERR, "[CACHE] async Redis connect failed: ", err)
-                    return
-                end
-                local ok1 = red:setex(key, ttl, value)
-                if not ok1 then
-                    ngx.log(ngx.ERR, "[CACHE] async Redis setex failed")
-                    return
-                end
-                red:set_keepalive(10000, 10)
-                ngx.log(ngx.ERR, "[CACHE] async Redis setex success: ", key)
-            end
-            local ok, err = ngx.timer.at(0, async_write, cache_key, ttl, cache_data)
-            if not ok then
-                ngx.log(ngx.ERR, "[CACHE] Failed to start async write: ", err)
-            end
+        if cache and cache.schedule_body_page_cache then
+            cache.schedule_body_page_cache(180, whole)
         end
-        -- ===========================
     end
 end
 

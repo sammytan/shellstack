@@ -12,6 +12,23 @@ local redis_config = {
 local CACHE_PREFIX = "php_cache:"
 local DEFAULT_TTL = 180 -- 3 minutes in seconds
 
+-- access 阶段命中缓存用，避免每条请求打 ERR 日志
+local function get_redis_client_quiet()
+    local client = redis:new()
+    client:set_timeout(1000)
+    local ok, err = client:connect(redis_config.host, redis_config.port)
+    if not ok then
+        return nil
+    end
+    if redis_config.db and redis_config.db > 0 then
+        local ok_db, err_db = client:select(redis_config.db)
+        if not ok_db then
+            return nil
+        end
+    end
+    return client
+end
+
 -- 获取 Redis 客户端
 local function get_redis_client()
     local client = redis:new()
@@ -98,10 +115,94 @@ local function clear_all_cache()
     end
 end
 
+-- body_filter 阶段：与 URI+查询串键不同，按 UA/Accept-Encoding 区分变体（与 body.lua 原逻辑一致）
+local function body_fingerprint_key()
+    local uri = ngx.var.uri or ""
+    local args = ngx.var.args or ""
+    local ua = ngx.req.get_headers()["user-agent"] or ""
+    local accept_encoding = ngx.req.get_headers()["accept-encoding"] or ""
+    local raw = uri .. "|" .. args .. "|" .. ua .. "|" .. accept_encoding
+    return CACHE_PREFIX .. ngx.md5(raw)
+end
+
+local function async_redis_setex(premature, key, ttl, value)
+    if premature then return end
+    local red = redis:new()
+    red:set_timeout(1000)
+    local ok, err = red:connect(redis_config.host, redis_config.port)
+    if not ok then
+        ngx.log(ngx.ERR, "[cache] async Redis connect failed: ", err or "")
+        return
+    end
+    if redis_config.db and redis_config.db > 0 then
+        red:select(redis_config.db)
+    end
+    local ok1 = red:setex(key, ttl, value)
+    if not ok1 then
+        ngx.log(ngx.ERR, "[cache] async Redis setex failed: ", key)
+        return
+    end
+    red:set_keepalive(10000, 10)
+end
+
+-- 供 body_filter 在拼装完整响应体后异步写入 Redis（GET 200、非白名单）
+-- access 阶段：与 schedule_body_page_cache 使用同一 Redis 键；命中则 ngx.exit(200)，未命中返回（继续 WAF）
+local function try_access_cache_hit()
+    if ngx.req.get_method() ~= "GET" then return end
+    local sk = ngx.var.skip_cache
+    if sk == "1" or sk == "true" then return end
+    local client = get_redis_client_quiet()
+    if not client then return end
+    local key = body_fingerprint_key()
+    local raw, err = client:get(key)
+    client:set_keepalive(10000, 10)
+    if not raw or raw == ngx.null then return end
+    local ok, data = pcall(cjson.decode, raw)
+    if not ok or type(data) ~= "table" or type(data.content) ~= "string" then return end
+    if data.headers and type(data.headers) == "table" then
+        for hk, hv in pairs(data.headers) do
+            if type(hv) == "string" then
+                local hkl = string.lower(tostring(hk))
+                if hkl ~= "transfer-encoding" and hkl ~= "content-length" then
+                    ngx.header[hk] = hv
+                end
+            end
+        end
+    end
+    ngx.header["X-Shellstack-Cache"] = "HIT"
+    ngx.print(data.content)
+    ngx.exit(ngx.HTTP_OK)
+end
+
+local function schedule_body_page_cache(ttl, whole)
+    ttl = ttl or DEFAULT_TTL
+    if ngx.req.get_method() ~= "GET" then return end
+    if ngx.status ~= 200 then return end
+    if ngx.ctx.white_rule then return end
+    local headers = {}
+    for k, v in pairs(ngx.header) do
+        headers[k] = v
+    end
+    local key = body_fingerprint_key()
+    local payload = cjson.encode({
+        content = whole,
+        headers = headers,
+        url = ngx.var.uri,
+        args = ngx.var.args,
+        user_agent = ngx.req.get_headers()["user-agent"]
+    })
+    local ok, err = ngx.timer.at(0, async_redis_setex, key, ttl, payload)
+    if not ok then
+        ngx.log(ngx.ERR, "[cache] timer.at failed: ", err or "")
+    end
+end
+
 -- Export functions
 return {
     get_cached_content = get_cached_content,
     set_cached_content = set_cached_content,
     delete_cache = delete_cache,
-    clear_all_cache = clear_all_cache
-} 
+    clear_all_cache = clear_all_cache,
+    schedule_body_page_cache = schedule_body_page_cache,
+    try_access_cache_hit = try_access_cache_hit
+}

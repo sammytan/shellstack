@@ -198,11 +198,12 @@ ModSecurity 核心库安装脚本
   --disable-kernel-opt   禁用 Google BBR 内核优化
   --disable-terminal     禁用终端配置
   --jobs=N               设置并行编译任务数 (默认: 自动检测，根据内存和CPU核心数)
-  --extend-btwaf-cache   下载 btwaf.tar.gz（默认 \$SHELLSTACK_BASE_URL/btwaf/btwaf.tar.gz）并覆盖 /www/server/btwaf
+  --extend-btwaf-cache   宝塔：执行面板插件 btwaf 的 install.sh、安装 Redis（可选）、再仅覆盖仓库 btwaf-ext/btwaf 中的扩展（lib/cache.lua、body.lua 等）；旧版全量 tar 包见 SHELLSTACK_BTWAF_LEGACY_TARBALL
   --deploy-conf          宝塔环境：部署 ModSecurity / OWASP CRS / custom 规则、nginx.conf 引用，并在 nginx.conf 与 enable-php-*.conf 中开启 FastCGI 缓存（需宝塔 Nginx）
   --bt-openresty=VER    宝塔 nginx.sh 的 OpenResty 版本键（默认 openresty127，可选 openresty 等）
-  说明: 使用 --extend-btwaf-cache、--deploy-conf 或 --bt-openresty 时，须已安装宝塔面板与「宝塔网站防火墙」(BTwaf)；否则脚本会退出并提示。
+  说明: 使用 --deploy-conf 或 --bt-openresty 时须已安装宝塔面板与 BTwaf；--extend-btwaf-cache 仅需宝塔面板（将调用面板 WAF 安装脚本并下发扩展）。
   说明: --deploy-conf 写入 nginx.conf 时仅在 \`nginx -V\` 含 modsecurity 时注入 modsecurity 指令；SHELLSTACK_DEPLOY_FASTCGI_CACHE=0 可关闭 fastcgi 共享区与 enable-php 缓存；编译 ModSecurity-nginx 后可用 SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK=1 删除旧块并重注入。
+  说明: --extend-btwaf-cache 环境变量：SHELLSTACK_BTWAF_PANEL_INSTALL=0 跳过面板 install.sh；SHELLSTACK_INSTALL_REDIS=0 跳过 Redis；SHELLSTACK_BTWAF_LEGACY_TARBALL=1 启用旧版 btwaf.tar.gz 全量覆盖；SHELLSTACK_BTWAF_OVERLAY_INIT_LUA=1 才覆盖 init.lua（默认自动插入 require cache）。部署后含 access 读缓存 + body 写缓存，无需再手改 waf/header。
   说明: 若 Nginx 已含 ModSecurity 且与当前 --bt-openresty 版本一致，将跳过重复编译；强制重编可设 MODSECURITY_FORCE_BT_NGINX_REBUILD=1。
   --help                 显示此帮助信息
   --verify               验证已安装的 ModSecurity
