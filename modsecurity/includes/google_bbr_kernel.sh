@@ -142,10 +142,10 @@ Google BBR 内核优化说明
 
 3. 验证 BBR 是否启用
 ------------------
-运行以下命令检查 BBR 是否启用:
+安装脚本结束时已自动执行 sysctl 并打印当前值；也可随时手动执行:
 sysctl net.ipv4.tcp_congestion_control
 
-如果输出包含 "bbr"，则表示 BBR 已成功启用。
+输出包含 "bbr" 即表示当前会话下 TCP 拥塞控制为 BBR。
 
 4. 系统兼容性
 -----------
@@ -178,7 +178,31 @@ EOF
 
   log "Google BBR 内核优化完成"
   log "详细说明已保存到: /usr/local/share/doc/modsecurity/google-bbr-kernel.txt"
-  log "请重启系统以使所有更改生效"
-  log "重启后，请运行 'sysctl net.ipv4.tcp_congestion_control' 确认 BBR 已启用"
+  _shellstack_log_bbr_verification
+  log "请重启系统以使内核等更改完全生效（若刚安装新内核，重启后 BBR 将随新内核生效）。"
+}
+
+# 安装流程末尾自动打印当前 BBR 相关 sysctl，无需用户再手动执行验证命令
+_shellstack_log_bbr_verification() {
+  log "BBR 验证（已自动执行 sysctl）："
+  local cc=""
+  if command -v sysctl >/dev/null 2>&1; then
+    if cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null); then
+      log "  net.ipv4.tcp_congestion_control = $cc"
+    else
+      log "  net.ipv4.tcp_congestion_control = (读取失败)"
+    fi
+    local avail
+    avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    [[ -n "$avail" ]] && log "  net.ipv4.tcp_available_congestion_control = $avail"
+  else
+    log "  sysctl 不可用，跳过"
+    return 0
+  fi
+  if [[ -n "$cc" ]] && echo "$cc" | grep -qi bbr; then
+    log "  结论: 当前 TCP 拥塞控制已为 bbr。"
+  elif [[ -n "$cc" ]]; then
+    log "  结论: 当前为「$cc」。若刚安装新内核或未重启，重启后应变为 bbr（已写入 /etc/sysctl.d/99-sysctl.conf）。"
+  fi
 }
 

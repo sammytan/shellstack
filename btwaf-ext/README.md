@@ -4,7 +4,9 @@
 
 ## 与 ShellStack `--extend-btwaf-cache` 的配合
 
-1. 在服务器上保留本仓库的 **`btwaf-ext/btwaf`** 目录（至少包含 `lib/cache.lua`、`body.lua`、`waf.lua`）。
+1. **扩展文件来源（任选）**：① 在运行脚本的服务器上**完整克隆本仓库**，使 `btwaf-ext/btwaf` 与 `modsecurity` 目录同级；② 或把本机 **`btwaf-ext/btwaf`** 目录上传到服务器任意路径，执行前设置 **`SHELLSTACK_BTWAF_OVERLAY_SRC=/该路径/btwaf`**；③ 或将 `btwaf-ext/` 同步到你的 **`SHELLSTACK_BASE_URL`（或 `BASE_URL`）** 静态站点下，保证可访问  
+   `https://<你的站点>/btwaf-ext/btwaf/lib/cache.lua`  
+   脚本在本地找不到目录时会自动 **curl/wget 下载**；④ 仅缺 `cache.lua` 时可设 **`SHELLSTACK_BTWAF_CACHE_LUA_URL`** 为单文件直链（如 GitHub raw）。
 2. 执行 ModSecurity 主脚本的 `--extend-btwaf-cache`：脚本会依次运行 **`/www/server/panel/plugin/btwaf/install.sh install`**（需已安装面板「宝塔网站防火墙」插件）、通过 **`install_soft.sh` 安装 Redis**（若 6379 未就绪）、再将 **`btwaf-ext/btwaf`** 中的 **`lib/cache.lua`、`body.lua`、`waf.lua`** 覆盖到 **`/www/server/btwaf`**（若未带 `waf.lua` 会尝试向官方 `waf.lua` **自动注入** access 缓存命中块），并在 **`nginx` 的 `btwaf.conf`** 中按需加入 `lua_shared_dict cache_shared 5000m;`，在 **`init.lua`** 中若无则自动插入 `cache = require "cache"`（支持 sed / perl，无需手改）。
 3. **部署后即用**：`lib/cache.lua` 提供 **`try_access_cache_hit`**（access 阶段读 Redis，键与 body 阶段写入一致）与 **`schedule_body_page_cache`**（body_filter 异步写）；`waf.lua` 在 `pcall(btwaf_run)` 之前调用前者，无需再改 `header.lua`。注意：命中在 **WAF 主逻辑之前**执行以降低延迟；若需先过拦截再缓存，需在业务上自行调整顺序或使用 `skip_cache` 等变量。
 4. **不建议**整目录替换官方 WAF；若必须用旧版 `btwaf.tar.gz` 全量包，可设 **`SHELLSTACK_BTWAF_LEGACY_TARBALL=1`**（仍建议随后再 overlay 扩展文件）。

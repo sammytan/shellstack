@@ -9,6 +9,14 @@ BT_PANEL_INSTALL_DIR="${BT_PANEL_INSTALL_DIR:-/www/server/panel/install}"
 BTWAF_PLUGIN_DIR="${BTWAF_PLUGIN_DIR:-/www/server/panel/plugin/btwaf}"
 # 为 0 时跳过 bash install.sh install（假定你已手动装过面板 WAF）
 SHELLSTACK_BTWAF_PANEL_INSTALL="${SHELLSTACK_BTWAF_PANEL_INSTALL:-1}"
+# 为 1 时无视「已安装」检测，仍执行 install.sh install（修复/强制重装；与面板 Check_install 相反）
+SHELLSTACK_BTWAF_FORCE_PANEL_INSTALL="${SHELLSTACK_BTWAF_FORCE_PANEL_INSTALL:-0}"
+# 手动指定已上传到服务器的 btwaf 扩展目录（须含 lib/cache.lua），优先于脚本旁 btwaf-ext/btwaf
+SHELLSTACK_BTWAF_OVERLAY_SRC="${SHELLSTACK_BTWAF_OVERLAY_SRC:-}"
+# HTTP 扩展根路径（可访问 .../lib/cache.lua），默认 $BASE_URL/btwaf-ext/btwaf
+SHELLSTACK_BTWAF_OVERLAY_BASE_URL="${SHELLSTACK_BTWAF_OVERLAY_BASE_URL:-}"
+# 仅 lib/cache.lua 的直接下载地址（本地与 HTTP 根均失败时的兜底）
+SHELLSTACK_BTWAF_CACHE_LUA_URL="${SHELLSTACK_BTWAF_CACHE_LUA_URL:-}"
 # 为 1 时执行旧逻辑：下载 btwaf.tar.gz 全量解压到 BTWAF_INSTALL_DIR（可与面板安装叠加，一般不建议）
 SHELLSTACK_BTWAF_LEGACY_TARBALL="${SHELLSTACK_BTWAF_LEGACY_TARBALL:-0}"
 # 为 0 时跳过宝塔 install_soft 安装 Redis
@@ -80,10 +88,26 @@ _btwaf_chattr_unlock_path() {
   chattr -R -ia "$p" 2>>"$LOG_FILE" || chattr -ia "$p" 2>>"$LOG_FILE" || true
 }
 
+# 与宝塔 /www/server/panel/plugin/btwaf/install.sh 末尾 Check_install 一致：仅当不存在 /www/server/btwaf/socket 时才应跑完整 Install_btwaf
+_btwaf_panel_btwaf_already_installed() {
+  [[ -d /www/server/btwaf/socket ]]
+}
+
 _btwaf_run_panel_btwaf_install() {
   local ins="$BTWAF_PLUGIN_DIR/install.sh"
   if [[ ! -f "$ins" ]]; then
     error "未找到面板 BTwaf 安装脚本: $ins。请先在宝塔「软件商店」安装「宝塔网站防火墙」插件后再执行 --extend-btwaf-cache。"
+  fi
+  if [[ "${SHELLSTACK_BTWAF_PANEL_INSTALL:-1}" != "1" ]]; then
+    log "SHELLSTACK_BTWAF_PANEL_INSTALL=0，跳过面板 install.sh install"
+    return 0
+  fi
+  if [[ "${SHELLSTACK_BTWAF_FORCE_PANEL_INSTALL:-0}" != "1" ]] && _btwaf_panel_btwaf_already_installed; then
+    log "检测到 BTwaf 已安装（存在 /www/server/btwaf/socket，与面板 install.sh 中 Check_install 判定一致），跳过 install.sh install"
+    return 0
+  fi
+  if [[ "${SHELLSTACK_BTWAF_FORCE_PANEL_INSTALL:-0}" == "1" ]]; then
+    log "SHELLSTACK_BTWAF_FORCE_PANEL_INSTALL=1，将强制执行面板 install.sh install"
   fi
   log "执行面板 BTwaf 安装: cd $BTWAF_PLUGIN_DIR && bash install.sh install"
   if ( cd "$BTWAF_PLUGIN_DIR" && bash install.sh install >>"$LOG_FILE" 2>&1 ); then
@@ -155,33 +179,110 @@ _btwaf_ensure_init_requires_cache_module() {
   warn "无法在 init.lua 中自动插入 cache = require \"cache\"（请安装 perl 或设 SHELLSTACK_BTWAF_OVERLAY_INIT_LUA=1 并保留仓库 btwaf-ext/btwaf/init.lua）"
 }
 
-_btwaf_overlay_repo_lua_files() {
-  local src
-  if ! src="$(_btwaf_shellstack_repo_overlay_dir)"; then
-    warn "仓库中未找到 btwaf-ext/btwaf 目录，跳过扩展文件覆盖（请将仓库 btwaf-ext 一并部署到服务器）"
+# 返回可读的 btwaf 扩展目录（含 lib/cache.lua）：SHELLSTACK_BTWAF_OVERLAY_SRC > 与 includes 同级的 btwaf-ext/btwaf
+_btwaf_resolve_local_overlay_src() {
+  if [[ -n "${SHELLSTACK_BTWAF_OVERLAY_SRC:-}" ]]; then
+    local o="${SHELLSTACK_BTWAF_OVERLAY_SRC}"
+    if [[ -d "$o" ]] && [[ -f "$o/lib/cache.lua" ]]; then
+      echo "$o"
+      return 0
+    fi
+    warn "SHELLSTACK_BTWAF_OVERLAY_SRC 无效或缺少 lib/cache.lua: $o"
+  fi
+  local repo
+  repo="$(_btwaf_shellstack_repo_overlay_dir 2>/dev/null)" || true
+  if [[ -n "$repo" ]] && [[ -f "$repo/lib/cache.lua" ]]; then
+    echo "$repo"
     return 0
   fi
-  local dest="$BTWAF_INSTALL_DIR"
-  mkdir -p "$dest/lib"
-  local files=(lib/cache.lua body.lua waf.lua)
-  local f
-  for f in "${files[@]}"; do
-    if [[ -f "$src/$f" ]]; then
-      _btwaf_chattr_unlock_path "$dest/$f"
-      if \cp -a "$src/$f" "$dest/$f" 2>>"$LOG_FILE"; then
-        log "已覆盖: $dest/$f <= $src/$f"
-      else
-        warn "复制失败: $f"
+  return 1
+}
+
+# 从站点拉取与仓库同路径的扩展文件（至少 lib/cache.lua）
+_btwaf_fetch_overlay_via_http() {
+  local stage
+  stage="$(mktemp -d /tmp/btwaf-overlay.XXXXXX)"
+  mkdir -p "$stage/lib"
+  local root="${SHELLSTACK_BASE_URL:-${BASE_URL:-https://shellstack.910918920801.xyz}}"
+  root="${root%/}"
+  local bases=()
+  if [[ -n "${SHELLSTACK_BTWAF_OVERLAY_BASE_URL:-}" ]]; then
+    bases+=("${SHELLSTACK_BTWAF_OVERLAY_BASE_URL%/}")
+  else
+    bases+=(
+      "$root/btwaf-ext/btwaf"
+      "$root/modsecurity/btwaf-overlay"
+    )
+  fi
+  local b
+  for b in "${bases[@]}"; do
+    [[ -n "$b" ]] || continue
+    rm -f "$stage/lib/cache.lua" "$stage/body.lua" "$stage/waf.lua"
+    log "尝试下载 BTwaf 扩展: $b/lib/cache.lua"
+    if _btwaf_try_download_to "$b/lib/cache.lua" "$stage/lib/cache.lua" && [[ -s "$stage/lib/cache.lua" ]]; then
+      log "已下载 lib/cache.lua"
+      if _btwaf_try_download_to "$b/body.lua" "$stage/body.lua" && [[ -s "$stage/body.lua" ]]; then
+        log "已下载 body.lua"
       fi
-    else
-      warn "扩展源缺少文件: $src/$f"
+      if _btwaf_try_download_to "$b/waf.lua" "$stage/waf.lua" && [[ -s "$stage/waf.lua" ]]; then
+        log "已下载 waf.lua"
+      fi
+      echo "$stage"
+      return 0
     fi
   done
-  # init.lua 默认不整文件覆盖，避免与官方版本漂移；仅上面补丁 require cache。若需完全替换可手工拷贝 $src/init.lua
-  if [[ -f "$src/init.lua" ]] && [[ "${SHELLSTACK_BTWAF_OVERLAY_INIT_LUA:-0}" == "1" ]]; then
-    _btwaf_chattr_unlock_path "$dest/init.lua"
-    \cp -a "$src/init.lua" "$dest/init.lua" && log "已按 SHELLSTACK_BTWAF_OVERLAY_INIT_LUA=1 覆盖 init.lua"
+  rm -rf "$stage"
+  return 1
+}
+
+_btwaf_overlay_repo_lua_files() {
+  local dest="$BTWAF_INSTALL_DIR"
+  mkdir -p "$dest/lib"
+  local src=""
+  local tmp_stage=""
+
+  if src="$(_btwaf_resolve_local_overlay_src 2>/dev/null)" && [[ -n "$src" ]]; then
+    log "使用本地扩展源: $src"
+  else
+    log "未找到本地 btwaf-ext/btwaf（或 SHELLSTACK_BTWAF_OVERLAY_SRC），尝试从 HTTP 下载扩展 Lua..."
+    if tmp_stage="$(_btwaf_fetch_overlay_via_http)"; then
+      src="$tmp_stage"
+    fi
   fi
+
+  if [[ -n "$src" ]] && [[ -f "$src/lib/cache.lua" ]]; then
+    local files=(lib/cache.lua body.lua waf.lua)
+    local f
+    for f in "${files[@]}"; do
+      if [[ -f "$src/$f" ]]; then
+        _btwaf_chattr_unlock_path "$dest/$f"
+        if \cp -a "$src/$f" "$dest/$f" 2>>"$LOG_FILE"; then
+          log "已覆盖: $dest/$f"
+        else
+          warn "复制失败: $f"
+        fi
+      else
+        [[ "$f" == "lib/cache.lua" ]] && warn "扩展源缺少必要文件: $f"
+      fi
+    done
+    if [[ -f "$src/init.lua" ]] && [[ "${SHELLSTACK_BTWAF_OVERLAY_INIT_LUA:-0}" == "1" ]]; then
+      _btwaf_chattr_unlock_path "$dest/init.lua"
+      \cp -a "$src/init.lua" "$dest/init.lua" && log "已按 SHELLSTACK_BTWAF_OVERLAY_INIT_LUA=1 覆盖 init.lua"
+    fi
+  fi
+
+  [[ -n "$tmp_stage" ]] && rm -rf "$tmp_stage"
+
+  if [[ ! -f "$dest/lib/cache.lua" ]] && [[ -n "${SHELLSTACK_BTWAF_CACHE_LUA_URL:-}" ]]; then
+    log "尝试从 SHELLSTACK_BTWAF_CACHE_LUA_URL 下载 lib/cache.lua"
+    _btwaf_chattr_unlock_path "$dest/lib/cache.lua"
+    if _btwaf_try_download_to "${SHELLSTACK_BTWAF_CACHE_LUA_URL}" "$dest/lib/cache.lua" && [[ -s "$dest/lib/cache.lua" ]]; then
+      log "已写入 $dest/lib/cache.lua（单文件 URL）"
+    else
+      warn "SHELLSTACK_BTWAF_CACHE_LUA_URL 下载失败"
+    fi
+  fi
+
   chmod 644 "$dest/body.lua" "$dest/lib/cache.lua" "$dest/waf.lua" 2>/dev/null || true
 }
 
@@ -294,11 +395,7 @@ extend_btwaf_cache_bundle() {
     _btwaf_legacy_tarball_bundle
   fi
 
-  if [[ "${SHELLSTACK_BTWAF_PANEL_INSTALL:-1}" == "1" ]]; then
-    _btwaf_run_panel_btwaf_install
-  else
-    log "SHELLSTACK_BTWAF_PANEL_INSTALL=0，跳过面板 install.sh"
-  fi
+  _btwaf_run_panel_btwaf_install
 
   _btwaf_install_redis_via_panel
   _btwaf_overlay_repo_lua_files
@@ -307,7 +404,9 @@ extend_btwaf_cache_bundle() {
   _btwaf_ensure_nginx_btwaf_conf_cache_shared
 
   if [[ ! -f "$BTWAF_INSTALL_DIR/lib/cache.lua" ]]; then
-    warn "未找到 $BTWAF_INSTALL_DIR/lib/cache.lua；页面级 Redis 缓存需要该模块，请确认 btwaf-ext/btwaf/lib/cache.lua 已部署"
+    local _bu="${SHELLSTACK_BASE_URL:-${BASE_URL:-https://shellstack.910918920801.xyz}}"
+    _bu="${_bu%/}"
+    warn "未找到 $BTWAF_INSTALL_DIR/lib/cache.lua。远程脚本默认从站点拉取扩展，基址为: ${_bu}（与 curl 管道执行时一致，可用环境变量 SHELLSTACK_BASE_URL 覆盖）。请保证可访问: ${_bu}/btwaf-ext/btwaf/lib/cache.lua（把仓库中的 btwaf-ext 目录按此路径发布到站点根目录）。也可设 SHELLSTACK_BTWAF_OVERLAY_SRC=/本机路径/btwaf 或 SHELLSTACK_BTWAF_CACHE_LUA_URL=单文件直链。"
   fi
 
   log "BTwaf 扩展步骤完成（含 access 阶段 Redis 命中 + body 阶段写入）。升级官方 WAF 后若丢失扩展，请重新执行 --extend-btwaf-cache。"
