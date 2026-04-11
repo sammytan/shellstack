@@ -36,6 +36,9 @@ info() {
   echo -e "${BLUE}[$(date '+%Y-%m-%d %H:%M:%S')] 信息: $1${NC}" | tee -a "$LOG_FILE"
 }
 
+# shellcheck source=lib_paths.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib_paths.sh"
+
 # 智能计算 MAKE_JOBS（考虑内存限制）
 # 每个编译任务大约需要 1-2GB 内存，根据可用内存自动调整
 _calculate_make_jobs() {
@@ -127,13 +130,13 @@ check_command() {
 # 检查库是否存在
 check_lib() {
   local lib_name="$1"
+  local path
 
-  # 检查多种可能的库文件路径
-  for path in /usr/lib /usr/lib64 /usr/local/lib /usr/lib/x86_64-linux-gnu /lib /lib64; do
+  while IFS= read -r path; do
     if ls "$path"/lib"$lib_name"*.so* >/dev/null 2>&1; then
       return 0
     fi
-  done
+  done < <(shellstack_standard_library_dirs)
 
   # 尝试使用ldconfig查找
   if ldconfig -p 2>/dev/null | grep -q "lib$lib_name"; then

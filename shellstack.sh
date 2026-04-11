@@ -232,6 +232,7 @@ download_module_dependencies() {
     "os_check.sh"
     "require_packages.sh"
     "cxx17_toolchain.sh"
+    "lib_paths.sh"
     "modsecurity_clone.sh"
     "modsecurity.sh"
     "geoip.sh"

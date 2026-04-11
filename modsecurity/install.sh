@@ -93,6 +93,9 @@ log "开始安装ModSecurity核心库(支持GeoIP)..."
 log "安装路径: $MODSECURITY_PREFIX"
 log "日志文件: $LOG_FILE"
 
+# shellcheck source=includes/lib_paths.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/includes/lib_paths.sh"
+
 # 检查命令是否存在
 check_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -104,16 +107,16 @@ check_command() {
 # 检查库是否存在
 check_lib() {
   local lib_name="$1"
+  local path
 
-  # 检查多种可能的库文件路径
-  for path in /usr/lib /usr/lib64 /usr/local/lib /usr/lib/x86_64-linux-gnu /lib /lib64; do
+  while IFS= read -r path; do
     if ls "$path"/lib"$lib_name"*.so* >/dev/null 2>&1; then
       return 0
     fi
-  done
+  done < <(shellstack_standard_library_dirs)
 
   # 尝试使用ldconfig查找
-  if ldconfig -p | grep -q "lib$lib_name"; then
+  if ldconfig -p 2>/dev/null | grep -q "lib$lib_name"; then
     return 0
   fi
 
@@ -389,17 +392,8 @@ build_modsecurity() {
   log "运行构建脚本..."
   ./build.sh >> "$LOG_FILE" 2>&1 || error "构建脚本运行失败"
 
-  # 设置库路径 - 确保能找到所有依赖
-  export PKG_CONFIG_PATH="$PKG_CONFIG_PATH:/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib64/pkgconfig:/usr/lib/pkgconfig:/usr/local/lib/pkgconfig"
-  export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/usr/lib/x86_64-linux-gnu:/usr/lib64:/usr/lib:/usr/local/lib"
-  export LDFLAGS="-L/usr/local/lib -L/usr/lib64 -L/usr/lib -L/usr/lib/x86_64-linux-gnu"
-  export CPPFLAGS="-I/usr/local/include -I/usr/include"
-
-  # 添加 GeoIP 特定的路径
-  export PKG_CONFIG_PATH="$PKG_CONFIG_PATH:/usr/lib/pkgconfig"
-  export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/usr/lib"
-  export LDFLAGS="$LDFLAGS -L/usr/lib"
-  export CPPFLAGS="$CPPFLAGS -I/usr/include"
+  # 设置库路径（含 Debian 多架构 arm64 等；勿写死 x86_64）
+  modsecurity_export_configure_build_env
 
   log "配置ModSecurity(启用MaxMindDB支持)..."
   ./configure --prefix="$MODSECURITY_PREFIX" \

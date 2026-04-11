@@ -8,6 +8,8 @@
 # C++17 / EL7 工具链：见 cxx17_toolchain.sh
 # shellcheck source=./cxx17_toolchain.sh
 source "$(dirname "${BASH_SOURCE[0]}")/cxx17_toolchain.sh"
+# shellcheck source=./lib_paths.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib_paths.sh"
 # shellcheck source=./modsecurity_clone.sh
 source "$(dirname "${BASH_SOURCE[0]}")/modsecurity_clone.sh"
 
@@ -66,11 +68,8 @@ build_modsecurity() {
     fi
   fi
 
-  # 设置库路径和环境变量
-  export PKG_CONFIG_PATH="$PKG_CONFIG_PATH:/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib64/pkgconfig:/usr/lib/pkgconfig:/usr/local/lib/pkgconfig"
-  export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:/usr/lib/x86_64-linux-gnu:/usr/lib64:/usr/lib:/usr/local/lib"
-  export LDFLAGS="-L/usr/local/lib -L/usr/lib64 -L/usr/lib -L/usr/lib/x86_64-linux-gnu"
-  export CPPFLAGS="-I/usr/local/include -I/usr/include"
+  # 设置库路径和环境变量（含 Debian 多架构 arm64 等，勿写死 x86_64）
+  modsecurity_export_configure_build_env
 
   # 配置选项
   local configure_opts=(
