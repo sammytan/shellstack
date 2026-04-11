@@ -12,6 +12,8 @@ BT_WHITELIST_FILE="${BT_WHITELIST_FILE:-/www/server/whitelist.txt}"
 CRS_GIT_BRANCH="${CRS_GIT_BRANCH:-v3.3.5}"
 CRS_GIT_URL="${CRS_GIT_URL:-https://github.com/coreruleset/coreruleset.git}"
 CRS_GIT_URL_FALLBACK="${CRS_GIT_URL_FALLBACK:-https://github.com/SpiderLabs/owasp-modsecurity-crs.git}"
+# 与 libmodsecurity 3.x 对齐的样例配置标签（用于 raw 回退下载）
+MODSECURITY_CONF_SAMPLES_TAG="${MODSECURITY_CONF_SAMPLES_TAG:-v3.0.10}"
 
 _baota_git_clone_shallow() {
   local url="$1"
@@ -26,20 +28,47 @@ _baota_git_clone_shallow() {
 }
 
 _baota_deploy_clone_modsecurity_core_for_samples() {
+  # 传入 $tmp_core（mktemp 根目录），克隆到 $tmp_core/ModSecurity/（勿再传 .../ModSecurity，否则会重复嵌套）
   local tmp_base="$1"
   local dest="$tmp_base/ModSecurity"
   local urls=(
     "https://github.com/SpiderLabs/ModSecurity.git"
+    "https://github.com/owasp-modsecurity/ModSecurity.git"
     "https://gitee.com/mirrors/ModSecurity.git"
   )
   local u
   for u in "${urls[@]}"; do
     rm -rf "$dest"
     if _baota_git_clone_shallow "$u" "$dest" ""; then
-      return 0
+      if [[ -f "$dest/modsecurity.conf-recommended" ]] && [[ -f "$dest/unicode.mapping" ]]; then
+        return 0
+      fi
+      warn "克隆 $u 成功但缺少 modsecurity.conf-recommended 或 unicode.mapping，尝试下一源"
     fi
   done
   return 1
+}
+
+# 当 git 不可用或克隆不完整时，从 GitHub raw 拉取官方样例
+_baota_fetch_modsecurity_samples_fallback() {
+  local out_dir="$1"
+  local tag="${MODSECURITY_CONF_SAMPLES_TAG:-v3.0.10}"
+  local base="https://raw.githubusercontent.com/owasp-modsecurity/ModSecurity/${tag}"
+  mkdir -p "$out_dir"
+  local ok=1
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 15 --max-time 120 "$base/modsecurity.conf-recommended" -o "$out_dir/modsecurity.conf-recommended.tmp" >>"$LOG_FILE" 2>&1 && [[ -s "$out_dir/modsecurity.conf-recommended.tmp" ]] || ok=0
+    curl -fsSL --connect-timeout 15 --max-time 120 "$base/unicode.mapping" -o "$out_dir/unicode.mapping.tmp" >>"$LOG_FILE" 2>&1 && [[ -s "$out_dir/unicode.mapping.tmp" ]] || ok=0
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -O "$out_dir/modsecurity.conf-recommended.tmp" --timeout=120 "$base/modsecurity.conf-recommended" >>"$LOG_FILE" 2>&1 && [[ -s "$out_dir/modsecurity.conf-recommended.tmp" ]] || ok=0
+    wget -q -O "$out_dir/unicode.mapping.tmp" --timeout=120 "$base/unicode.mapping" >>"$LOG_FILE" 2>&1 && [[ -s "$out_dir/unicode.mapping.tmp" ]] || ok=0
+  else
+    return 1
+  fi
+  [[ "$ok" -eq 1 ]] || return 1
+  mv -f "$out_dir/modsecurity.conf-recommended.tmp" "$out_dir/modsecurity.conf-recommended"
+  mv -f "$out_dir/unicode.mapping.tmp" "$out_dir/unicode.mapping"
+  [[ -f "$out_dir/modsecurity.conf-recommended" ]] && [[ -f "$out_dir/unicode.mapping" ]]
 }
 
 _baota_deploy_clone_crs() {
@@ -218,12 +247,23 @@ baota_deploy_modsecurity_conf() {
 
   local tmp_core
   tmp_core="$(mktemp -d /tmp/shellstack-modsec-core.XXXXXX)"
-  if ! _baota_deploy_clone_modsecurity_core_for_samples "$tmp_core/ModSecurity"; then
-    rm -rf "$tmp_core"
-    error "无法克隆 ModSecurity 主仓库以获取 modsecurity.conf-recommended / unicode.mapping"
+  local ms_src="$tmp_core/ModSecurity"
+  if ! _baota_deploy_clone_modsecurity_core_for_samples "$tmp_core"; then
+    warn "ModSecurity 仓库克隆失败或不完整，尝试从 raw.githubusercontent.com 下载样例（标签 ${MODSECURITY_CONF_SAMPLES_TAG:-v3.0.10}）"
+    if ! _baota_fetch_modsecurity_samples_fallback "$ms_src"; then
+      rm -rf "$tmp_core"
+      error "无法获取 modsecurity.conf-recommended / unicode.mapping（请检查网络与 git/curl）"
+    fi
   fi
-  \cp -a "$tmp_core/ModSecurity/modsecurity.conf-recommended" "$BT_NGINX_CONF_DIR/modsecurity.conf"
-  \cp -a "$tmp_core/ModSecurity/unicode.mapping" "$BT_NGINX_CONF_DIR/"
+  if [[ ! -f "$ms_src/modsecurity.conf-recommended" ]] || [[ ! -f "$ms_src/unicode.mapping" ]]; then
+    warn "克隆目录仍缺少样例文件，尝试 raw 回退"
+    if ! _baota_fetch_modsecurity_samples_fallback "$ms_src"; then
+      rm -rf "$tmp_core"
+      error "无法获取 modsecurity.conf-recommended / unicode.mapping"
+    fi
+  fi
+  \cp -a "$ms_src/modsecurity.conf-recommended" "$BT_NGINX_CONF_DIR/modsecurity.conf"
+  \cp -a "$ms_src/unicode.mapping" "$BT_NGINX_CONF_DIR/"
   rm -rf "$tmp_core"
 
   sed -i 's/^SecRuleEngine DetectionOnly/SecRuleEngine On/' "$BT_NGINX_CONF_DIR/modsecurity.conf"

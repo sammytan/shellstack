@@ -203,6 +203,7 @@ ModSecurity 核心库安装脚本
   --bt-openresty=VER    宝塔 nginx.sh 的 OpenResty 版本键（默认 openresty127，可选 openresty 等）
   说明: 使用 --deploy-conf 或 --bt-openresty 时须已安装宝塔面板与 BTwaf；--extend-btwaf-cache 仅需宝塔面板（将调用面板 WAF 安装脚本并下发扩展）。
   说明: --deploy-conf 写入 nginx.conf 时仅在 \`nginx -V\` 含 modsecurity 时注入 modsecurity 指令；SHELLSTACK_DEPLOY_FASTCGI_CACHE=0 可关闭 fastcgi 共享区与 enable-php 缓存；编译 ModSecurity-nginx 后可用 SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK=1 删除旧块并重注入。
+  说明: --deploy-conf 从 ModSecurity 仓库复制 modsecurity.conf-recommended / unicode.mapping；若 git 失败会回退从 raw.githubusercontent.com/owasp-modsecurity/ModSecurity 下载（MODSECURITY_CONF_SAMPLES_TAG 默认 v3.0.10）。
   说明: --extend-btwaf-cache 环境变量：SHELLSTACK_BTWAF_PANEL_INSTALL=0 跳过面板 install.sh；SHELLSTACK_INSTALL_REDIS=0 跳过 Redis；SHELLSTACK_BTWAF_LEGACY_TARBALL=1 启用旧版 btwaf.tar.gz 全量覆盖；SHELLSTACK_BTWAF_OVERLAY_INIT_LUA=1 才覆盖 init.lua（默认自动插入 require cache）。部署后含 access 读缓存 + body 写缓存，无需再手改 waf/header。
   说明: 若 Nginx 已含 ModSecurity 且与当前 --bt-openresty 版本一致，将跳过重复编译；强制重编可设 MODSECURITY_FORCE_BT_NGINX_REBUILD=1。
   --help                 显示此帮助信息
