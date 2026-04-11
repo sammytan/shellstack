@@ -73,11 +73,36 @@ _btwaf_shellstack_repo_overlay_dir() {
 }
 
 _shellstack_redis_responds() {
-  if command -v redis-cli >/dev/null 2>&1; then
-    redis-cli -h 127.0.0.1 -p 6379 ping 2>/dev/null | grep -q PONG && return 0
-  fi
+  local cli
+  for cli in /www/server/redis/src/redis-cli /www/server/redis/bin/redis-cli /usr/local/redis/bin/redis-cli redis-cli; do
+    if [[ -x "$cli" ]]; then
+      "$cli" -h 127.0.0.1 -p 6379 ping 2>/dev/null | grep -q PONG && return 0
+    elif [[ "$cli" == redis-cli ]] && command -v redis-cli >/dev/null 2>&1; then
+      redis-cli -h 127.0.0.1 -p 6379 ping 2>/dev/null | grep -q PONG && return 0
+    fi
+  done
   if command -v ss >/dev/null 2>&1; then
-    ss -lntp 2>/dev/null | grep -qE '127\.0\.0\.1:6379|:6379' && return 0
+    ss -lntp 2>/dev/null | grep -qE '127\.0\.0\.1:6379|[0-9.]+:6379|\*:6379|:::6379' && return 0
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -lntp 2>/dev/null | grep -qE ':6379' && return 0
+  fi
+  return 1
+}
+
+# 已装 Redis / 6379 已占用则跳过 install_soft（比仅 ping 更宽：进程、端口）
+_shellstack_redis_skip_install_soft() {
+  if _shellstack_redis_responds; then
+    log "Redis 检测: 127.0.0.1:6379 可 ping 或端口已监听"
+    return 0
+  fi
+  if pgrep -x redis-server >/dev/null 2>&1 || pgrep -f '[/]redis-server' >/dev/null 2>&1; then
+    log "Redis 检测: 已存在 redis-server 进程，跳过 install_soft（若无法连接请检查密码/绑定地址）"
+    return 0
+  fi
+  if [[ -d /www/server/redis ]] && { [[ -f /www/server/redis/src/redis-server ]] || [[ -x /www/server/redis/src/redis-cli ]] || [[ -x /www/server/redis/bin/redis-cli ]]; }; then
+    log "Redis 检测: 已存在宝塔 Redis 安装目录/二进制，跳过 install_soft"
+    return 0
   fi
   return 1
 }
@@ -88,9 +113,15 @@ _btwaf_chattr_unlock_path() {
   chattr -R -ia "$p" 2>>"$LOG_FILE" || chattr -ia "$p" 2>>"$LOG_FILE" || true
 }
 
-# 与宝塔 /www/server/panel/plugin/btwaf/install.sh 末尾 Check_install 一致：仅当不存在 /www/server/btwaf/socket 时才应跑完整 Install_btwaf
+# 与面板 install.sh 中 Check_install 一致（socket），并补充：部分环境 socket 路径不同，但 waf 已部署则视为已装
 _btwaf_panel_btwaf_already_installed() {
-  [[ -d /www/server/btwaf/socket ]]
+  if [[ -e /www/server/btwaf/socket ]]; then
+    return 0
+  fi
+  if [[ -f /www/server/btwaf/waf.lua ]] && [[ -f /www/server/btwaf/init.lua ]]; then
+    return 0
+  fi
+  return 1
 }
 
 _btwaf_run_panel_btwaf_install() {
@@ -103,7 +134,7 @@ _btwaf_run_panel_btwaf_install() {
     return 0
   fi
   if [[ "${SHELLSTACK_BTWAF_FORCE_PANEL_INSTALL:-0}" != "1" ]] && _btwaf_panel_btwaf_already_installed; then
-    log "检测到 BTwaf 已安装（存在 /www/server/btwaf/socket，与面板 install.sh 中 Check_install 判定一致），跳过 install.sh install"
+    log "预检: BTwaf 已安装（/www/server/btwaf/socket 存在，或 waf.lua+init.lua 已部署），跳过 install.sh install"
     return 0
   fi
   if [[ "${SHELLSTACK_BTWAF_FORCE_PANEL_INSTALL:-0}" == "1" ]]; then
@@ -119,8 +150,7 @@ _btwaf_run_panel_btwaf_install() {
 
 _btwaf_install_redis_via_panel() {
   [[ "${SHELLSTACK_INSTALL_REDIS:-1}" == "1" ]] || return 0
-  if _shellstack_redis_responds; then
-    log "检测到 Redis 已在 127.0.0.1:6379 可用，跳过 install_soft 安装"
+  if _shellstack_redis_skip_install_soft; then
     return 0
   fi
   local soft_install="$BT_PANEL_INSTALL_DIR/install_soft.sh"
@@ -198,6 +228,14 @@ _btwaf_resolve_local_overlay_src() {
   return 1
 }
 
+# 过滤 404 HTML 等非 Lua 内容
+_btwaf_cache_lua_looks_valid() {
+  local f="$1"
+  [[ -s "$f" ]] || return 1
+  grep -qi '<!DOCTYPE\|<html' "$f" 2>/dev/null && return 1
+  grep -qE 'resty\.redis|schedule_body_page_cache|require\s*\(?[\"'\'']resty\.redis' "$f" 2>/dev/null
+}
+
 # 从站点拉取与仓库同路径的扩展文件（至少 lib/cache.lua）
 _btwaf_fetch_overlay_via_http() {
   local stage
@@ -211,6 +249,7 @@ _btwaf_fetch_overlay_via_http() {
   else
     bases+=(
       "$root/btwaf-ext/btwaf"
+      "$root/shellstack/btwaf-ext/btwaf"
       "$root/modsecurity/btwaf-overlay"
     )
   fi
@@ -220,7 +259,12 @@ _btwaf_fetch_overlay_via_http() {
     rm -f "$stage/lib/cache.lua" "$stage/body.lua" "$stage/waf.lua"
     log "尝试下载 BTwaf 扩展: $b/lib/cache.lua"
     if _btwaf_try_download_to "$b/lib/cache.lua" "$stage/lib/cache.lua" && [[ -s "$stage/lib/cache.lua" ]]; then
-      log "已下载 lib/cache.lua"
+      if ! _btwaf_cache_lua_looks_valid "$stage/lib/cache.lua"; then
+        warn "URL 返回内容不是有效 cache.lua（可能为 404 页面）: $b/lib/cache.lua"
+        rm -f "$stage/lib/cache.lua"
+        continue
+      fi
+      log "已下载并校验 lib/cache.lua"
       if _btwaf_try_download_to "$b/body.lua" "$stage/body.lua" && [[ -s "$stage/body.lua" ]]; then
         log "已下载 body.lua"
       fi
@@ -231,6 +275,7 @@ _btwaf_fetch_overlay_via_http() {
       return 0
     fi
   done
+  warn "HTTP 未成功拉取 lib/cache.lua（请确认站点已发布 btwaf-ext，且 URL 返回纯 Lua 非 HTML）"
   rm -rf "$stage"
   return 1
 }
@@ -276,10 +321,11 @@ _btwaf_overlay_repo_lua_files() {
   if [[ ! -f "$dest/lib/cache.lua" ]] && [[ -n "${SHELLSTACK_BTWAF_CACHE_LUA_URL:-}" ]]; then
     log "尝试从 SHELLSTACK_BTWAF_CACHE_LUA_URL 下载 lib/cache.lua"
     _btwaf_chattr_unlock_path "$dest/lib/cache.lua"
-    if _btwaf_try_download_to "${SHELLSTACK_BTWAF_CACHE_LUA_URL}" "$dest/lib/cache.lua" && [[ -s "$dest/lib/cache.lua" ]]; then
+    if _btwaf_try_download_to "${SHELLSTACK_BTWAF_CACHE_LUA_URL}" "$dest/lib/cache.lua" && _btwaf_cache_lua_looks_valid "$dest/lib/cache.lua"; then
       log "已写入 $dest/lib/cache.lua（单文件 URL）"
     else
-      warn "SHELLSTACK_BTWAF_CACHE_LUA_URL 下载失败"
+      rm -f "$dest/lib/cache.lua"
+      warn "SHELLSTACK_BTWAF_CACHE_LUA_URL 下载失败或内容非有效 Lua"
     fi
   fi
 
