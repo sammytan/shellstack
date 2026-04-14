@@ -21,7 +21,7 @@ SHELLSTACK_BTWAF_CACHE_LUA_URL="${SHELLSTACK_BTWAF_CACHE_LUA_URL:-}"
 SHELLSTACK_BTWAF_LEGACY_TARBALL="${SHELLSTACK_BTWAF_LEGACY_TARBALL:-0}"
 # 为 0 时跳过宝塔 install_soft 安装 Redis
 SHELLSTACK_INSTALL_REDIS="${SHELLSTACK_INSTALL_REDIS:-1}"
-SHELLSTACK_REDIS_VER="${SHELLSTACK_REDIS_VER:-8.0}"
+SHELLSTACK_REDIS_VER="${SHELLSTACK_REDIS_VER:-8.0.5}"
 # _btwaf_fetch_overlay_via_http 成功时写入临时目录路径（勿用 $(...) 捕获，log() 会污染 stdout）
 _SHELLSTACK_BTWAF_HTTP_STAGE=""
 
@@ -109,6 +109,22 @@ _shellstack_redis_skip_install_soft() {
   return 1
 }
 
+# 将大版本映射为宝塔软件商店的具体版本号（与 install_soft.sh 参数一致）
+_btwaf_normalize_redis_version() {
+  local v="${1:-8.0.5}"
+  case "$v" in
+    latest) echo "8.4.0" ;;
+    8|8.0) echo "8.0.5" ;;
+    8.2) echo "8.2.3" ;;
+    8.4) echo "8.4.0" ;;
+    7|7.4) echo "7.4.7" ;;
+    7.2) echo "7.2.12" ;;
+    7.0) echo "7.0.11" ;;
+    6|6.2) echo "6.2.21" ;;
+    *) echo "$v" ;;
+  esac
+}
+
 _btwaf_chattr_unlock_path() {
   local p="$1"
   [[ -e "$p" ]] || return 0
@@ -156,12 +172,14 @@ _btwaf_install_redis_via_panel() {
     return 0
   fi
   local soft_install="$BT_PANEL_INSTALL_DIR/install_soft.sh"
+  local redis_ver
+  redis_ver="$(_btwaf_normalize_redis_version "${SHELLSTACK_REDIS_VER:-8.0.5}")"
   if [[ ! -f "$soft_install" ]]; then
     warn "未找到 $soft_install，无法自动安装 Redis；请手动安装 Redis 并监听 6379"
     return 0
   fi
-  log "通过宝塔 install_soft 安装 Redis ${SHELLSTACK_REDIS_VER}（与面板一致）..."
-  if ( cd "$BT_PANEL_INSTALL_DIR" && bash install_soft.sh 4 install redis "${SHELLSTACK_REDIS_VER}" >>"$LOG_FILE" 2>&1 ); then
+  log "通过宝塔 install_soft 安装 Redis ${redis_ver}（与面板版本号一致）..."
+  if ( cd "$BT_PANEL_INSTALL_DIR" && bash install_soft.sh 4 install redis "${redis_ver}" >>"$LOG_FILE" 2>&1 ); then
     log "install_soft redis 已执行（详见 $LOG_FILE）"
   else
     warn "install_soft 安装 Redis 可能失败，请检查 $LOG_FILE 并确认 redis-cli ping"
