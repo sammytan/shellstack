@@ -245,6 +245,7 @@ download_module_dependencies() {
     "fail2ban.sh"
     "openresty.sh"
     "baota_require_check.sh"
+    "baota_install_panel.sh"
     "baota_modsec_connector.sh"
     "baota_modsec_deploy.sh"
     "btwaf_extend.sh"

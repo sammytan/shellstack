@@ -198,6 +198,7 @@ ModSecurity 核心库安装脚本
   --disable-kernel-opt   禁用 Google BBR 内核优化
   --disable-terminal     禁用终端配置
   --jobs=N               设置并行编译任务数 (默认: 自动检测，根据内存和CPU核心数)
+  --install-bt           安装宝塔面板（BT11）；若已安装则自动跳过。可与 --force/--deploy-conf 连用
   --extend-btwaf-cache   宝塔：执行面板 btwaf install（已装则跳过）、Redis、再下发扩展 Lua；本地无 btwaf-ext 时从 \$SHELLSTACK_BASE_URL/btwaf-ext/btwaf/ 下载；见 SHELLSTACK_BTWAF_OVERLAY_SRC / SHELLSTACK_BTWAF_CACHE_LUA_URL
   --force                强制覆盖安装：等效 --bt-openresty=openresty --deploy-conf --extend-btwaf-cache，并强制重编译 Nginx / 重注入 nginx.conf / 重装 BTwaf / 执行 Redis 安装流程
   --with-exporter=ADDR   安装 node exporter，并尝试自动注册到 Prometheus 服务端（ADDR 可为 IP/域名 或 http(s):// 地址）
@@ -209,6 +210,7 @@ ModSecurity 核心库安装脚本
   说明: --extend-btwaf-cache 环境变量：SHELLSTACK_BTWAF_PANEL_INSTALL=0 跳过面板 install.sh；已安装 BTwaf（/www/server/btwaf/socket 存在）默认不重复 install；SHELLSTACK_BTWAF_FORCE_PANEL_INSTALL=1 强制重装；SHELLSTACK_BTWAF_OVERLAY_SRC=目录 指定本地扩展；SHELLSTACK_BTWAF_OVERLAY_BASE_URL=URL 覆盖 HTTP 根；SHELLSTACK_BTWAF_CACHE_LUA_URL=单文件 仅拉 cache.lua；SHELLSTACK_INSTALL_REDIS=0 跳过 Redis；SHELLSTACK_REDIS_VER 可填宝塔版本号（如 8.0.5/8.2.3/8.4.0，传 8.0/8.2 会自动映射）；SHELLSTACK_BTWAF_LEGACY_TARBALL=1 旧版全量 tar；SHELLSTACK_BTWAF_OVERLAY_INIT_LUA=1 覆盖 init.lua。
   说明: --with-exporter 会尝试通过包管理器安装 node exporter（默认端口 9100，可设 EXPORTER_LISTEN_PORT），并优先以 file_sd 方式注册到 Prometheus；远端 Prometheus 会尝试免密 SSH(root@host) 写入并重载，失败则给出手工注册提示。
   说明: --with-exporter 可在 main.sh 中单独使用（例如仅部署 exporter + 注册 Prometheus）；如不希望执行默认内核/终端优化，可同时加 --disable-kernel-opt --disable-terminal。
+  说明: --install-bt 使用 BT11 安装命令下载并执行 install_panel.sh（默认地址: https://bt11.btmb.cc/install/install_panel.sh）；可用 BT_INSTALL_SCRIPT_URL / BT_INSTALL_ARG 覆盖。
   说明: 若 Nginx 已含 ModSecurity 且与当前 --bt-openresty 版本一致，将跳过重复编译；强制重编可设 MODSECURITY_FORCE_BT_NGINX_REBUILD=1。
   --help                 显示此帮助信息
   --verify               验证已安装的 ModSecurity
@@ -248,6 +250,9 @@ ModSecurity 核心库安装脚本
 
   # 宝塔快捷强制模式（等效 --bt-openresty=openresty --deploy-conf --extend-btwaf-cache）
   $0 --force
+
+  # 先安装宝塔，再执行强制覆盖安装流程
+  $0 --install-bt --force
 
   # 安装 exporter 并注册到 Prometheus 服务端
   $0 --with-exporter=10.0.0.10

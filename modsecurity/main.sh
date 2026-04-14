@@ -108,6 +108,7 @@ ENABLE_KERNEL_OPT=1
 ENABLE_TERMINAL=1
 ENABLE_EXPORTER=0
 EXPORTER_PROMETHEUS_SERVER="${EXPORTER_PROMETHEUS_SERVER:-}"
+INSTALL_BAOTA_PANEL=0
 # 宝塔：从站点下载 btwaf.tar.gz 覆盖 /www/server/btwaf
 EXTEND_BTWAF_CACHE=0
 # 宝塔：部署 nginx.conf / CRS / 自定义规则（需配合 --deploy-conf）
@@ -193,6 +194,10 @@ parse_args() {
         ;;
       --extend-btwaf-cache)
         EXTEND_BTWAF_CACHE=1
+        shift
+        ;;
+      --install-bt)
+        INSTALL_BAOTA_PANEL=1
         shift
         ;;
       --force)
@@ -454,6 +459,12 @@ main_install() {
 main() {
   # 解析命令行参数
   parse_args "$@"
+
+  # 可选：先安装宝塔面板，再做宝塔相关环境检查
+  if [[ "${INSTALL_BAOTA_PANEL:-0}" == "1" ]]; then
+    source "$INCLUDES_DIR/baota_install_panel.sh"
+    install_baota_panel_if_requested
+  fi
 
   # 宝塔相关参数需已安装宝塔面板与 BTwaf
   # shellcheck source=includes/baota_require_check.sh
