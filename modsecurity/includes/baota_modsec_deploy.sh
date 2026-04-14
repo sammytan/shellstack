@@ -2,7 +2,15 @@
 # 宝塔：部署 modsecurity.conf、OWASP CRS、modsec_includes.conf、custom_modsec_rules.conf、whitelist、nginx.conf 中的 modsecurity 指令
 # 依赖 shared.sh: log warn error LOG_FILE
 
-BT_NGINX_CONF_DIR="${BT_NGINX_CONF_DIR:-/www/server/nginx/conf}"
+if [[ -z "${BT_NGINX_CONF_DIR:-}" ]]; then
+  if [[ -d /www/server/nginx/conf ]]; then
+    BT_NGINX_CONF_DIR="/www/server/nginx/conf"
+  elif [[ -d /www/server/nginx/nginx/conf ]]; then
+    BT_NGINX_CONF_DIR="/www/server/nginx/nginx/conf"
+  else
+    BT_NGINX_CONF_DIR="/www/server/nginx/conf"
+  fi
+fi
 if [[ -z "${BT_NGINX_BIN:-}" ]]; then
   if [[ -x /www/server/nginx/sbin/nginx ]]; then
     BT_NGINX_BIN="/www/server/nginx/sbin/nginx"

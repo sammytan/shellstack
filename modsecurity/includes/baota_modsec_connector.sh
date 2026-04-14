@@ -38,7 +38,7 @@ _baota_detect_nginx_setup_path() {
 }
 
 _baota_panel_present() {
-  [[ -f "$BT_PANEL_NGINX_SH" ]] && [[ -f /www/server/panel/install/public.sh ]]
+  [[ -d /www/server/panel ]] && [[ -f /www/server/panel/install/public.sh ]]
 }
 
 _baota_run_panel_nginx_build() {
@@ -51,6 +51,15 @@ _baota_run_panel_nginx_build() {
     log "执行: cd ${install_dir} && bash install_soft.sh 3 install nginx"
     ( cd "$install_dir" && bash "$BT_PANEL_INSTALL_SOFT_SH" 3 install nginx >>"$LOG_FILE" 2>&1 )
     return $?
+  fi
+
+  if [[ ! -f "$BT_PANEL_NGINX_SH" ]]; then
+    warn "未找到 $BT_PANEL_NGINX_SH，回退尝试 install_soft.sh 3 install nginx"
+    if [[ -f "$BT_PANEL_INSTALL_SOFT_SH" ]]; then
+      ( cd "$install_dir" && bash "$BT_PANEL_INSTALL_SOFT_SH" 3 install nginx >>"$LOG_FILE" 2>&1 )
+      return $?
+    fi
+    return 1
   fi
 
   log "调用宝塔 nginx.sh update ${ver}"
