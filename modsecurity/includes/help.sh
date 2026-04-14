@@ -207,6 +207,7 @@ ModSecurity 核心库安装脚本
   说明: --deploy-conf 从 ModSecurity 仓库复制 modsecurity.conf-recommended / unicode.mapping；若 git 失败会回退从 raw.githubusercontent.com/owasp-modsecurity/ModSecurity 下载（MODSECURITY_CONF_SAMPLES_TAG 默认 v3.0.10）。
   说明: --extend-btwaf-cache 环境变量：SHELLSTACK_BTWAF_PANEL_INSTALL=0 跳过面板 install.sh；已安装 BTwaf（/www/server/btwaf/socket 存在）默认不重复 install；SHELLSTACK_BTWAF_FORCE_PANEL_INSTALL=1 强制重装；SHELLSTACK_BTWAF_OVERLAY_SRC=目录 指定本地扩展；SHELLSTACK_BTWAF_OVERLAY_BASE_URL=URL 覆盖 HTTP 根；SHELLSTACK_BTWAF_CACHE_LUA_URL=单文件 仅拉 cache.lua；SHELLSTACK_INSTALL_REDIS=0 跳过 Redis；SHELLSTACK_BTWAF_LEGACY_TARBALL=1 旧版全量 tar；SHELLSTACK_BTWAF_OVERLAY_INIT_LUA=1 覆盖 init.lua。
   说明: --with-exporter 会尝试通过包管理器安装 node exporter（默认端口 9100，可设 EXPORTER_LISTEN_PORT），并优先以 file_sd 方式注册到 Prometheus；远端 Prometheus 会尝试免密 SSH(root@host) 写入并重载，失败则给出手工注册提示。
+  说明: --with-exporter 可在 main.sh 中单独使用（例如仅部署 exporter + 注册 Prometheus）；如不希望执行默认内核/终端优化，可同时加 --disable-kernel-opt --disable-terminal。
   说明: 若 Nginx 已含 ModSecurity 且与当前 --bt-openresty 版本一致，将跳过重复编译；强制重编可设 MODSECURITY_FORCE_BT_NGINX_REBUILD=1。
   --help                 显示此帮助信息
   --verify               验证已安装的 ModSecurity
@@ -246,6 +247,9 @@ ModSecurity 核心库安装脚本
 
   # 安装 exporter 并注册到 Prometheus 服务端
   $0 --with-exporter=10.0.0.10
+
+  # 在 main.sh 中仅使用 exporter（关闭默认内核/终端优化）
+  $0 --with-exporter=https://prom.example.com:9090 --disable-kernel-opt --disable-terminal
 
   # 宝塔面板：安装 libmodsecurity、升级 OpenResty 并编译 ModSecurity-nginx，并下发 CRS/自定义规则
   $0 --deploy-conf
