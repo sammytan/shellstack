@@ -106,6 +106,8 @@ ENABLE_SECURITY=0
 ENABLE_OPENRESTY=0
 ENABLE_KERNEL_OPT=1
 ENABLE_TERMINAL=1
+ENABLE_EXPORTER=0
+EXPORTER_PROMETHEUS_SERVER="${EXPORTER_PROMETHEUS_SERVER:-}"
 # 宝塔：从站点下载 btwaf.tar.gz 覆盖 /www/server/btwaf
 EXTEND_BTWAF_CACHE=0
 # 宝塔：部署 nginx.conf / CRS / 自定义规则（需配合 --deploy-conf）
@@ -197,6 +199,18 @@ parse_args() {
         DEPLOY_MODSEC_CONF=1
         shift
         ;;
+      --with-exporter=*)
+        ENABLE_EXPORTER=1
+        EXPORTER_PROMETHEUS_SERVER="${1#*=}"
+        export EXPORTER_PROMETHEUS_SERVER
+        shift
+        ;;
+      --with-exporter)
+        ENABLE_EXPORTER=1
+        EXPORTER_PROMETHEUS_SERVER="$2"
+        export EXPORTER_PROMETHEUS_SERVER
+        shift 2
+        ;;
       --bt-openresty=*)
         BT_OPENRESTY_VERSION="${1#*=}"
         BT_OPENRESTY_FROM_CLI=1
@@ -286,6 +300,10 @@ load_modules() {
   if [ "$ENABLE_OPENRESTY" = "1" ]; then
     source "$INCLUDES_DIR/openresty.sh"
   fi
+
+  if [ "$ENABLE_EXPORTER" = "1" ]; then
+    source "$INCLUDES_DIR/exporter.sh"
+  fi
   
   log "模块加载完成"
 }
@@ -347,6 +365,16 @@ main_install() {
     extend_btwaf_cache_bundle
   else
     log "未使用 --extend-btwaf-cache，跳过 BTwaf 包覆盖"
+  fi
+
+  if [ "$ENABLE_EXPORTER" = "1" ]; then
+    if [[ -z "${EXPORTER_PROMETHEUS_SERVER:-}" ]]; then
+      warn "已启用 --with-exporter 但未提供 Prometheus 地址，跳过 exporter 安装/注册"
+    else
+      setup_exporter_and_register "$EXPORTER_PROMETHEUS_SERVER"
+    fi
+  else
+    log "未使用 --with-exporter，跳过 exporter 安装与 Prometheus 注册"
   fi
   
   # 可选功能安装

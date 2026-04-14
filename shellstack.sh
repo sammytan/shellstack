@@ -248,6 +248,7 @@ download_module_dependencies() {
     "baota_modsec_connector.sh"
     "baota_modsec_deploy.sh"
     "btwaf_extend.sh"
+    "exporter.sh"
     "help.sh"
   )
   
