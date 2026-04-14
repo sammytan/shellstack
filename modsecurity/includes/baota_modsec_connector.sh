@@ -81,7 +81,6 @@ _baota_skip_openresty_rebuild_if_current() {
   [[ "${MODSECURITY_FORCE_BT_NGINX_REBUILD}" == "1" ]] && return 1
 
   local nginx_bin="/www/server/nginx/sbin/nginx"
-  local cfg="/www/server/panel/install/nginx_configure.pl"
   local vchk="/www/server/nginx/version_check.pl"
   local want="${BT_OPENRESTY_VERSION:-openresty127}"
 
@@ -89,7 +88,6 @@ _baota_skip_openresty_rebuild_if_current() {
   if ! "$nginx_bin" -V 2>&1 | grep -qi modsecurity; then
     return 1
   fi
-  [[ -f "$cfg" ]] && grep -qF -- "--add-module=${MODSECURITY_NGX_CONNECTOR_DIR}" "$cfg" 2>/dev/null || return 1
   [[ -f "$vchk" ]] || return 1
 
   local line
@@ -108,6 +106,28 @@ _baota_skip_openresty_rebuild_if_current() {
   esac
 
   return 0
+}
+
+_baota_print_nginx_make_failure_snippet() {
+  local mk="/tmp/nginx_make.pl"
+  local cfg="/tmp/nginx_config.pl"
+  warn "宝塔编译失败关键日志（自动摘录）:"
+  if [[ -f "$mk" ]]; then
+    local snip
+    snip="$(rg -n -i '(^|[[:space:]])(error|undefined reference|fatal):|No such file|cannot find' "$mk" 2>/dev/null | head -n 40)"
+    if [[ -n "$snip" ]]; then
+      while IFS= read -r line; do
+        [[ -n "$line" ]] && warn "  $line"
+      done <<< "$snip"
+    else
+      warn "  /tmp/nginx_make.pl 未匹配到明确 error 关键词，请手工查看完整文件"
+    fi
+  else
+    warn "  未找到 /tmp/nginx_make.pl"
+  fi
+  if [[ -f "$cfg" ]]; then
+    warn "  参考配置文件: $cfg"
+  fi
 }
 
 # 检测宝塔并升级/重编译 OpenResty，静态链接 ModSecurity-nginx 连接器
@@ -145,6 +165,7 @@ baota_install_openresty_with_modsecurity_connector() {
   log "（将按面板流程编译，日志同时写入 $LOG_FILE）"
   log "=========================================="
   if ! bash "$BT_PANEL_NGINX_SH" update "$BT_OPENRESTY_VERSION" >>"$LOG_FILE" 2>&1; then
+    _baota_print_nginx_make_failure_snippet
     error "宝塔 nginx.sh update 失败。请检查 $LOG_FILE 与 /tmp/nginx_config.pl / /tmp/nginx_make.pl"
   fi
 
