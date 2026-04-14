@@ -3,15 +3,14 @@
 # 依赖: 已安装 libmodsecurity（pkg-config libmodsecurity）、/www/server/panel/install/nginx.sh
 
 MODSECURITY_NGX_CONNECTOR_DIR="${MODSECURITY_NGX_CONNECTOR_DIR:-/www/server/modsecurity-nginx}"
-BT_PANEL_NGINX_SH="${BT_PANEL_NGINX_SH:-/www/server/panel/install/nginx.sh}"
 BT_PANEL_INSTALL_SOFT_SH="${BT_PANEL_INSTALL_SOFT_SH:-/www/server/panel/install/install_soft.sh}"
 BT_OPENRESTY_VERSION="${BT_OPENRESTY_VERSION:-openresty127}"
 # 设为 1 时强制执行宝塔 nginx.sh update（跳过「已就绪」检测）
 MODSECURITY_FORCE_BT_NGINX_REBUILD="${MODSECURITY_FORCE_BT_NGINX_REBUILD:-0}"
 # 设为 1 时保留 shellstack 生成的 .bak.shellstack.* 文件，默认清理
 MODSECURITY_KEEP_BT_TEMP_FILES="${MODSECURITY_KEEP_BT_TEMP_FILES:-0}"
-# 构建调用方式: auto | install_soft | nginx_sh（默认 auto，优先 install_soft）
-MODSECURITY_BT_NGINX_INSTALL_MODE="${MODSECURITY_BT_NGINX_INSTALL_MODE:-auto}"
+# 构建调用方式固定为 install_soft（安全策略：禁止直接调用 nginx.sh update）
+MODSECURITY_BT_NGINX_INSTALL_MODE="${MODSECURITY_BT_NGINX_INSTALL_MODE:-install_soft}"
 
 _baota_detect_nginx_bin() {
   local candidates=(
@@ -27,10 +26,16 @@ _baota_detect_nginx_bin() {
 
 _baota_detect_nginx_setup_path() {
   local candidates=(
-    "/www/server/nginx"
     "/www/server/nginx/nginx"
+    "/www/server/nginx"
   )
   local p
+  # 优先返回真正的运行目录（含 version_check.pl 或 sbin/nginx）
+  for p in "${candidates[@]}"; do
+    [[ -f "${p}/version_check.pl" ]] && { echo "$p"; return 0; }
+    [[ -x "${p}/sbin/nginx" ]] && { echo "$p"; return 0; }
+  done
+  # 兜底返回存在的目录
   for p in "${candidates[@]}"; do
     [[ -d "$p" ]] && { echo "$p"; return 0; }
   done
@@ -39,7 +44,7 @@ _baota_detect_nginx_setup_path() {
 
 _baota_panel_present() {
   # 文件特征
-  if [[ -d /www/server/panel ]] && [[ -f /www/server/panel/install/public.sh ]]; then
+  if [[ -d /www/server/panel ]] && [[ -f /www/server/panel/install/public.sh ]] && [[ -f "$BT_PANEL_INSTALL_SOFT_SH" ]]; then
     return 0
   fi
   # 进程特征（BT-Panel / BT-Task）
@@ -54,38 +59,56 @@ _baota_panel_present() {
 _baota_run_panel_nginx_build() {
   local ver="$1"
   local install_dir="/www/server/panel/install"
-  local mode="${MODSECURITY_BT_NGINX_INSTALL_MODE:-auto}"
+  local mode="${MODSECURITY_BT_NGINX_INSTALL_MODE:-install_soft}"
   log "Nginx 构建参数: version=${ver}, mode=${mode}"
 
-  # openresty/openresty127 必须走 nginx.sh update <ver>，install_soft.sh 会回落到默认 Tengine
-  if [[ "$mode" != "install_soft" ]] && [[ "$ver" == "openresty" || "$ver" == "openresty127" ]]; then
-    if [[ -f "$BT_PANEL_NGINX_SH" ]]; then
-      log "检测到 OpenResty 版本键(${ver})，强制走 nginx.sh update，避免 install_soft 回落 Tengine"
-      log "执行: bash ${BT_PANEL_NGINX_SH} update ${ver}"
-      bash "$BT_PANEL_NGINX_SH" update "$ver" >>"$LOG_FILE" 2>&1
-      return $?
-    fi
-  fi
-
-  if [[ "$mode" == "install_soft" ]] || [[ "$mode" == "auto" && -f "$BT_PANEL_INSTALL_SOFT_SH" ]]; then
-    log "调用宝塔 install_soft.sh 安装/重装 Nginx（与面板一致）"
-    log "执行: cd ${install_dir} && bash install_soft.sh 3 install nginx ${ver}"
-    ( cd "$install_dir" && bash "$BT_PANEL_INSTALL_SOFT_SH" 3 install nginx "${ver}" >>"$LOG_FILE" 2>&1 )
-    return $?
-  fi
-
-  if [[ ! -f "$BT_PANEL_NGINX_SH" ]]; then
-    warn "未找到 $BT_PANEL_NGINX_SH，回退尝试 install_soft.sh 3 install nginx"
-    if [[ -f "$BT_PANEL_INSTALL_SOFT_SH" ]]; then
-      ( cd "$install_dir" && bash "$BT_PANEL_INSTALL_SOFT_SH" 3 install nginx "${ver}" >>"$LOG_FILE" 2>&1 )
-      return $?
-    fi
+  if [[ ! -f "$BT_PANEL_INSTALL_SOFT_SH" ]]; then
+    warn "未找到 $BT_PANEL_INSTALL_SOFT_SH，无法按策略安装 Nginx"
     return 1
   fi
 
-  log "调用宝塔 nginx.sh update ${ver}"
-  log "执行: bash ${BT_PANEL_NGINX_SH} update ${ver}"
-  bash "$BT_PANEL_NGINX_SH" update "$ver" >>"$LOG_FILE" 2>&1
+  log "调用宝塔 install_soft.sh 安装/重装 Nginx（与面板一致）"
+  log "执行: cd ${install_dir} && bash install_soft.sh 3 install nginx ${ver}"
+  if ! ( cd "$install_dir" && bash "$BT_PANEL_INSTALL_SOFT_SH" 3 install nginx "${ver}" >>"$LOG_FILE" 2>&1 ); then
+    return 1
+  fi
+
+  # install_soft 有时会忽略版本键回落到默认（如 tengine），这里做强校验并二次重试 update
+  if [[ "$ver" == "openresty" || "$ver" == "openresty127" ]]; then
+    if ! _baota_version_matches_request "$ver"; then
+      warn "install_soft 返回成功，但实际版本未匹配 ${ver}，尝试 install_soft update 重试一次"
+      log "执行: cd ${install_dir} && bash install_soft.sh 3 update nginx ${ver}"
+      if ! ( cd "$install_dir" && bash "$BT_PANEL_INSTALL_SOFT_SH" 3 update nginx "${ver}" >>"$LOG_FILE" 2>&1 ); then
+        return 1
+      fi
+      if ! _baota_version_matches_request "$ver"; then
+        warn "install_soft 仍未应用版本键 ${ver}（面板源脚本可能忽略该键，回落到默认版本）"
+        return 1
+      fi
+    fi
+  fi
+  return 0
+}
+
+_baota_version_matches_request() {
+  local want="$1"
+  local setup_path
+  setup_path="$(_baota_detect_nginx_setup_path 2>/dev/null)" || return 1
+  local vchk="${setup_path}/version_check.pl"
+  [[ -f "$vchk" ]] || return 1
+  local line
+  line="$(head -1 "$vchk" | tr -d '[:space:]')"
+  case "$want" in
+    openresty127)
+      [[ "$line" == *openresty-1.27* ]] || [[ "$line" == *openresty-1.28* ]] || [[ "$line" == *openresty-1.29* ]]
+      ;;
+    openresty)
+      [[ "$line" == *openresty-1.25* ]] || [[ "$line" == *openresty-1.24* ]] || [[ "$line" == *openresty-1.23* ]] || [[ "$line" == *openresty-1.26* ]]
+      ;;
+    *)
+      return 0
+      ;;
+  esac
 }
 
 _clone_modsecurity_nginx_connector() {
