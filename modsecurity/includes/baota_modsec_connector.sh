@@ -38,7 +38,17 @@ _baota_detect_nginx_setup_path() {
 }
 
 _baota_panel_present() {
-  [[ -d /www/server/panel ]] && [[ -f /www/server/panel/install/public.sh ]]
+  # 文件特征
+  if [[ -d /www/server/panel ]] && [[ -f /www/server/panel/install/public.sh ]]; then
+    return 0
+  fi
+  # 进程特征（BT-Panel / BT-Task）
+  if command -v pgrep >/dev/null 2>&1; then
+    if pgrep -f '/www/server/panel/BT-Panel|/www/server/panel/BT-Task' >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+  return 1
 }
 
 _baota_run_panel_nginx_build() {

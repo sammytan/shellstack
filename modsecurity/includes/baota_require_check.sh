@@ -15,8 +15,21 @@ _shellstack_detect_btwaf_installed() {
 
 # 返回 0：检测到宝塔面板（兼容不同版本目录结构）
 _shellstack_detect_baota_panel() {
-  [[ -d /www/server/panel ]] || return 1
-  [[ -f /www/server/panel/class/common.py ]] || [[ -d /www/server/panel/class ]] || [[ -f /www/server/panel/BT-Panel ]]
+  # 1) 目录/文件特征
+  if [[ -d /www/server/panel ]]; then
+    if [[ -f /www/server/panel/class/common.py ]] || [[ -d /www/server/panel/class ]] || [[ -f /www/server/panel/BT-Panel ]]; then
+      return 0
+    fi
+  fi
+
+  # 2) 进程特征（BT-Panel / BT-Task）
+  if command -v pgrep >/dev/null 2>&1; then
+    if pgrep -f '/www/server/panel/BT-Panel|/www/server/panel/BT-Task' >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+
+  return 1
 }
 
 # 若用户传了宝塔相关参数，未满足环境则终止
