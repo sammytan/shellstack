@@ -65,28 +65,33 @@ _baota_append_nginx_configure_modsecurity() {
   local connector_dir="$1"
   local cfg_pl="/www/server/panel/install/nginx_configure.pl"
   local flag="--add-module=${connector_dir}"
-
-  # 历史执行可能重复注入，先去重（最多保留一条同 flag）
-  if [[ -f "$cfg_pl" ]] && grep -qF "$flag" "$cfg_pl" 2>/dev/null; then
-    local bak="${cfg_pl}.bak.shellstack.$(date +%Y%m%d%H%M%S)"
-    \cp -a "$cfg_pl" "$bak" 2>/dev/null || true
-    awk -v f="$flag" '{
-      if ($0==f) {
-        n++
-        if (n==1) print $0
-      } else {
+  # 每次都做一次稳健去重：兼容 CRLF、前后空白、历史重复行
+  if [[ -f "$cfg_pl" ]] && [[ -s "$cfg_pl" ]]; then
+    \cp -a "$cfg_pl" "${cfg_pl}.bak.shellstack.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    awk -v f="$flag" '
+      {
+        line=$0
+        gsub(/\r/, "", line)
+        sub(/^[ \t]+/, "", line)
+        sub(/[ \t]+$/, "", line)
+        if (line==f) {
+          dup++
+          next
+        }
         print $0
       }
-    }' "$cfg_pl" > "${cfg_pl}.tmp.shellstack" && mv -f "${cfg_pl}.tmp.shellstack" "$cfg_pl"
-    log "nginx_configure.pl 已去重 ModSecurity-nginx 标记（保留 1 条）: $flag"
-    return 0
+      END {
+        # no-op
+      }
+    ' "$cfg_pl" > "${cfg_pl}.tmp.shellstack" && mv -f "${cfg_pl}.tmp.shellstack" "$cfg_pl"
   fi
 
-  if [[ -f "$cfg_pl" ]] && [[ -s "$cfg_pl" ]]; then
-    \cp -a "$cfg_pl" "${cfg_pl}.bak.shellstack.$(date +%Y%m%d%H%M%S)"
+  if grep -qF "$flag" "$cfg_pl" 2>/dev/null; then
+    log "nginx_configure.pl 已存在 ModSecurity-nginx 标记（重复项已清理）: $flag"
+  else
+    echo "$flag" >> "$cfg_pl"
+    log "已追加到 nginx_configure.pl: $flag"
   fi
-  echo "$flag" >> "$cfg_pl"
-  log "已追加到 nginx_configure.pl: $flag"
 }
 
 # 当前 Nginx 是否已是「目标 OpenResty 键 + 已编进 ModSecurity-nginx」，可跳过重复 nginx.sh update
@@ -143,6 +148,43 @@ _baota_print_nginx_make_failure_snippet() {
   fi
 }
 
+_baota_post_build_verification() {
+  local nginx_bin="/www/server/nginx/sbin/nginx"
+  if [[ ! -x "$nginx_bin" ]]; then
+    warn "验收: 未找到 $nginx_bin，跳过自动验收"
+    return 0
+  fi
+
+  local vout
+  vout="$("$nginx_bin" -V 2>&1)"
+  log "验收: nginx -V 关键摘要"
+  local ver_line cfg_line
+  ver_line="$(echo "$vout" | awk 'NR==1{print; exit}')"
+  cfg_line="$(echo "$vout" | awk 'NR==2{print; exit}')"
+  [[ -n "$ver_line" ]] && log "  $ver_line"
+  if echo "$cfg_line" | grep -q -- '--add-module='; then
+    # 只保留与模块相关的参数，避免输出过长
+    local mod_args
+    mod_args="$(echo "$cfg_line" | tr ' ' '\n' | grep -- '--add-module=' | tr '\n' ' ')"
+    [[ -n "$mod_args" ]] && log "  configure modules: $mod_args"
+  fi
+
+  if echo "$vout" | grep -qi modsecurity; then
+    log "验收: nginx -V 已包含 modsecurity"
+  else
+    warn "验收: nginx -V 未包含 modsecurity，请检查 /tmp/nginx_config.pl 与 /tmp/nginx_make.pl"
+  fi
+
+  if "$nginx_bin" -t >/tmp/shellstack-nginx-test.log 2>&1; then
+    log "验收: nginx -t 通过"
+  else
+    warn "验收: nginx -t 失败（摘要如下）"
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && warn "  $line"
+    done < /tmp/shellstack-nginx-test.log
+  fi
+}
+
 # 检测宝塔并升级/重编译 OpenResty，静态链接 ModSecurity-nginx 连接器
 baota_install_openresty_with_modsecurity_connector() {
   if ! _baota_panel_present; then
@@ -182,11 +224,7 @@ baota_install_openresty_with_modsecurity_connector() {
     error "宝塔 nginx.sh update 失败。请检查 $LOG_FILE 与 /tmp/nginx_config.pl / /tmp/nginx_make.pl"
   fi
 
-  if nginx -V 2>&1 | grep -qi modsecurity; then
-    log "验证: nginx -V 已包含 modsecurity"
-  else
-    warn "nginx -V 未看到 modsecurity 字样，请确认编译是否启用连接器（查看 /tmp/nginx_config.pl）"
-  fi
+  _baota_post_build_verification
 
   log "宝塔 OpenResty 更新与 ModSecurity-nginx 集成步骤完成。请执行: nginx -t && /etc/init.d/nginx restart"
 }
