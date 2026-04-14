@@ -195,6 +195,15 @@ parse_args() {
         EXTEND_BTWAF_CACHE=1
         shift
         ;;
+      --force)
+        # 快捷强制模式：覆盖为宝塔 OpenResty + 下发配置 + 扩展 BTwaf
+        BT_OPENRESTY_VERSION="openresty"
+        BT_OPENRESTY_FROM_CLI=1
+        export BT_OPENRESTY_VERSION
+        DEPLOY_MODSEC_CONF=1
+        EXTEND_BTWAF_CACHE=1
+        shift
+        ;;
       --deploy-conf)
         DEPLOY_MODSEC_CONF=1
         shift
