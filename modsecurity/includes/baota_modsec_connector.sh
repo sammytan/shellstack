@@ -65,10 +65,23 @@ _baota_append_nginx_configure_modsecurity() {
   local connector_dir="$1"
   local cfg_pl="/www/server/panel/install/nginx_configure.pl"
   local flag="--add-module=${connector_dir}"
+
+  # 历史执行可能重复注入，先去重（最多保留一条同 flag）
   if [[ -f "$cfg_pl" ]] && grep -qF "$flag" "$cfg_pl" 2>/dev/null; then
-    log "nginx_configure.pl 已包含 ModSecurity-nginx: $flag"
+    local bak="${cfg_pl}.bak.shellstack.$(date +%Y%m%d%H%M%S)"
+    \cp -a "$cfg_pl" "$bak" 2>/dev/null || true
+    awk -v f="$flag" '{
+      if ($0==f) {
+        n++
+        if (n==1) print $0
+      } else {
+        print $0
+      }
+    }' "$cfg_pl" > "${cfg_pl}.tmp.shellstack" && mv -f "${cfg_pl}.tmp.shellstack" "$cfg_pl"
+    log "nginx_configure.pl 已去重 ModSecurity-nginx 标记（保留 1 条）: $flag"
     return 0
   fi
+
   if [[ -f "$cfg_pl" ]] && [[ -s "$cfg_pl" ]]; then
     \cp -a "$cfg_pl" "${cfg_pl}.bak.shellstack.$(date +%Y%m%d%H%M%S)"
   fi
