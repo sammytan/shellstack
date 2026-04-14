@@ -55,18 +55,29 @@ _baota_run_panel_nginx_build() {
   local ver="$1"
   local install_dir="/www/server/panel/install"
   local mode="${MODSECURITY_BT_NGINX_INSTALL_MODE:-auto}"
+  log "Nginx 构建参数: version=${ver}, mode=${mode}"
+
+  # openresty/openresty127 必须走 nginx.sh update <ver>，install_soft.sh 会回落到默认 Tengine
+  if [[ "$mode" != "install_soft" ]] && [[ "$ver" == "openresty" || "$ver" == "openresty127" ]]; then
+    if [[ -f "$BT_PANEL_NGINX_SH" ]]; then
+      log "检测到 OpenResty 版本键(${ver})，强制走 nginx.sh update，避免 install_soft 回落 Tengine"
+      log "执行: bash ${BT_PANEL_NGINX_SH} update ${ver}"
+      bash "$BT_PANEL_NGINX_SH" update "$ver" >>"$LOG_FILE" 2>&1
+      return $?
+    fi
+  fi
 
   if [[ "$mode" == "install_soft" ]] || [[ "$mode" == "auto" && -f "$BT_PANEL_INSTALL_SOFT_SH" ]]; then
     log "调用宝塔 install_soft.sh 安装/重装 Nginx（与面板一致）"
-    log "执行: cd ${install_dir} && bash install_soft.sh 3 install nginx"
-    ( cd "$install_dir" && bash "$BT_PANEL_INSTALL_SOFT_SH" 3 install nginx >>"$LOG_FILE" 2>&1 )
+    log "执行: cd ${install_dir} && bash install_soft.sh 3 install nginx ${ver}"
+    ( cd "$install_dir" && bash "$BT_PANEL_INSTALL_SOFT_SH" 3 install nginx "${ver}" >>"$LOG_FILE" 2>&1 )
     return $?
   fi
 
   if [[ ! -f "$BT_PANEL_NGINX_SH" ]]; then
     warn "未找到 $BT_PANEL_NGINX_SH，回退尝试 install_soft.sh 3 install nginx"
     if [[ -f "$BT_PANEL_INSTALL_SOFT_SH" ]]; then
-      ( cd "$install_dir" && bash "$BT_PANEL_INSTALL_SOFT_SH" 3 install nginx >>"$LOG_FILE" 2>&1 )
+      ( cd "$install_dir" && bash "$BT_PANEL_INSTALL_SOFT_SH" 3 install nginx "${ver}" >>"$LOG_FILE" 2>&1 )
       return $?
     fi
     return 1
@@ -389,7 +400,7 @@ baota_install_openresty_with_modsecurity_connector() {
 
   log "=========================================="
   log "调用宝塔 Nginx 编译安装流程"
-  log "（将按面板流程编译，日志同时写入 $LOG_FILE；模式: ${MODSECURITY_BT_NGINX_INSTALL_MODE}）"
+  log "（将按面板流程编译，日志同时写入 $LOG_FILE；最终版本键: ${BT_OPENRESTY_VERSION}, 模式: ${MODSECURITY_BT_NGINX_INSTALL_MODE}）"
   log "=========================================="
   if ! _baota_run_panel_nginx_build "$BT_OPENRESTY_VERSION"; then
     _baota_recover_nginx_layout_from_source

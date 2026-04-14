@@ -203,9 +203,11 @@ parse_args() {
       --force)
         # 快捷强制模式：覆盖为宝塔 OpenResty + 下发配置 + 扩展 BTwaf
         # 并启用强制重编译/重注入/重安装相关行为
-        BT_OPENRESTY_VERSION="openresty"
-        BT_OPENRESTY_FROM_CLI=1
-        export BT_OPENRESTY_VERSION
+        if [[ "${BT_OPENRESTY_FROM_CLI:-0}" != "1" ]]; then
+          BT_OPENRESTY_VERSION="openresty"
+          BT_OPENRESTY_FROM_CLI=1
+          export BT_OPENRESTY_VERSION
+        fi
         DEPLOY_MODSEC_CONF=1
         EXTEND_BTWAF_CACHE=1
         MODSECURITY_FORCE_BT_NGINX_REBUILD=1
@@ -216,7 +218,7 @@ parse_args() {
         export SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK
         export SHELLSTACK_BTWAF_FORCE_PANEL_INSTALL
         export SHELLSTACK_INSTALL_REDIS
-        log "启用 --force：将强制执行 nginx 重编译、nginx.conf http 块重注入、BTwaf 面板重装及 Redis 安装流程。"
+        log "启用 --force：将强制执行 nginx 重编译、nginx.conf http 块重注入、BTwaf 面板重装及 Redis 安装流程（OpenResty 版本优先使用显式 --bt-openresty）。"
         shift
         ;;
       --deploy-conf)
@@ -469,6 +471,10 @@ main() {
   if [[ "${INSTALL_BAOTA_PANEL:-0}" == "1" ]]; then
     source "$INCLUDES_DIR/baota_install_panel.sh"
     install_baota_panel_if_requested
+  fi
+
+  if [[ "${BT_OPENRESTY_FROM_CLI:-0}" == "1" || "${DEPLOY_MODSEC_CONF:-0}" == "1" || "${EXTEND_BTWAF_CACHE:-0}" == "1" ]]; then
+    log "参数归一化: BT_OPENRESTY_VERSION=${BT_OPENRESTY_VERSION} (force=${MODSECURITY_FORCE_BT_NGINX_REBUILD:-0}, deploy=${DEPLOY_MODSEC_CONF:-0}, btwaf=${EXTEND_BTWAF_CACHE:-0})"
   fi
 
   # 宝塔相关参数需已安装宝塔面板与 BTwaf
