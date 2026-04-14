@@ -71,14 +71,17 @@ install_system_dependencies() {
       eval "$PKG_INSTALL build-essential automake libtool pkg-config \
                     libpcre2-dev libssl-dev libxml2-dev" >> "$LOG_FILE" 2>&1
 
-      [ $CURL_MISSING -eq 1 ] && \
+      if [ $CURL_MISSING -eq 1 ]; then
         eval "$PKG_INSTALL libcurl4-openssl-dev" >> "$LOG_FILE" 2>&1 || warn "curl开发库安装失败"
+      fi
 
-      [ $GEOIP_MISSING -eq 1 ] && \
+      if [ $GEOIP_MISSING -eq 1 ]; then
         eval "$PKG_INSTALL libgeoip-dev" >> "$LOG_FILE" 2>&1 || warn "GeoIP开发库安装失败"
+      fi
 
-      [ $MAXMINDDB_MISSING -eq 1 ] && \
+      if [ $MAXMINDDB_MISSING -eq 1 ]; then
         eval "$PKG_INSTALL libmaxminddb-dev" >> "$LOG_FILE" 2>&1 || warn "MaxMindDB开发库安装失败"
+      fi
 
       eval "$PKG_INSTALL liblua5.3-dev libyajl-dev" >> "$LOG_FILE" 2>&1 || warn "部分可选依赖安装失败"
       ;;
@@ -93,14 +96,17 @@ install_system_dependencies() {
       eval "$PKG_INSTALL gcc gcc-c++ make automake libtool pkgconfig \
                     pcre2-devel openssl-devel libxml2-devel" >> "$LOG_FILE" 2>&1
 
-      [ $CURL_MISSING -eq 1 ] && \
+      if [ $CURL_MISSING -eq 1 ]; then
         eval "$PKG_INSTALL libcurl-devel" >> "$LOG_FILE" 2>&1 || warn "curl开发库安装失败"
+      fi
 
-      [ $GEOIP_MISSING -eq 1 ] && \
+      if [ $GEOIP_MISSING -eq 1 ]; then
         eval "$PKG_INSTALL libmaxminddb-devel" >> "$LOG_FILE" 2>&1 || warn "GeoIP开发库安装失败"
+      fi
 
-      [ $MAXMINDDB_MISSING -eq 1 ] && \
+      if [ $MAXMINDDB_MISSING -eq 1 ]; then
         eval "$PKG_INSTALL libmaxminddb-devel" >> "$LOG_FILE" 2>&1 || warn "MaxMindDB开发库安装失败"
+      fi
 
       eval "$PKG_INSTALL lua-devel yajl-devel" >> "$LOG_FILE" 2>&1 || warn "部分可选依赖安装失败"
       ;;
@@ -109,14 +115,17 @@ install_system_dependencies() {
       eval "$PKG_INSTALL gcc make automake libtool pkgconf \
                     pcre2 openssl libxml2" >> "$LOG_FILE" 2>&1
 
-      [ $CURL_MISSING -eq 1 ] && \
+      if [ $CURL_MISSING -eq 1 ]; then
         eval "$PKG_INSTALL curl" >> "$LOG_FILE" 2>&1 || warn "curl开发库安装失败"
+      fi
 
-      [ $GEOIP_MISSING -eq 1 ] && \
+      if [ $GEOIP_MISSING -eq 1 ]; then
         eval "$PKG_INSTALL geoip" >> "$LOG_FILE" 2>&1 || warn "GeoIP开发库安装失败"
+      fi
 
-      [ $MAXMINDDB_MISSING -eq 1 ] && \
+      if [ $MAXMINDDB_MISSING -eq 1 ]; then
         eval "$PKG_INSTALL libmaxminddb" >> "$LOG_FILE" 2>&1 || warn "MaxMindDB开发库安装失败"
+      fi
 
       eval "$PKG_INSTALL lua yajl" >> "$LOG_FILE" 2>&1 || warn "部分可选依赖安装失败"
       ;;
@@ -125,14 +134,17 @@ install_system_dependencies() {
       eval "$PKG_INSTALL gcc gcc-c++ make automake libtool pkg-config \
                     pcre2-devel libopenssl-devel libxml2-devel" >> "$LOG_FILE" 2>&1
 
-      [ $CURL_MISSING -eq 1 ] && \
+      if [ $CURL_MISSING -eq 1 ]; then
         eval "$PKG_INSTALL libcurl-devel" >> "$LOG_FILE" 2>&1 || warn "curl开发库安装失败"
+      fi
 
-      [ $GEOIP_MISSING -eq 1 ] && \
+      if [ $GEOIP_MISSING -eq 1 ]; then
         eval "$PKG_INSTALL geoip-devel" >> "$LOG_FILE" 2>&1 || warn "GeoIP开发库安装失败"
+      fi
 
-      [ $MAXMINDDB_MISSING -eq 1 ] && \
+      if [ $MAXMINDDB_MISSING -eq 1 ]; then
         eval "$PKG_INSTALL libmaxminddb-devel" >> "$LOG_FILE" 2>&1 || warn "MaxMindDB开发库安装失败"
+      fi
 
       eval "$PKG_INSTALL lua-devel libyajl-devel" >> "$LOG_FILE" 2>&1 || warn "部分可选依赖安装失败"
       ;;

@@ -211,6 +211,7 @@ ModSecurity 核心库安装脚本
   说明: --with-exporter 会尝试通过包管理器安装 node exporter（默认端口 9100，可设 EXPORTER_LISTEN_PORT），并优先以 file_sd 方式注册到 Prometheus；远端 Prometheus 会尝试免密 SSH(root@host) 写入并重载，失败则给出手工注册提示。
   说明: --with-exporter 可在 main.sh 中单独使用（例如仅部署 exporter + 注册 Prometheus）；如不希望执行默认内核/终端优化，可同时加 --disable-kernel-opt --disable-terminal。
   说明: --install-bt 使用 BT11 安装命令下载并执行 install_panel.sh（默认地址: https://bt11.btmb.cc/install/install_panel.sh）；可用 BT_INSTALL_SCRIPT_URL / BT_INSTALL_ARG 覆盖。
+  说明: 未显式使用 --bt-openresty/--deploy-conf（或 --force）时，不会触发宝塔 Nginx 重编译；仅 --extend-btwaf-cache 不会重装 Nginx。
   说明: 若 Nginx 已含 ModSecurity 且与当前 --bt-openresty 版本一致，将跳过重复编译；强制重编可设 MODSECURITY_FORCE_BT_NGINX_REBUILD=1。
   --help                 显示此帮助信息
   --verify               验证已安装的 ModSecurity

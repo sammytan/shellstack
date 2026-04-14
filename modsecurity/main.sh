@@ -370,9 +370,14 @@ main_install() {
     install_system_dependencies
   fi
 
-  # 宝塔：升级 OpenResty 并编译 ModSecurity-nginx 连接器（非宝塔环境自动跳过）
-  source "$INCLUDES_DIR/baota_modsec_connector.sh"
-  baota_install_openresty_with_modsecurity_connector
+  # 宝塔：仅在显式需要时才升级/重编译 OpenResty + ModSecurity-nginx
+  # 触发条件：--bt-openresty（含 --force 覆盖）或 --deploy-conf
+  if [[ "${BT_OPENRESTY_FROM_CLI:-0}" == "1" || "${DEPLOY_MODSEC_CONF:-0}" == "1" ]]; then
+    source "$INCLUDES_DIR/baota_modsec_connector.sh"
+    baota_install_openresty_with_modsecurity_connector
+  else
+    log "未使用 --bt-openresty/--deploy-conf，跳过宝塔 Nginx 重编译流程（仅执行核心库与可选扩展）。"
+  fi
 
   if [ "$DEPLOY_MODSEC_CONF" = "1" ]; then
     log "=========================================="

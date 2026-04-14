@@ -252,6 +252,20 @@ _baota_crs_rule_files() {
   echo "RESPONSE-980-CORRELATION.conf"
 }
 
+_baota_detect_geoip_db_for_modsec() {
+  local candidates=(
+    "/usr/local/share/GeoIP/dbip-country-lite.mmdb"
+    "/usr/local/share/GeoIP/GeoLite2-Country.mmdb"
+    "/var/lib/GeoIP/dbip-country-lite.mmdb"
+    "/var/lib/GeoIP/GeoLite2-Country.mmdb"
+  )
+  local p
+  for p in "${candidates[@]}"; do
+    [[ -f "$p" ]] && { echo "$p"; return 0; }
+  done
+  return 1
+}
+
 baota_deploy_modsecurity_conf() {
   if [[ ! -d "$BT_NGINX_CONF_DIR" ]]; then
     error "配置目录不存在: $BT_NGINX_CONF_DIR"
@@ -327,8 +341,22 @@ baota_deploy_modsecurity_conf() {
 
   touch "$BT_WHITELIST_FILE"
 
-  cat > "$BT_NGINX_CONF_DIR/custom_modsec_rules.conf" <<'RULES'
-SecGeoLookupDB /var/lib/GeoIP/GeoLite2-Country.mmdb
+  local geoip_db=""
+  geoip_db="$(_baota_detect_geoip_db_for_modsec 2>/dev/null || true)"
+  if [[ -n "$geoip_db" ]]; then
+    log "GeoIP 数据库检测: 使用 $geoip_db（优先 DB-IP Lite）"
+  else
+    warn "未检测到可用 GeoIP 数据库（dbip/GeoLite2），将不写入 SecGeoLookupDB，避免 nginx -t 失败。"
+  fi
+
+  {
+    if [[ -n "$geoip_db" ]]; then
+      echo "SecGeoLookupDB $geoip_db"
+    else
+      echo "# SecGeoLookupDB /usr/local/share/GeoIP/dbip-country-lite.mmdb"
+      echo "# 未检测到 GeoIP 库，已注释以避免 nginx 启动失败"
+    fi
+    cat <<'RULES'
 SecRule REMOTE_ADDR "@geoLookup" "id:10001,phase:1,pass,log"
 SecRule REQUEST_URI "@beginsWith /vts_status" "id:10002,phase:1,nolog,pass,ctl:ruleEngine=Off"
 SecRule REQUEST_URI "@beginsWith /e/e_DliR28KktG1dpud/" "id:10003,phase:1,nolog,pass,ctl:ruleEngine=Off"
@@ -364,6 +392,7 @@ SecRule IP:error_request_counter "@gt 15" \
 SecRule IP:block_time "@ge 1" \
     "id:2003,phase:1,log,deny,status:403,msg:'IP is banned for 1 hour due to excessive error requests'"
 RULES
+  } > "$BT_NGINX_CONF_DIR/custom_modsec_rules.conf"
   log "已写入 $BT_NGINX_CONF_DIR/custom_modsec_rules.conf"
 
   _baota_inject_shellstack_http_block_in_nginx_conf
