@@ -3,7 +3,15 @@
 # 依赖 shared.sh: log warn error LOG_FILE
 
 BT_NGINX_CONF_DIR="${BT_NGINX_CONF_DIR:-/www/server/nginx/conf}"
-BT_NGINX_BIN="${BT_NGINX_BIN:-/www/server/nginx/sbin/nginx}"
+if [[ -z "${BT_NGINX_BIN:-}" ]]; then
+  if [[ -x /www/server/nginx/sbin/nginx ]]; then
+    BT_NGINX_BIN="/www/server/nginx/sbin/nginx"
+  elif [[ -x /www/server/nginx/nginx/sbin/nginx ]]; then
+    BT_NGINX_BIN="/www/server/nginx/nginx/sbin/nginx"
+  else
+    BT_NGINX_BIN="/www/server/nginx/sbin/nginx"
+  fi
+fi
 # 为 0 时不写入 nginx.conf 的 fastcgi_cache 共享区，且不向 enable-php 注入 fastcgi_cache（仅 ModSecurity / real_ip 等）
 SHELLSTACK_DEPLOY_FASTCGI_CACHE="${SHELLSTACK_DEPLOY_FASTCGI_CACHE:-1}"
 # 为 1 时先删除 # shellstack-http-includes-begin … end 旧块再按当前环境重新注入（例如编译 modsecurity-nginx 后补全）

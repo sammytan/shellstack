@@ -8,6 +8,18 @@ BT_OPENRESTY_VERSION="${BT_OPENRESTY_VERSION:-openresty127}"
 # 设为 1 时强制执行宝塔 nginx.sh update（跳过「已就绪」检测）
 MODSECURITY_FORCE_BT_NGINX_REBUILD="${MODSECURITY_FORCE_BT_NGINX_REBUILD:-0}"
 
+_baota_detect_nginx_bin() {
+  local candidates=(
+    "/www/server/nginx/sbin/nginx"
+    "/www/server/nginx/nginx/sbin/nginx"
+  )
+  local p
+  for p in "${candidates[@]}"; do
+    [[ -x "$p" ]] && { echo "$p"; return 0; }
+  done
+  return 1
+}
+
 _baota_panel_present() {
   [[ -f "$BT_PANEL_NGINX_SH" ]] && [[ -f /www/server/panel/install/public.sh ]]
 }
@@ -98,7 +110,8 @@ _baota_append_nginx_configure_modsecurity() {
 _baota_skip_openresty_rebuild_if_current() {
   [[ "${MODSECURITY_FORCE_BT_NGINX_REBUILD}" == "1" ]] && return 1
 
-  local nginx_bin="/www/server/nginx/sbin/nginx"
+  local nginx_bin
+  nginx_bin="$(_baota_detect_nginx_bin 2>/dev/null)" || return 1
   local vchk="/www/server/nginx/version_check.pl"
   local want="${BT_OPENRESTY_VERSION:-openresty127}"
 
@@ -149,9 +162,9 @@ _baota_print_nginx_make_failure_snippet() {
 }
 
 _baota_post_build_verification() {
-  local nginx_bin="/www/server/nginx/sbin/nginx"
-  if [[ ! -x "$nginx_bin" ]]; then
-    warn "验收: 未找到 $nginx_bin，跳过自动验收"
+  local nginx_bin
+  if ! nginx_bin="$(_baota_detect_nginx_bin 2>/dev/null)"; then
+    warn "验收: 未找到可执行 nginx（已尝试 /www/server/nginx/sbin/nginx 与 /www/server/nginx/nginx/sbin/nginx），跳过自动验收"
     return 0
   fi
 
