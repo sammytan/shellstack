@@ -159,6 +159,16 @@ _baota_print_nginx_make_failure_snippet() {
   if [[ -f "$cfg" ]]; then
     warn "  参考配置文件: $cfg"
   fi
+  if [[ -f /tmp/nginx_install.pl ]]; then
+    warn "  /tmp/nginx_install.pl 尾部:"
+    local tail_install
+    tail_install="$(awk 'NR>0{a[NR%20]=$0} END{for(i=NR-19;i<=NR;i++) if(i>0) print a[i%20]}' /tmp/nginx_install.pl 2>/dev/null)"
+    if [[ -n "$tail_install" ]]; then
+      while IFS= read -r line; do
+        [[ -n "$line" ]] && warn "    $line"
+      done <<< "$tail_install"
+    fi
+  fi
 }
 
 _baota_post_build_verification() {
@@ -198,6 +208,14 @@ _baota_post_build_verification() {
   fi
 }
 
+_baota_update_result_can_be_accepted() {
+  local nginx_bin
+  nginx_bin="$(_baota_detect_nginx_bin 2>/dev/null)" || return 1
+  "$nginx_bin" -V 2>&1 | grep -qi modsecurity || return 1
+  "$nginx_bin" -t >/dev/null 2>&1 || return 1
+  return 0
+}
+
 # 检测宝塔并升级/重编译 OpenResty，静态链接 ModSecurity-nginx 连接器
 baota_install_openresty_with_modsecurity_connector() {
   if ! _baota_panel_present; then
@@ -234,7 +252,11 @@ baota_install_openresty_with_modsecurity_connector() {
   log "=========================================="
   if ! bash "$BT_PANEL_NGINX_SH" update "$BT_OPENRESTY_VERSION" >>"$LOG_FILE" 2>&1; then
     _baota_print_nginx_make_failure_snippet
-    error "宝塔 nginx.sh update 失败。请检查 $LOG_FILE 与 /tmp/nginx_config.pl / /tmp/nginx_make.pl"
+    if _baota_update_result_can_be_accepted; then
+      warn "宝塔 nginx.sh update 返回非 0，但验收通过（nginx -V 含 modsecurity 且 nginx -t 通过），按成功继续。"
+    else
+      error "宝塔 nginx.sh update 失败。请检查 $LOG_FILE 与 /tmp/nginx_config.pl / /tmp/nginx_make.pl"
+    fi
   fi
 
   _baota_post_build_verification
