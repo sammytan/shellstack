@@ -4,11 +4,14 @@
 
 MODSECURITY_NGX_CONNECTOR_DIR="${MODSECURITY_NGX_CONNECTOR_DIR:-/www/server/modsecurity-nginx}"
 BT_PANEL_NGINX_SH="${BT_PANEL_NGINX_SH:-/www/server/panel/install/nginx.sh}"
+BT_PANEL_INSTALL_SOFT_SH="${BT_PANEL_INSTALL_SOFT_SH:-/www/server/panel/install/install_soft.sh}"
 BT_OPENRESTY_VERSION="${BT_OPENRESTY_VERSION:-openresty127}"
 # 设为 1 时强制执行宝塔 nginx.sh update（跳过「已就绪」检测）
 MODSECURITY_FORCE_BT_NGINX_REBUILD="${MODSECURITY_FORCE_BT_NGINX_REBUILD:-0}"
 # 设为 1 时保留 shellstack 生成的 .bak.shellstack.* 文件，默认清理
 MODSECURITY_KEEP_BT_TEMP_FILES="${MODSECURITY_KEEP_BT_TEMP_FILES:-0}"
+# 构建调用方式: auto | install_soft | nginx_sh（默认 auto，优先 install_soft）
+MODSECURITY_BT_NGINX_INSTALL_MODE="${MODSECURITY_BT_NGINX_INSTALL_MODE:-auto}"
 
 _baota_detect_nginx_bin() {
   local candidates=(
@@ -36,6 +39,23 @@ _baota_detect_nginx_setup_path() {
 
 _baota_panel_present() {
   [[ -f "$BT_PANEL_NGINX_SH" ]] && [[ -f /www/server/panel/install/public.sh ]]
+}
+
+_baota_run_panel_nginx_build() {
+  local ver="$1"
+  local install_dir="/www/server/panel/install"
+  local mode="${MODSECURITY_BT_NGINX_INSTALL_MODE:-auto}"
+
+  if [[ "$mode" == "install_soft" ]] || [[ "$mode" == "auto" && -f "$BT_PANEL_INSTALL_SOFT_SH" ]]; then
+    log "调用宝塔 install_soft.sh 安装/重装 Nginx（与面板一致）"
+    log "执行: cd ${install_dir} && bash install_soft.sh 3 install nginx"
+    ( cd "$install_dir" && bash "$BT_PANEL_INSTALL_SOFT_SH" 3 install nginx >>"$LOG_FILE" 2>&1 )
+    return $?
+  fi
+
+  log "调用宝塔 nginx.sh update ${ver}"
+  log "执行: bash ${BT_PANEL_NGINX_SH} update ${ver}"
+  bash "$BT_PANEL_NGINX_SH" update "$ver" >>"$LOG_FILE" 2>&1
 }
 
 _clone_modsecurity_nginx_connector() {
@@ -79,45 +99,44 @@ EOF
   log "已写入 $mark 到 nginx_prepare.sh（libmodsecurity 编译期可见性）"
 }
 
-_baota_ensure_nginx_config_pl() {
-  local d="/www/server/panel/install/nginx"
-  mkdir -p "$d"
-  if [[ ! -f "$d/config.pl" ]]; then
-    touch "$d/config.pl"
-  fi
-}
-
-_baota_append_nginx_configure_modsecurity() {
+_baota_register_modsecurity_with_panel() {
   local connector_dir="$1"
-  local cfg_pl="/www/server/panel/install/nginx_configure.pl"
-  local flag="--add-module=${connector_dir}"
-  # 每次都做一次稳健去重：兼容 CRLF、前后空白、历史重复行
-  if [[ -f "$cfg_pl" ]] && [[ -s "$cfg_pl" ]]; then
-    \cp -a "$cfg_pl" "${cfg_pl}.bak.shellstack.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
-    awk -v f="$flag" '
+  local nginx_install_dir="/www/server/panel/install/nginx"
+  local ms_dir="${nginx_install_dir}/modsecurity"
+  local config_pl="${nginx_install_dir}/config.pl"
+  local args_pl="${ms_dir}/args.pl"
+  local ps_pl="${ms_dir}/ps.pl"
+
+  mkdir -p "$ms_dir"
+  [[ -f "$config_pl" ]] || touch "$config_pl"
+
+  # 按宝塔扩展约定：config.pl 中登记模块名（去重保留一条）
+  if grep -qE '^[[:space:]]*modsecurity[[:space:]]*$' "$config_pl" 2>/dev/null; then
+    awk '
       {
         line=$0
         gsub(/\r/, "", line)
         sub(/^[ \t]+/, "", line)
         sub(/[ \t]+$/, "", line)
-        if (line==f) {
-          dup++
+        if (line=="modsecurity") {
+          c++
+          if (c==1) print "modsecurity"
           next
         }
         print $0
       }
-      END {
-        # no-op
-      }
-    ' "$cfg_pl" > "${cfg_pl}.tmp.shellstack" && mv -f "${cfg_pl}.tmp.shellstack" "$cfg_pl"
+    ' "$config_pl" > "${config_pl}.tmp.shellstack" && mv -f "${config_pl}.tmp.shellstack" "$config_pl"
+  else
+    echo "modsecurity" >> "$config_pl"
   fi
 
-  if grep -qF "$flag" "$cfg_pl" 2>/dev/null; then
-    log "nginx_configure.pl 已存在 ModSecurity-nginx 标记（重复项已清理）: $flag"
-  else
-    echo "$flag" >> "$cfg_pl"
-    log "已追加到 nginx_configure.pl: $flag"
-  fi
+  # 官方扩展参数入口：args.pl
+  echo "--add-module=${connector_dir}" > "$args_pl"
+
+  # 保持 ps.pl 存在（部分面板逻辑会探测该文件）
+  [[ -f "$ps_pl" ]] || echo "modsecurity" > "$ps_pl"
+
+  log "已按宝塔扩展方式登记 ModSecurity: ${config_pl} + ${args_pl}"
 }
 
 # 当前 Nginx 是否已是「目标 OpenResty 键 + 已编进 ModSecurity-nginx」，可跳过重复 nginx.sh update
@@ -347,14 +366,13 @@ baota_install_openresty_with_modsecurity_connector() {
   fi
 
   _baota_merge_nginx_prepare_modsec "$modsec_prefix"
-  _baota_ensure_nginx_config_pl
-  _baota_append_nginx_configure_modsecurity "$MODSECURITY_NGX_CONNECTOR_DIR"
+  _baota_register_modsecurity_with_panel "$MODSECURITY_NGX_CONNECTOR_DIR"
 
   log "=========================================="
-  log "调用宝塔 nginx.sh update ${BT_OPENRESTY_VERSION}"
-  log "（将按面板流程编译，日志同时写入 $LOG_FILE）"
+  log "调用宝塔 Nginx 编译安装流程"
+  log "（将按面板流程编译，日志同时写入 $LOG_FILE；模式: ${MODSECURITY_BT_NGINX_INSTALL_MODE}）"
   log "=========================================="
-  if ! bash "$BT_PANEL_NGINX_SH" update "$BT_OPENRESTY_VERSION" >>"$LOG_FILE" 2>&1; then
+  if ! _baota_run_panel_nginx_build "$BT_OPENRESTY_VERSION"; then
     _baota_recover_nginx_layout_from_source
     _baota_repair_openresty_layout_if_needed
     _baota_print_nginx_make_failure_snippet
