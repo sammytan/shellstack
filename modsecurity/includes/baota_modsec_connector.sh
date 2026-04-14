@@ -20,6 +20,18 @@ _baota_detect_nginx_bin() {
   return 1
 }
 
+_baota_detect_nginx_setup_path() {
+  local candidates=(
+    "/www/server/nginx"
+    "/www/server/nginx/nginx"
+  )
+  local p
+  for p in "${candidates[@]}"; do
+    [[ -d "$p" ]] && { echo "$p"; return 0; }
+  done
+  return 1
+}
+
 _baota_panel_present() {
   [[ -f "$BT_PANEL_NGINX_SH" ]] && [[ -f /www/server/panel/install/public.sh ]]
 }
@@ -112,7 +124,9 @@ _baota_skip_openresty_rebuild_if_current() {
 
   local nginx_bin
   nginx_bin="$(_baota_detect_nginx_bin 2>/dev/null)" || return 1
-  local vchk="/www/server/nginx/version_check.pl"
+  local setup_path
+  setup_path="$(_baota_detect_nginx_setup_path 2>/dev/null)" || return 1
+  local vchk="${setup_path}/version_check.pl"
   local want="${BT_OPENRESTY_VERSION:-openresty127}"
 
   [[ -x "$nginx_bin" ]] || return 1
@@ -224,9 +238,12 @@ baota_install_openresty_with_modsecurity_connector() {
   fi
 
   if _baota_skip_openresty_rebuild_if_current; then
-    log "当前 OpenResty（version_check.pl: $(head -1 /www/server/nginx/version_check.pl 2>/dev/null | tr -d '\n')）已包含 ModSecurity，且与 --bt-openresty=${BT_OPENRESTY_VERSION} 一致，跳过重复执行 nginx.sh update。"
+    local setup_path cur_ver
+    setup_path="$(_baota_detect_nginx_setup_path 2>/dev/null || true)"
+    cur_ver="$(head -1 "${setup_path}/version_check.pl" 2>/dev/null | tr -d '\n')"
+    log "当前 OpenResty（version_check.pl: ${cur_ver:-unknown}）已包含 ModSecurity，且与 --bt-openresty=${BT_OPENRESTY_VERSION} 一致，跳过重复执行 nginx.sh update。"
     log "若需强制重新编译 Nginx，请设置: export MODSECURITY_FORCE_BT_NGINX_REBUILD=1 后重跑。"
-    if nginx -V 2>&1 | grep -qi modsecurity; then
+    if "$nginx_bin" -V 2>&1 | grep -qi modsecurity; then
       log "验证: nginx -V 已包含 modsecurity"
     fi
     log "宝塔 OpenResty 与 ModSecurity-nginx 无需变更。请按需: nginx -t && /etc/init.d/nginx restart"

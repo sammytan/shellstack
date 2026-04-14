@@ -199,7 +199,7 @@ ModSecurity 核心库安装脚本
   --disable-terminal     禁用终端配置
   --jobs=N               设置并行编译任务数 (默认: 自动检测，根据内存和CPU核心数)
   --extend-btwaf-cache   宝塔：执行面板 btwaf install（已装则跳过）、Redis、再下发扩展 Lua；本地无 btwaf-ext 时从 \$SHELLSTACK_BASE_URL/btwaf-ext/btwaf/ 下载；见 SHELLSTACK_BTWAF_OVERLAY_SRC / SHELLSTACK_BTWAF_CACHE_LUA_URL
-  --force                快捷强制模式：等效 --bt-openresty=openresty --deploy-conf --extend-btwaf-cache
+  --force                强制覆盖安装：等效 --bt-openresty=openresty --deploy-conf --extend-btwaf-cache，并强制重编译 Nginx / 重注入 nginx.conf / 重装 BTwaf / 执行 Redis 安装流程
   --with-exporter=ADDR   安装 node exporter，并尝试自动注册到 Prometheus 服务端（ADDR 可为 IP/域名 或 http(s):// 地址）
   --deploy-conf          宝塔环境：部署 ModSecurity / OWASP CRS / custom 规则、nginx.conf 引用，并在 nginx.conf 与 enable-php-*.conf 中开启 FastCGI 缓存（需宝塔 Nginx）
   --bt-openresty=VER    宝塔 nginx.sh 的 OpenResty 版本键（默认 openresty127，可选 openresty 等）

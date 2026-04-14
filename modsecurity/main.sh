@@ -197,11 +197,21 @@ parse_args() {
         ;;
       --force)
         # 快捷强制模式：覆盖为宝塔 OpenResty + 下发配置 + 扩展 BTwaf
+        # 并启用强制重编译/重注入/重安装相关行为
         BT_OPENRESTY_VERSION="openresty"
         BT_OPENRESTY_FROM_CLI=1
         export BT_OPENRESTY_VERSION
         DEPLOY_MODSEC_CONF=1
         EXTEND_BTWAF_CACHE=1
+        MODSECURITY_FORCE_BT_NGINX_REBUILD=1
+        SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK=1
+        SHELLSTACK_BTWAF_FORCE_PANEL_INSTALL=1
+        SHELLSTACK_INSTALL_REDIS=1
+        export MODSECURITY_FORCE_BT_NGINX_REBUILD
+        export SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK
+        export SHELLSTACK_BTWAF_FORCE_PANEL_INSTALL
+        export SHELLSTACK_INSTALL_REDIS
+        log "启用 --force：将强制执行 nginx 重编译、nginx.conf http 块重注入、BTwaf 面板重装及 Redis 安装流程。"
         shift
         ;;
       --deploy-conf)
