@@ -74,6 +74,64 @@ _btwaf_shellstack_repo_overlay_dir() {
   return 1
 }
 
+# 与 overlay 同级：btwaf-ext/btwaf-OFFICIAL（官方全量，仅作本地参考，用于补齐 lib 下缺失的 resty 等）
+# 可选覆盖：SHELLSTACK_BTWAF_OFFICIAL_REF=/path/to/btwaf-OFFICIAL
+_btwaf_shellstack_official_reference_dir() {
+  if [[ -n "${SHELLSTACK_BTWAF_OFFICIAL_REF:-}" ]]; then
+    local o="${SHELLSTACK_BTWAF_OFFICIAL_REF}"
+    if [[ -f "$o/resty/redis.lua" ]]; then
+      echo "$o"
+      return 0
+    fi
+    warn "SHELLSTACK_BTWAF_OFFICIAL_REF 无效或缺少 resty/redis.lua: $o"
+  fi
+  local root
+  root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd 2>/dev/null)" || return 1
+  if [[ -f "$root/btwaf-ext/btwaf-OFFICIAL/resty/redis.lua" ]]; then
+    echo "$root/btwaf-ext/btwaf-OFFICIAL"
+    return 0
+  fi
+  return 1
+}
+
+# init.lua 的 package.path 含 BTWAF_LIB/?.lua，require "resty.redis" 只认 .../lib/resty/redis.lua。
+# 官方包常把 resty 放在安装根目录 resty/，若未同步到 lib/resty/ 则 cache.lua 会报 module not found。
+# 此处从：① 仓库 btwaf-OFFICIAL ② 已安装的 $BTWAF/resty/redis.lua 复制到 lib/resty/（不依赖 HTTP）。
+_btwaf_ensure_lib_resty_redis() {
+  local dest="${BTWAF_INSTALL_DIR:-/www/server/btwaf}"
+  local target="$dest/lib/resty/redis.lua"
+  local src=""
+
+  if [[ -f "$target" ]] && [[ -s "$target" ]]; then
+    log "已存在 $target，跳过 resty.redis 补齐"
+    return 0
+  fi
+
+  if src="$(_btwaf_shellstack_official_reference_dir 2>/dev/null)" && [[ -n "$src" ]]; then
+    if [[ -f "$src/resty/redis.lua" ]]; then
+      mkdir -p "$dest/lib/resty"
+      _btwaf_chattr_unlock_path "$target"
+      if \cp -a "$src/resty/redis.lua" "$target" 2>>"$LOG_FILE"; then
+        log "已从本地参考目录复制 resty/redis.lua -> $target ($src)"
+        chmod 644 "$target" 2>/dev/null || true
+        return 0
+      fi
+    fi
+  fi
+
+  if [[ -f "$dest/resty/redis.lua" ]] && [[ -s "$dest/resty/redis.lua" ]]; then
+    mkdir -p "$dest/lib/resty"
+    _btwaf_chattr_unlock_path "$target"
+    if \cp -a "$dest/resty/redis.lua" "$target" 2>>"$LOG_FILE"; then
+      log "已从 $dest/resty/redis.lua 复制到 $target（与官方根目录布局一致）"
+      chmod 644 "$target" 2>/dev/null || true
+      return 0
+    fi
+  fi
+
+  warn "无法补齐 lib/resty/redis.lua：① 仓库无 btwaf-ext/btwaf-OFFICIAL/resty/redis.lua；② $dest/resty/redis.lua 不存在。cache.lua 将降级（无 Redis 缓存）。克隆完整 shellstack 后重跑 --extend-btwaf-cache，或设 SHELLSTACK_BTWAF_OFFICIAL_REF=官方目录。"
+}
+
 _shellstack_redis_responds() {
   local cli
   for cli in /www/server/redis/src/redis-cli /www/server/redis/bin/redis-cli /usr/local/redis/bin/redis-cli redis-cli; do
@@ -473,6 +531,7 @@ extend_btwaf_cache_bundle() {
 
   _btwaf_install_redis_via_panel
   _btwaf_overlay_repo_lua_files
+  _btwaf_ensure_lib_resty_redis
   _btwaf_ensure_waf_cache_hit_hook
   _btwaf_ensure_init_requires_cache_module
   _btwaf_ensure_nginx_btwaf_conf_cache_shared
