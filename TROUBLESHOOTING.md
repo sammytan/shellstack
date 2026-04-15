@@ -81,13 +81,21 @@ curl -fsSL -o /dev/null -w '%{http_code}\n' https://你的域名/btwaf-ext/btwaf
 
 ### 3b. 脚本提示「不是有效 cache.lua」但浏览器能打开同一 URL
 
-**常见原因**：服务端对静态文件启用了 **gzip**，旧版脚本用 curl 落盘的是**压缩二进制**，本地 `grep` 匹配不到 `resty.redis`。当前 `btwaf_extend.sh` 已改为 `curl --compressed`（并带固定 UA），请更新脚本后重试。
+**常见原因**：
 
-自检（应看到明文 `--` 或 `local` 开头，且含 `resty.redis`）：
+1. **gzip**：脚本已用 `curl --compressed`，并在校验失败时再试 `Accept-Encoding: identity`。
+2. **Nginx `charset utf-8,gbk` 写在 `location /`**：可能对静态 `.lua` 做字符集处理，导致落盘内容与源码不一致。请为 **`location ^~ /btwaf-ext/`** 单独设 **`charset off`**（见 `nginx-config-example.conf`）。
+3. **磁盘路径**：`root` 下必须有 `btwaf-ext/btwaf/lib/cache.lua`，与 URL 路径一致。
+
+自检：
 
 ```bash
 curl -fsSL --compressed -A 'ShellStack-test/1' 'https://你的域名/btwaf-ext/btwaf/lib/cache.lua' | head -n 5
+# 再与 identity 对比
+curl -fsSL -H 'Accept-Encoding: identity' -A 'ShellStack-test/1' 'https://你的域名/btwaf-ext/btwaf/lib/cache.lua' | head -n 5
 ```
+
+部署机排障：`SHELLSTACK_BTWAF_HTTP_DEBUG=1` 再跑 `--extend-btwaf-cache`，日志会打出文件头样本。
 
 ### 3. Web 服务器无法访问文件
 

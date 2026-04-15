@@ -36,29 +36,62 @@ _btwaf_resolve_extracted_root() {
   fi
 }
 
-# 下载扩展 Lua：--compressed 避免服务端 gzip 后落盘为二进制导致校验失败；UA 避免部分 CDN/WAF 对「空 curl」返回挑战页
-_btwaf_try_download_to() {
+# 单次 HTTP 拉取：encoding_mode=auto 时 curl 使用 --compressed；identity 时强制不协商 br/zstd 等（部分环境解压异常时校验失败）
+_btwaf_download_one_pass() {
   local url="$1"
   local out="$2"
+  local ua="$3"
+  local encoding_mode="${4:-auto}"
   rm -f "$out"
-  local ua="ShellStack-BTwaf-Extend/1.0 (+https://github.com/shellstack/shellstack)"
   if command -v curl >/dev/null 2>&1; then
-    if curl -fsSL --compressed -A "$ua" --connect-timeout 15 --max-time 180 "$url" -o "$out" >>"$LOG_FILE" 2>&1 && [[ -s "$out" ]]; then
+    local cargs=(-fsSL -A "$ua" --connect-timeout 15 --max-time 180 -o "$out")
+    if [[ "$encoding_mode" == "auto" ]]; then
+      cargs=(--compressed "${cargs[@]}")
+    else
+      cargs=(-H "Accept-Encoding: identity" "${cargs[@]}")
+    fi
+    if curl "${cargs[@]}" "$url" >>"$LOG_FILE" 2>&1 && [[ -s "$out" ]]; then
       return 0
     fi
   fi
   rm -f "$out"
   if command -v wget >/dev/null 2>&1; then
     local wextra=()
-    if wget --help 2>&1 | grep -q -- '--compression'; then
+    if [[ "$encoding_mode" == "auto" ]] && wget --help 2>&1 | grep -q -- '--compression'; then
       wextra=(--compression=auto)
     fi
-    if wget -q "${wextra[@]}" -U "$ua" -O "$out" --timeout=180 "$url" >>"$LOG_FILE" 2>&1 && [[ -s "$out" ]]; then
+    local wh=()
+    if [[ "$encoding_mode" != "auto" ]]; then
+      wh=(--header="Accept-Encoding: identity")
+    fi
+    if wget -q "${wextra[@]}" "${wh[@]}" -U "$ua" -O "$out" --timeout=180 "$url" >>"$LOG_FILE" 2>&1 && [[ -s "$out" ]]; then
       return 0
     fi
   fi
   rm -f "$out"
   return 1
+}
+
+# 下载扩展 Lua：先协商压缩；失败或后续校验非 Lua 时由调用方用 identity 再拉（见 _btwaf_fetch_overlay_via_http）
+_btwaf_try_download_to() {
+  local url="$1"
+  local out="$2"
+  local ua="${SHELLSTACK_BTWAF_DOWNLOAD_UA:-ShellStack-BTwaf-Extend/1.0 (+https://github.com/shellstack/shellstack)}"
+  if _btwaf_download_one_pass "$url" "$out" "$ua" "auto"; then
+    return 0
+  fi
+  _btwaf_download_one_pass "$url" "$out" "$ua" "identity"
+}
+
+_btwaf_cache_lua_debug_sample() {
+  local f="$1"
+  [[ "${SHELLSTACK_BTWAF_HTTP_DEBUG:-0}" == "1" ]] || return 0
+  [[ -f "$f" ]] || return 0
+  local n hex
+  n=$(wc -c <"$f" 2>/dev/null | tr -d ' ')
+  hex="$(head -c 48 "$f" 2>/dev/null | od -An -tx1 2>/dev/null | tr -s ' ' | head -c 200)"
+  warn "BTWAF_HTTP_DEBUG cache.lua 样本: size=${n:-?} head48hex=${hex:-?}"
+  head -n 8 "$f" 2>/dev/null | while IFS= read -r line; do warn "BTWAF_HTTP_DEBUG | $line"; done
 }
 
 _btwaf_local_tarball_path() {
@@ -416,12 +449,20 @@ _btwaf_fetch_overlay_via_http() {
     [[ -n "$b" ]] || continue
     rm -f "$stage/lib/cache.lua" "$stage/body.lua" "$stage/waf.lua"
     log "尝试下载 BTwaf 扩展: $b/lib/cache.lua"
-    if _btwaf_try_download_to "$b/lib/cache.lua" "$stage/lib/cache.lua" && [[ -s "$stage/lib/cache.lua" ]]; then
-      if ! _btwaf_cache_lua_looks_valid "$stage/lib/cache.lua"; then
-        warn "URL 返回内容不是有效 cache.lua（可能为 404 页面）: $b/lib/cache.lua"
-        rm -f "$stage/lib/cache.lua"
-        continue
+    local ua="${SHELLSTACK_BTWAF_DOWNLOAD_UA:-ShellStack-BTwaf-Extend/1.0 (+https://github.com/shellstack/shellstack)}"
+    local dlok=0
+    if _btwaf_download_one_pass "$b/lib/cache.lua" "$stage/lib/cache.lua" "$ua" "auto" && [[ -s "$stage/lib/cache.lua" ]]; then
+      dlok=1
+    fi
+    if [[ "$dlok" == "1" ]] && ! _btwaf_cache_lua_looks_valid "$stage/lib/cache.lua"; then
+      log "lib/cache.lua 校验未通过，改用 Accept-Encoding: identity 重拉: $b/lib/cache.lua"
+      _btwaf_cache_lua_debug_sample "$stage/lib/cache.lua"
+      dlok=0
+      if _btwaf_download_one_pass "$b/lib/cache.lua" "$stage/lib/cache.lua" "$ua" "identity" && [[ -s "$stage/lib/cache.lua" ]]; then
+        dlok=1
       fi
+    fi
+    if [[ "$dlok" == "1" ]] && _btwaf_cache_lua_looks_valid "$stage/lib/cache.lua"; then
       log "已下载并校验 lib/cache.lua"
       if _btwaf_try_download_to "$b/body.lua" "$stage/body.lua" && [[ -s "$stage/body.lua" ]]; then
         log "已下载 body.lua"
@@ -432,8 +473,13 @@ _btwaf_fetch_overlay_via_http() {
       _SHELLSTACK_BTWAF_HTTP_STAGE="$stage"
       return 0
     fi
+    if [[ "$dlok" == "1" ]]; then
+      _btwaf_cache_lua_debug_sample "$stage/lib/cache.lua"
+      warn "URL 返回内容不是有效 cache.lua: $b/lib/cache.lua（可设 SHELLSTACK_BTWAF_HTTP_DEBUG=1 查看样本；若站点 location / 使用 charset utf-8,gbk，请为 ^~ /btwaf-ext/ 单独 charset off，见 nginx-config-example.conf）"
+    fi
+    rm -f "$stage/lib/cache.lua"
   done
-  warn "HTTP 未成功拉取 lib/cache.lua。请确认：① 站点已发布 btwaf-ext；② URL 返回 200 且为 Lua 非 HTML；③ 若 Nginx 对 .lua 统一 return 403，请增加 location ^~ /btwaf-ext/ { ... } 优先于「禁止 .lua」正则（见仓库 nginx-config-example.conf / TROUBLESHOOTING.md）"
+  warn "HTTP 未成功拉取 lib/cache.lua。请确认：① 磁盘路径存在 \$root/btwaf-ext/btwaf/lib/cache.lua；② URL 200 且为 Lua；③ Nginx 未对 .lua 403；④ 静态站避免在 /btwaf-ext 上 charset 转码 body；⑤ 详见 nginx-config-example.conf / TROUBLESHOOTING.md"
   rm -rf "$stage"
   _SHELLSTACK_BTWAF_HTTP_STAGE=""
   return 1
