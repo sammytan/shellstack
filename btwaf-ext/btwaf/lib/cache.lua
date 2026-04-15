@@ -48,6 +48,24 @@ local CACHE_PREFIX = "php_cache:"
 local DEFAULT_TTL = 180 -- 3 minutes in seconds
 local redis_missing_logged = false
 
+-- body_filter 里 whole 多为已解压正文，但 ngx.header 可能仍带 gzip / attachment，命中时若照搬会导致浏览器乱码或「变成下载」
+local PAGE_CACHE_HEADER_SKIP = {
+    ["transfer-encoding"] = true,
+    ["content-length"] = true,
+    ["content-encoding"] = true,
+    ["content-disposition"] = true,
+    ["connection"] = true,
+    ["keep-alive"] = true,
+    ["upgrade"] = true,
+    ["trailer"] = true,
+    ["content-md5"] = true,
+}
+
+local function page_cache_header_should_skip(name)
+    local k = string.lower(tostring(name or ""))
+    return PAGE_CACHE_HEADER_SKIP[k] == true
+end
+
 local function cache_debug_enabled()
     if _G.Config and type(_G.Config) == "table" then
         if _G.Config.cache_debug == true then
@@ -363,14 +381,12 @@ local function try_access_cache_hit()
     end
     if data.headers and type(data.headers) == "table" then
         for hk, hv in pairs(data.headers) do
-            if type(hv) == "string" then
-                local hkl = string.lower(tostring(hk))
-                if hkl ~= "transfer-encoding" and hkl ~= "content-length" then
-                    ngx.header[hk] = hv
-                end
+            if type(hv) == "string" and not page_cache_header_should_skip(hk) then
+                ngx.header[hk] = hv
             end
         end
     end
+    ngx.header["Content-Length"] = tostring(#data.content)
     stash_shellstack_cache_state("HIT", "served_from_redis", key)
     cache_log_op("access_hit", "key=", key_trace(key), " body_bytes=", tostring(#data.content))
     ngx.print(data.content)
@@ -384,7 +400,15 @@ local function schedule_body_page_cache(ttl, whole)
     if ngx.ctx.white_rule then return end
     local headers = {}
     for k, v in pairs(ngx.header) do
-        headers[k] = v
+        if not page_cache_header_should_skip(k) then
+            if type(v) == "string" then
+                headers[k] = v
+            elseif type(v) == "table" then
+                if v[1] and type(v[1]) == "string" then
+                    headers[k] = v[1]
+                end
+            end
+        end
     end
     local key = body_fingerprint_key()
     local payload = cjson.encode({
