@@ -438,9 +438,10 @@ _btwaf_fetch_overlay_via_http() {
   if [[ -n "${SHELLSTACK_BTWAF_OVERLAY_BASE_URL:-}" ]]; then
     bases+=("${SHELLSTACK_BTWAF_OVERLAY_BASE_URL%/}")
   else
+    # 与仓库目录一致：站点 root 下为 btwaf-ext/btwaf（非 /shellstack/btwaf-ext/，除非你把整站挂在子路径）
+    # 子路径发布时：SHELLSTACK_BTWAF_OVERLAY_BASE_URL=https://域名/前缀/btwaf-ext/btwaf
     bases+=(
       "$root/btwaf-ext/btwaf"
-      "$root/shellstack/btwaf-ext/btwaf"
       "$root/modsecurity/btwaf-overlay"
     )
   fi
