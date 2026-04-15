@@ -44,9 +44,70 @@ local function cache_log_redis_connect_err(event, err_msg)
 end
 
 -- Cache configuration
-local CACHE_PREFIX = "php_cache:"
+local CACHE_PREFIX = "btwaf_cms_cache:"
+-- 整页缓存（access + body）使用**单个 Redis Hash**：所有页面存在同一 key 下，field = md5(server|uri|args)，避免 UA / Accept-Encoding 导致大量重复 key。
+-- 可通过 SHELLSTACK_CACHE_HASH_KEY 覆盖 Hash 名（须与 clear 逻辑一致）。
+local DEFAULT_CACHE_HASH_KEY = "btwaf_cms_cache"
 local DEFAULT_TTL = 180 -- 3 minutes in seconds
 local redis_missing_logged = false
+
+local function get_page_cache_hash_key()
+    local k = os.getenv("SHELLSTACK_CACHE_HASH_KEY")
+    if k and k ~= "" then
+        return k
+    end
+    return DEFAULT_CACHE_HASH_KEY
+end
+
+-- 与 BTwaf 站点键一致：优先 ngx.ctx.server_name（Public.get_server_name_waf），否则 nginx 变量
+-- try_access_cache_hit 早于 btwaf_run，须在命中前补全 ctx.server_name（见 try_access_cache_hit）
+local function cache_page_site()
+    local ctx_sn = ngx.ctx and ngx.ctx.server_name
+    if type(ctx_sn) == "string" and ctx_sn ~= "" then
+        return ctx_sn
+    end
+    local sn = ngx.var.server_name
+    if type(sn) == "string" and sn ~= "" then
+        return sn
+    end
+    return ngx.var.host or ngx.var.http_host or ""
+end
+
+local function ensure_ctx_server_name_for_cache()
+    local cur = ngx.ctx and ngx.ctx.server_name
+    if type(cur) == "string" and cur ~= "" then
+        return
+    end
+    if _G.Public and type(_G.Public.get_server_name_waf) == "function" then
+        local ok, sn = pcall(_G.Public.get_server_name_waf)
+        if ok and type(sn) == "string" and sn ~= "" then
+            ngx.ctx.server_name = sn
+        end
+    end
+end
+
+local function cache_page_field_hex()
+    local site = cache_page_site()
+    local uri = ngx.var.uri or ""
+    local args = ngx.var.args or ""
+    return ngx.md5(site .. "|" .. uri .. "|" .. args)
+end
+
+-- 供 delete/get/set_cached_content（可能无 ngx 上下文时由调用方传入 site）
+local function cache_page_field_hex_for(site, uri, args)
+    site = site or ""
+    uri = uri or ""
+    args = args or ""
+    return ngx.md5(site .. "|" .. uri .. "|" .. args)
+end
+
+local function cache_payload_expired(data)
+    local t = data and data.expires_at
+    if type(t) ~= "number" then
+        return false
+    end
+    return ngx.time() > t
+end
 
 -- body_filter 里 whole 多为已解压正文，但 ngx.header 可能仍带 gzip / attachment，命中时若照搬会导致浏览器乱码或「变成下载」
 local PAGE_CACHE_HEADER_SKIP = {
@@ -238,7 +299,8 @@ end
 local function stash_shellstack_cache_state(state, reason, key)
     local fp = nil
     if key then
-        local m = string.match(key, "^php_cache:([a-fA-F0-9]+)$")
+        -- 指纹展示：key 形如 "btwaf_cms_cache:" .. field（32 位 md5 hex）
+        local m = string.match(key, ":([a-fA-F0-9]+)$")
         if m and #m >= 8 then
             fp = string.lower(string.sub(m, -8))
         end
@@ -357,82 +419,107 @@ local function get_redis_client()
     return client
 end
 
--- Function to generate cache key
-local function generate_cache_key(uri, query_string)
-    local key = CACHE_PREFIX .. uri
-    if query_string and query_string ~= "" then
-        key = key .. "?" .. query_string
+local function resolve_cache_site(explicit_site)
+    if type(explicit_site) == "string" and explicit_site ~= "" then
+        return explicit_site
     end
-    return key
+    if ngx and ngx.var then
+        return cache_page_site()
+    end
+    return ""
 end
 
--- Function to get cached content
-local function get_cached_content(uri, query_string)
+-- Function to get cached content（与整页缓存共用 Hash + field；可选 explicit_site 用于无 ngx 上下文）
+local function get_cached_content(uri, query_string, explicit_site)
     local client = get_redis_client()
     if not client then
         cache_log(ngx.ERR, "get_client_nil", "Redis client nil")
         return nil
     end
-    local key = generate_cache_key(uri, query_string)
-    local cached_data, err = client:get(key)
+    local main_key = get_page_cache_hash_key()
+    local field = cache_page_field_hex_for(resolve_cache_site(explicit_site), uri, query_string)
+    local trace = main_key .. "#" .. key_trace(CACHE_PREFIX .. field)
+    local cached_data, err = client:hget(main_key, field)
     if not cached_data or cached_data == ngx.null then
-        cache_log_op("get_miss", "key=", key_trace(key), err and (", err=" .. tostring(err)) or "")
+        cache_log_op("get_miss", "key=", trace, err and (", err=" .. tostring(err)) or "")
         return nil
     end
-    cache_log_op("get_hit", "key=", key_trace(key), ", payload_bytes=", tostring(#cached_data))
-    return cjson.decode(cached_data)
+    local ok, decoded = pcall(cjson.decode, cached_data)
+    if not ok or type(decoded) ~= "table" then
+        cache_log_op("get_miss", "key=", trace, ", err=decode_fail")
+        return nil
+    end
+    if cache_payload_expired(decoded) then
+        cache_log_op("get_miss", "key=", trace, ", err=expired")
+        return nil
+    end
+    cache_log_op("get_hit", "key=", trace, ", payload_bytes=", tostring(#cached_data))
+    return decoded
 end
 
 -- Function to set cache content
-local function set_cached_content(uri, query_string, content, ttl)
+local function set_cached_content(uri, query_string, content, ttl, explicit_site)
     local client = get_redis_client()
     if not client then
         cache_log(ngx.ERR, "set_client_nil", "Redis client nil")
         return
     end
-    local key = generate_cache_key(uri, query_string)
-    local data = cjson.encode(content)
     ttl = ttl or DEFAULT_TTL
-    cache_log_op("set_try", "key=", key_trace(key), " ttl=", tostring(ttl), " payload_bytes=", tostring(#data))
-    local ok, err = client:setex(key, ttl, data)
+    if type(content) ~= "table" then
+        cache_log(ngx.ERR, "set_fail", "content must be a table")
+        return
+    end
+    local main_key = get_page_cache_hash_key()
+    local field = cache_page_field_hex_for(resolve_cache_site(explicit_site), uri, query_string)
+    local trace = main_key .. "#" .. key_trace(CACHE_PREFIX .. field)
+    local payload_tbl = {}
+    for k, v in pairs(content) do
+        payload_tbl[k] = v
+    end
+    payload_tbl.expires_at = ngx.time() + ttl
+    local data = cjson.encode(payload_tbl)
+    cache_log_op("set_try", "key=", trace, " ttl=", tostring(ttl), " payload_bytes=", tostring(#data))
+    local ok, err = client:hset(main_key, field, data)
     if ok then
-        cache_log_op("set_ok", "key=", key_trace(key), " ttl=", tostring(ttl))
+        cache_log_op("set_ok", "key=", trace, " ttl=", tostring(ttl))
     else
-        cache_log(ngx.ERR, "set_fail", key, " err=", err or "")
+        cache_log(ngx.ERR, "set_fail", trace, " err=", err or "")
     end
 end
 
 -- Function to delete cache
-local function delete_cache(uri, query_string)
+local function delete_cache(uri, query_string, explicit_site)
     local client = get_redis_client()
     if not client then return end
-    local key = generate_cache_key(uri, query_string)
-    client:del(key)
+    local main_key = get_page_cache_hash_key()
+    local field = cache_page_field_hex_for(resolve_cache_site(explicit_site), uri, query_string)
+    client:hdel(main_key, field)
 end
 
--- Function to clear all cache
+-- Function to clear all cache（主 Hash + btwaf_cms_cache:* 遗留 string 键；另清 php_cache:* 便于从旧版迁移）
 local function clear_all_cache()
     local client = get_redis_client()
     if not client then return end
+    client:del(get_page_cache_hash_key())
     local keys, err = client:keys(CACHE_PREFIX .. "*")
     if keys and type(keys) == "table" then
         for _, key in ipairs(keys) do
             client:del(key)
         end
     end
+    local legacy, _ = client:keys("php_cache:*")
+    if legacy and type(legacy) == "table" then
+        for _, key in ipairs(legacy) do
+            client:del(key)
+        end
+    end
 end
 
--- body_filter 阶段：与 URI+查询串键不同，按 UA/Accept-Encoding 区分变体（与 body.lua 原逻辑一致）
-local function body_fingerprint_key()
-    local uri = ngx.var.uri or ""
-    local args = ngx.var.args or ""
-    local ua = ngx.req.get_headers()["user-agent"] or ""
-    local accept_encoding = ngx.req.get_headers()["accept-encoding"] or ""
-    local raw = uri .. "|" .. args .. "|" .. ua .. "|" .. accept_encoding
-    return CACHE_PREFIX .. ngx.md5(raw)
+local function page_cache_trace_key(field_hex)
+    return get_page_cache_hash_key() .. "#" .. key_trace(CACHE_PREFIX .. field_hex)
 end
 
-local function async_redis_setex(premature, key, ttl, value)
+local function async_redis_hset_page(premature, main_key, field, value)
     if premature then return end
     if not redis_available() then return end
     local cfg = get_redis_config()
@@ -446,13 +533,13 @@ local function async_redis_setex(premature, key, ttl, value)
     if cfg.db and cfg.db > 0 then
         red:select(cfg.db)
     end
-    local ok1, err_set = red:setex(key, ttl, value)
+    local ok1, err_set = red:hset(main_key, field, value)
     if not ok1 then
-        cache_log(ngx.ERR, "async_set_fail", "key=", key_trace(key), " err=", err_set or "")
+        cache_log(ngx.ERR, "async_set_fail", "key=", page_cache_trace_key(field), " err=", err_set or "")
         return
     end
     red:set_keepalive(10000, 10)
-    cache_log_op("async_set_ok", "key=", key_trace(key), " ttl=", tostring(ttl), " payload_bytes=", tostring(#value))
+    cache_log_op("async_set_ok", "key=", page_cache_trace_key(field), " payload_bytes=", tostring(#value))
 end
 
 -- 供 body_filter 在拼装完整响应体后异步写入 Redis（GET 200、非白名单）
@@ -474,23 +561,31 @@ local function try_access_cache_hit()
         stash_shellstack_cache_state("OFF", "redis_module_unavailable", nil)
         return
     end
+    ensure_ctx_server_name_for_cache()
     local client = get_redis_client_quiet()
     if not client then
         stash_shellstack_cache_state("OFF", "redis_connect_or_db_failed", nil)
         return
     end
-    local key = body_fingerprint_key()
-    local raw, err = client:get(key)
+    local main_key = get_page_cache_hash_key()
+    local field = cache_page_field_hex()
+    local trace = page_cache_trace_key(field)
+    local raw, err = client:hget(main_key, field)
     client:set_keepalive(10000, 10)
     if not raw or raw == ngx.null then
-        stash_shellstack_cache_state("MISS", "redis_key_miss", key)
-        cache_log_op("access_miss", "key=", key_trace(key), err and (", err=" .. tostring(err)) or "")
+        stash_shellstack_cache_state("MISS", "redis_key_miss", CACHE_PREFIX .. field)
+        cache_log_op("access_miss", "key=", trace, err and (", err=" .. tostring(err)) or "")
         return
     end
     local ok, data = pcall(cjson.decode, raw)
     if not ok or type(data) ~= "table" or type(data.content) ~= "string" then
-        stash_shellstack_cache_state("MISS", "corrupt_cache_entry", key)
-        cache_log(ngx.ERR, "access_decode_fail", key)
+        stash_shellstack_cache_state("MISS", "corrupt_cache_entry", CACHE_PREFIX .. field)
+        cache_log(ngx.ERR, "access_decode_fail", trace)
+        return
+    end
+    if cache_payload_expired(data) then
+        stash_shellstack_cache_state("MISS", "cache_entry_expired", CACHE_PREFIX .. field)
+        cache_log_op("access_miss", "key=", trace, ", err=expired")
         return
     end
     if data.headers and type(data.headers) == "table" then
@@ -502,8 +597,8 @@ local function try_access_cache_hit()
     end
     repair_generic_content_type_if_needed(data)
     ngx.header["Content-Length"] = tostring(#data.content)
-    stash_shellstack_cache_state("HIT", "served_from_redis", key)
-    cache_log_op("access_hit", "key=", key_trace(key), " body_bytes=", tostring(#data.content))
+    stash_shellstack_cache_state("HIT", "served_from_redis", CACHE_PREFIX .. field)
+    cache_log_op("access_hit", "key=", trace, " body_bytes=", tostring(#data.content))
     ngx.print(data.content)
     ngx.exit(ngx.HTTP_OK)
 end
@@ -525,21 +620,26 @@ local function schedule_body_page_cache(ttl, whole)
             end
         end
     end
+    ensure_ctx_server_name_for_cache()
     local hreq = ngx.req.get_headers()
-    local key = body_fingerprint_key()
+    local main_key = get_page_cache_hash_key()
+    local field = cache_page_field_hex()
+    local trace = page_cache_trace_key(field)
     local payload = cjson.encode({
         content = whole,
         headers = headers,
         url = ngx.var.uri,
         args = ngx.var.args,
+        site = cache_page_site(),
         user_agent = hreq["user-agent"] or hreq["User-Agent"],
-        accept = hreq["Accept"] or hreq["accept"]
+        accept = hreq["Accept"] or hreq["accept"],
+        expires_at = ngx.time() + ttl
     })
-    local ok, err = ngx.timer.at(0, async_redis_setex, key, ttl, payload)
+    local ok, err = ngx.timer.at(0, async_redis_hset_page, main_key, field, payload)
     if not ok then
         cache_log(ngx.ERR, "timer_fail", err or "")
     else
-        cache_log_op("body_timer_queued", "key=", key_trace(key), " ttl=", tostring(ttl), " payload_bytes=", tostring(#payload))
+        cache_log_op("body_timer_queued", "key=", trace, " ttl=", tostring(ttl), " payload_bytes=", tostring(#payload))
     end
 end
 

@@ -18,20 +18,20 @@ BTwaf 在 `init.lua` 中通过 `cache = require "cache"` 加载 **`btwaf/lib/cac
 ### 行为概要
 
 - **后端**：使用 `lua-resty-redis` 连接本机 Redis（默认 `127.0.0.1:6379`，数据库 `0`）。
-- **键名规则**：整页缓存（access/body 共用）为前缀 `php_cache:` + **URI|args|UA|Accept-Encoding 的 md5**；`get_cached_content` / `set_cached_content` 仍使用 **URI + 可选查询串** 的旧键（与整页缓存不同）。
+- **键名规则**：整页缓存在 **单个 Redis Hash**，默认键名 **`btwaf_cms_cache`**；field = **md5(server_name|uri|args)**（与 access/body 共用）。指纹/辅助前缀为 `btwaf_cms_cache:` + field。`get_cached_content` / `set_cached_content` / `delete_cache` 使用同一 Hash 与 field 规则。
 - **存取格式**：缓存值为 **JSON**，经 `cjson` 编码后写入 Redis；读取时再解码为 Lua 表。
 - **默认过期时间**：`DEFAULT_TTL = 180` 秒（3 分钟，可在模块内按需调整）。
 - **对外接口**（模块 `return` 表）：
   - `try_access_cache_hit()`：access 阶段调用，命中则直接响应并 `ngx.exit(200)`，未命中则返回。
   - `schedule_body_page_cache(ttl, whole)`：body_filter 在整页响应后异步写入 Redis。
-  - `get_cached_content(uri, query_string)`：按 URI 键读取（与整页指纹键不同）。
-  - `set_cached_content(uri, query_string, content, ttl)`：按 URI 键写入。
-  - `delete_cache(uri, query_string)`：删除单条。
-  - `clear_all_cache()`：按前缀 `php_cache:*` 批量删除（依赖 `KEYS`，数据量大时注意 Redis 影响）。
+  - `get_cached_content(uri, query_string, explicit_site?)`：HGET 同上 field。
+  - `set_cached_content(uri, query_string, content, ttl, explicit_site?)`：HSET + JSON 内 `expires_at`。
+  - `delete_cache(uri, query_string, explicit_site?)`：HDEL 单 field。
+  - `clear_all_cache()`：删除主 Hash、`btwaf_cms_cache:*` 遗留键，并清理旧版 `php_cache:*`（依赖 `KEYS`，数据量大时注意 Redis 影响）。
 
 ### 与配置的关系
 
-`btwaf/lib/config.lua` 中另有 **cache 相关配置项**（如 `prefix`、`default_ttl`、`max_ttl`），与面板 JSON 配置配合使用；`cache.lua` 内当前为 **写死的 `redis_config` 与 `CACHE_PREFIX`**，若环境与默认不一致，需在 `cache.lua` 或上层封装中改为与 `config.lua` / `config.json` 一致，并保证 **Redis 已启动且可连**。
+`btwaf/lib/config.lua` 中另有 **cache 相关配置项**（如 `prefix`、`default_ttl`、`max_ttl`），与面板 JSON 配置配合使用；`cache.lua` 内 Redis 连接以环境变量 **`SHELLSTACK_REDIS_*`** 为准，Hash 名可用 **`SHELLSTACK_CACHE_HASH_KEY`** 覆盖默认 `btwaf_cms_cache`。
 
 ### 依赖
 
