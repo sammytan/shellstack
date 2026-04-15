@@ -159,7 +159,7 @@ _baota_inject_shellstack_http_block_in_nginx_conf() {
       echo '        # shellstack-fastcgi-cache-zone'
       echo '        # 只有开启了 fastcgi 缓存才能启用这些配置;'
       echo '        fastcgi_cache_path /www/wwwlogs/fastcgi_cache levels=1:2 keys_zone=fastcgi_cache:10m max_size=10g inactive=60m use_temp_path=off;'
-      echo '        fastcgi_cache_key "$scheme$request_method$host$request_uri";'
+      echo '        #fastcgi_cache_key "$scheme$request_method$host$request_uri";'
     fi
     echo "        $ending"
   } > "$snip"
