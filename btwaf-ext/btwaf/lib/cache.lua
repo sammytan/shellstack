@@ -66,29 +66,8 @@ local function page_cache_header_should_skip(name)
     return PAGE_CACHE_HEADER_SKIP[k] == true
 end
 
--- 上游/代理有时把 HTML 标成 application/octet-stream，浏览器会当下载；页缓存只服务 HTML 场景，按正文纠正类型
-local function body_looks_like_html(body)
-    if type(body) ~= "string" or body == "" then
-        return false
-    end
-    local start = 1
-    if string.byte(body, 1) == 239 and string.byte(body, 2) == 187 and string.byte(body, 3) == 191 then
-        start = 4
-    end
-    local max_end = math.min(#body, start + 2047)
-    local head = string.lower(string.sub(body, start, max_end))
-    if not string.find(head, "^%s*<", 1) then
-        return false
-    end
-    if string.find(head, "<!doctype html", 1, true)
-        or string.find(head, "<html", 1, true)
-        or string.find(head, "<head", 1, true)
-        or string.find(head, "<body", 1, true) then
-        return true
-    end
-    return false
-end
-
+-- 命中时优先沿用 Redis 里保存的**原响应头**；仅当 Content-Type 为泛二进制（如 octet-stream）时，
+-- 再结合**请求 Accept**（写入缓存时记录的 accept + 当前请求）与正文嗅探尝试修正，避免一律改成 text/html。
 local function content_type_is_generic_binary(ct)
     if ct == nil or ct == "" then
         return true
@@ -100,34 +79,104 @@ local function content_type_is_generic_binary(ct)
     if string.find(c, "application/x%-download", 1, true) then
         return true
     end
+    if string.find(c, "binary/", 1, true) then
+        return true
+    end
     return false
 end
 
-local function fix_page_cache_content_type_from_body(body)
-    local ct = ngx.header["Content-Type"]
-    if content_type_is_generic_binary(ct) and body_looks_like_html(body) then
-        ngx.header["Content-Type"] = "text/html; charset=utf-8"
+local function body_looks_like_html(body)
+    if type(body) ~= "string" or body == "" then
+        return false
     end
+    local start = 1
+    if string.byte(body, 1) == 239 and string.byte(body, 2) == 187 and string.byte(body, 3) == 191 then
+        start = 4
+    end
+    local max_end = math.min(#body, start + 8191)
+    local head = string.lower(string.sub(body, start, max_end))
+    if string.find(head, "<!doctype html", 1, true)
+        or string.find(head, "<html", 1, true)
+        or string.find(head, "<head", 1, true)
+        or string.find(head, "<body", 1, true)
+        or string.find(head, "<meta", 1, true)
+        or string.find(head, "<title", 1, true) then
+        return true
+    end
+    if string.find(head, "^%s*<") and string.find(head, "html", 1, true) then
+        return true
+    end
+    return false
 end
 
-local function fix_stored_headers_content_type(headers, body)
-    if type(headers) ~= "table" or type(body) ~= "string" then
+local function body_looks_like_json(body)
+    if type(body) ~= "string" or body == "" then
+        return false
+    end
+    local _, e = string.find(body, "^%s*")
+    local c = string.byte(body, (e or 0) + 1)
+    return c == 123 or c == 91
+end
+
+-- 从正文前部嗅探 HTML charset（GBK 等）；用于仅在需要把泛二进制改成 HTML 时
+local function page_cache_html_content_type(body)
+    if type(body) ~= "string" or body == "" then
+        return "text/html; charset=utf-8"
+    end
+    local n = math.min(#body, 16384)
+    local low = string.lower(string.sub(body, 1, n))
+    local m = string.match(low, 'charset%s*=%s*["\']%s*([%a%d%._%-]+)%s*["\']')
+    if not m then
+        m = string.match(low, 'charset%s*=%s*([%a%d%._%-]+)')
+    end
+    if not m then
+        m = string.match(low, '<meta%s+charset%s*=%s*["\']?([%a%d%._%-]+)["\']?')
+    end
+    if m and #m > 0 and #m < 48 then
+        return "text/html; charset=" .. m
+    end
+    return "text/html; charset=utf-8"
+end
+
+local function merge_accept_for_cache_hit(data)
+    local parts = {}
+    if type(data.accept) == "string" and data.accept ~= "" then
+        parts[#parts + 1] = data.accept
+    end
+    local h = ngx.req.get_headers()
+    local cur = h["Accept"] or h["accept"]
+    if type(cur) == "string" and cur ~= "" then
+        parts[#parts + 1] = cur
+    end
+    return table.concat(parts, ",")
+end
+
+-- 仅在泛二进制时返回新 Content-Type；否则返回 nil（保留当前 ngx.header）
+local function infer_content_type_when_generic_binary(data)
+    local body = data.content
+    local accept = string.lower(merge_accept_for_cache_hit(data))
+    if string.find(accept, "text/html", 1, true) then
+        if body_looks_like_html(body) then
+            return page_cache_html_content_type(body)
+        end
+    end
+    if string.find(accept, "application/json", 1, true) and body_looks_like_json(body) then
+        return "application/json; charset=utf-8"
+    end
+    if body_looks_like_html(body) then
+        return page_cache_html_content_type(body)
+    end
+    return nil
+end
+
+local function repair_generic_content_type_if_needed(data)
+    local ct = ngx.header["Content-Type"]
+    if not content_type_is_generic_binary(ct) then
         return
     end
-    local ct_key, ct_val = nil, nil
-    for k, v in pairs(headers) do
-        if string.lower(tostring(k)) == "content-type" and type(v) == "string" then
-            ct_key = k
-            ct_val = v
-            break
-        end
-    end
-    if content_type_is_generic_binary(ct_val) and body_looks_like_html(body) then
-        if ct_key then
-            headers[ct_key] = "text/html; charset=utf-8"
-        else
-            headers["Content-Type"] = "text/html; charset=utf-8"
-        end
+    local fixed = infer_content_type_when_generic_binary(data)
+    if fixed then
+        ngx.header["Content-Type"] = fixed
     end
 end
 
@@ -451,7 +500,7 @@ local function try_access_cache_hit()
             end
         end
     end
-    fix_page_cache_content_type_from_body(data.content)
+    repair_generic_content_type_if_needed(data)
     ngx.header["Content-Length"] = tostring(#data.content)
     stash_shellstack_cache_state("HIT", "served_from_redis", key)
     cache_log_op("access_hit", "key=", key_trace(key), " body_bytes=", tostring(#data.content))
@@ -476,14 +525,15 @@ local function schedule_body_page_cache(ttl, whole)
             end
         end
     end
-    fix_stored_headers_content_type(headers, whole)
+    local hreq = ngx.req.get_headers()
     local key = body_fingerprint_key()
     local payload = cjson.encode({
         content = whole,
         headers = headers,
         url = ngx.var.uri,
         args = ngx.var.args,
-        user_agent = ngx.req.get_headers()["user-agent"]
+        user_agent = hreq["user-agent"] or hreq["User-Agent"],
+        accept = hreq["Accept"] or hreq["accept"]
     })
     local ok, err = ngx.timer.at(0, async_redis_setex, key, ttl, payload)
     if not ok then
