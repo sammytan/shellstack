@@ -66,6 +66,71 @@ local function page_cache_header_should_skip(name)
     return PAGE_CACHE_HEADER_SKIP[k] == true
 end
 
+-- 上游/代理有时把 HTML 标成 application/octet-stream，浏览器会当下载；页缓存只服务 HTML 场景，按正文纠正类型
+local function body_looks_like_html(body)
+    if type(body) ~= "string" or body == "" then
+        return false
+    end
+    local start = 1
+    if string.byte(body, 1) == 239 and string.byte(body, 2) == 187 and string.byte(body, 3) == 191 then
+        start = 4
+    end
+    local max_end = math.min(#body, start + 2047)
+    local head = string.lower(string.sub(body, start, max_end))
+    if not string.find(head, "^%s*<", 1) then
+        return false
+    end
+    if string.find(head, "<!doctype html", 1, true)
+        or string.find(head, "<html", 1, true)
+        or string.find(head, "<head", 1, true)
+        or string.find(head, "<body", 1, true) then
+        return true
+    end
+    return false
+end
+
+local function content_type_is_generic_binary(ct)
+    if ct == nil or ct == "" then
+        return true
+    end
+    local c = string.lower(tostring(ct))
+    if string.find(c, "application/octet%-stream", 1, true) then
+        return true
+    end
+    if string.find(c, "application/x%-download", 1, true) then
+        return true
+    end
+    return false
+end
+
+local function fix_page_cache_content_type_from_body(body)
+    local ct = ngx.header["Content-Type"]
+    if content_type_is_generic_binary(ct) and body_looks_like_html(body) then
+        ngx.header["Content-Type"] = "text/html; charset=utf-8"
+    end
+end
+
+local function fix_stored_headers_content_type(headers, body)
+    if type(headers) ~= "table" or type(body) ~= "string" then
+        return
+    end
+    local ct_key, ct_val = nil, nil
+    for k, v in pairs(headers) do
+        if string.lower(tostring(k)) == "content-type" and type(v) == "string" then
+            ct_key = k
+            ct_val = v
+            break
+        end
+    end
+    if content_type_is_generic_binary(ct_val) and body_looks_like_html(body) then
+        if ct_key then
+            headers[ct_key] = "text/html; charset=utf-8"
+        else
+            headers["Content-Type"] = "text/html; charset=utf-8"
+        end
+    end
+end
+
 local function cache_debug_enabled()
     if _G.Config and type(_G.Config) == "table" then
         if _G.Config.cache_debug == true then
@@ -386,6 +451,7 @@ local function try_access_cache_hit()
             end
         end
     end
+    fix_page_cache_content_type_from_body(data.content)
     ngx.header["Content-Length"] = tostring(#data.content)
     stash_shellstack_cache_state("HIT", "served_from_redis", key)
     cache_log_op("access_hit", "key=", key_trace(key), " body_bytes=", tostring(#data.content))
@@ -410,6 +476,7 @@ local function schedule_body_page_cache(ttl, whole)
             end
         end
     end
+    fix_stored_headers_content_type(headers, whole)
     local key = body_fingerprint_key()
     local payload = cjson.encode({
         content = whole,
