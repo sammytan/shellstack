@@ -36,18 +36,24 @@ _btwaf_resolve_extracted_root() {
   fi
 }
 
+# 下载扩展 Lua：--compressed 避免服务端 gzip 后落盘为二进制导致校验失败；UA 避免部分 CDN/WAF 对「空 curl」返回挑战页
 _btwaf_try_download_to() {
   local url="$1"
   local out="$2"
   rm -f "$out"
+  local ua="ShellStack-BTwaf-Extend/1.0 (+https://github.com/shellstack/shellstack)"
   if command -v curl >/dev/null 2>&1; then
-    if curl -fsSL --connect-timeout 15 --max-time 180 "$url" -o "$out" >>"$LOG_FILE" 2>&1 && [[ -s "$out" ]]; then
+    if curl -fsSL --compressed -A "$ua" --connect-timeout 15 --max-time 180 "$url" -o "$out" >>"$LOG_FILE" 2>&1 && [[ -s "$out" ]]; then
       return 0
     fi
   fi
   rm -f "$out"
   if command -v wget >/dev/null 2>&1; then
-    if wget -q -O "$out" --timeout=180 "$url" >>"$LOG_FILE" 2>&1 && [[ -s "$out" ]]; then
+    local wextra=()
+    if wget --help 2>&1 | grep -q -- '--compression'; then
+      wextra=(--compression=auto)
+    fi
+    if wget -q "${wextra[@]}" -U "$ua" -O "$out" --timeout=180 "$url" >>"$LOG_FILE" 2>&1 && [[ -s "$out" ]]; then
       return 0
     fi
   fi
@@ -359,16 +365,32 @@ _btwaf_resolve_local_overlay_src() {
   return 1
 }
 
-# 过滤 404 HTML 等非 Lua 内容
+# 过滤 404 HTML 等非 Lua 内容（须与 btwaf-ext/btwaf/lib/cache.lua 实际关键字一致）
 _btwaf_cache_lua_looks_valid() {
   local f="$1"
   [[ -s "$f" ]] || return 1
-  grep -qi '<!DOCTYPE\|<html' "$f" 2>/dev/null && return 1
-  if grep -qE 'resty\.redis|schedule_body_page_cache|require\s*\(?[\"'\'']resty\.redis' "$f" 2>/dev/null; then
+  # 仍为 gzip 时（未解压）：前 2 字节 1f 8b
+  local magic
+  magic="$(head -c 2 "$f" 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n')"
+  if [[ "$magic" == "1f8b" ]]; then
+    warn "下载内容仍为 gzip 压缩（1f 8b），请升级 curl（支持 --compressed）或检查站点是否强制返回 br/zstd"
+    return 1
+  fi
+  grep -qiE '<!doctype[[:space:]]+html|<html[[:space:]]' "$f" 2>/dev/null && return 1
+  # pcall(require, "resty.redis") 无括号紧挨 require，须直接匹配 resty.redis / 其它稳定锚点
+  if grep -qE 'resty\.redis|schedule_body_page_cache|try_access_cache_hit|get_page_cache_hash_key|btwaf_cms_cache' "$f" 2>/dev/null; then
     return 0
   fi
-  # 兜底：避免 grep 因环境差异失败，但明显为 Lua 脚本
-  [[ $(wc -c <"$f" 2>/dev/null | tr -d ' ') -ge 500 ]] && head -n 3 "$f" | grep -qE '^local |^--' && return 0
+  # 兜底：足够大且前几行像 Lua；或前 2KB 内出现 resty.redis（兼容 UTF-8 BOM 导致首行不匹配 ^--）
+  local sz
+  sz=$(wc -c <"$f" 2>/dev/null | tr -d ' ')
+  [[ "${sz:-0}" -ge 400 ]] || return 1
+  if head -n 15 "$f" | grep -qE '^[[:space:]]*(--|local )' 2>/dev/null; then
+    return 0
+  fi
+  if head -c 2048 "$f" 2>/dev/null | grep -qF 'resty.redis' 2>/dev/null; then
+    return 0
+  fi
   return 1
 }
 

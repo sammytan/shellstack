@@ -79,6 +79,16 @@ curl -fsSL -o /dev/null -w '%{http_code}\n' https://你的域名/btwaf-ext/btwaf
 # 应输出 200
 ```
 
+### 3b. 脚本提示「不是有效 cache.lua」但浏览器能打开同一 URL
+
+**常见原因**：服务端对静态文件启用了 **gzip**，旧版脚本用 curl 落盘的是**压缩二进制**，本地 `grep` 匹配不到 `resty.redis`。当前 `btwaf_extend.sh` 已改为 `curl --compressed`（并带固定 UA），请更新脚本后重试。
+
+自检（应看到明文 `--` 或 `local` 开头，且含 `resty.redis`）：
+
+```bash
+curl -fsSL --compressed -A 'ShellStack-test/1' 'https://你的域名/btwaf-ext/btwaf/lib/cache.lua' | head -n 5
+```
+
 ### 3. Web 服务器无法访问文件
 
 **问题**: Nginx/Apache 返回 403 Forbidden
