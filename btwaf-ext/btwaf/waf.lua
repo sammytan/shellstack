@@ -16,18 +16,6 @@ if not ngx.shared.spider:get("works"..worker_pid) then
     ngx.timer.every(60,Public.insert_request_total)-- 60秒更新一次规则命中记录
 end
 
-local cjson = require "cjson"
-
-local function build_cache_key()
-    local uri = ngx.var.uri or ""
-    local args = ngx.var.args or ""
-    local ua = ngx.req.get_headers()["user-agent"] or ""
-    local accept_encoding = ngx.req.get_headers()["accept-encoding"] or ""
-    local raw = uri .. "|" .. args .. "|" .. ua .. "|" .. accept_encoding
-    local key = "php_cache:" .. ngx.md5(raw)
-    return key
-end
-
 local function btwaf_run()
     local time_str = ngx.localtime()
     ngx.ctx.white_rule=false
@@ -220,25 +208,11 @@ local function btwaf_run()
     ngx.ctx.white_rule=false
     ngx.ctx.proxy=true
     
-end 
+end
 
-        -- 跳过非 GET 请求
-        if ngx.var.skip_cache == 1 then
-            return
-        end
-
-        local cache_key = build_cache_key()
-        local cached_data = cache.get_cached_content(cache_key, nil)
-        if cached_data then
-            -- 设置响应头
-            for header, value in pairs(cached_data.headers) do
-                ngx.header[header] = value
-            end
-
-            -- 输出缓存内容
-            ngx.say(cached_data.content)
-            ngx.exit(ngx.HTTP_OK)
-        end
+if cache and type(cache.try_access_cache_hit) == "function" then
+    cache.try_access_cache_hit()
+end
 
 
 local ok,error = pcall(function()
