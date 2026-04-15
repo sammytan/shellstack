@@ -263,6 +263,31 @@ _btwaf_ensure_nginx_btwaf_conf_cache_shared() {
   log "已向 $conf 注入 lua_shared_dict cache_shared 5000m;"
 }
 
+# 在官方 header.lua 末尾追加一行：header_filter 阶段把 shellstack 缓存状态写入响应头（对抗 proxy 覆盖 access 阶段 ngx.header）
+_btwaf_ensure_header_lua_shellstack_hook() {
+  local hf="${BTWAF_INSTALL_DIR:-/www/server/btwaf}/header.lua"
+  [[ -f "$hf" ]] || {
+    warn "未找到 $hf，跳过 shellstack header_filter 钩子（响应头可能无 X-Shellstack-*）"
+    return 0
+  }
+  if grep -q 'shellstack_header_filter_cache' "$hf" 2>/dev/null; then
+    log "header.lua 已含 shellstack header_filter 钩子，跳过"
+    return 0
+  fi
+  _btwaf_chattr_unlock_path "$hf"
+  {
+    echo ""
+    echo "-- shellstack_header_filter_cache (auto by shellstack --extend-btwaf-cache)"
+    echo "do"
+    echo "  local _ok, _c = pcall(require, \"cache\")"
+    echo "  if _ok and _c and type(_c.apply_header_filter_headers) == \"function\" then"
+    echo "    _c.apply_header_filter_headers()"
+    echo "  end"
+    echo "end"
+  } >>"$hf"
+  log "已向 $hf 追加 shellstack header_filter 钩子（输出 X-Shellstack-Cache*）"
+}
+
 _btwaf_ensure_init_requires_cache_module() {
   local init="$BTWAF_INSTALL_DIR/init.lua"
   [[ -f "$init" ]] || return 0
@@ -534,6 +559,7 @@ extend_btwaf_cache_bundle() {
   _btwaf_ensure_lib_resty_redis
   _btwaf_ensure_waf_cache_hit_hook
   _btwaf_ensure_init_requires_cache_module
+  _btwaf_ensure_header_lua_shellstack_hook
   _btwaf_ensure_nginx_btwaf_conf_cache_shared
 
   if [[ ! -f "$BTWAF_INSTALL_DIR/lib/cache.lua" ]]; then

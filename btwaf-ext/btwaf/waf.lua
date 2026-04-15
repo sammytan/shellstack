@@ -210,10 +210,18 @@ local function btwaf_run()
     
 end
 
-if cache and type(cache.try_access_cache_hit) == "function" then
-    cache.try_access_cache_hit()
+do
+    local c = _G.cache
+    if not c then
+        local okm, m = pcall(require, "cache")
+        if okm then
+            c = m
+        end
+    end
+    if c and type(c.try_access_cache_hit) == "function" then
+        c.try_access_cache_hit()
+    end
 end
-
 
 local ok,error = pcall(function()
         return btwaf_run()
