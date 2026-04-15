@@ -409,7 +409,10 @@ _btwaf_cache_lua_looks_valid() {
     warn "下载内容仍为 gzip 压缩（1f 8b），请升级 curl（支持 --compressed）或检查站点是否强制返回 br/zstd"
     return 1
   fi
-  grep -qiE '<!doctype[[:space:]]+html|<html[[:space:]]' "$f" 2>/dev/null && return 1
+  # 只把「像整页错误 HTML」的判掉：须在某行前部以 <!DOCTYPE html 或 <html 开头（避免 cache.lua 源码里的 "<!doctype html" 子串误伤）
+  if head -n 50 "$f" 2>/dev/null | grep -qiE '^[[:space:]]*<!DOCTYPE[[:space:]]+html|^[[:space:]]*<html[[:space:]]' 2>/dev/null; then
+    return 1
+  fi
   # pcall(require, "resty.redis") 无括号紧挨 require，须直接匹配 resty.redis / 其它稳定锚点
   if grep -qE 'resty\.redis|schedule_body_page_cache|try_access_cache_hit|get_page_cache_hash_key|btwaf_cms_cache' "$f" 2>/dev/null; then
     return 0
