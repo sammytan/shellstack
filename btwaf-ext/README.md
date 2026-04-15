@@ -18,20 +18,20 @@ BTwaf 在 `init.lua` 中通过 `cache = require "cache"` 加载 **`btwaf/lib/cac
 ### 行为概要
 
 - **后端**：使用 `lua-resty-redis` 连接本机 Redis（默认 `127.0.0.1:6379`，数据库 `0`）。
-- **键名规则**：整页缓存在 **单个 Redis Hash**，默认键名 **`btwaf_cms_cache`**；field = **md5(server_name|uri|args|User-Agent)**（与官方 `waf.lua` 一致：无 UA 时为 `btwaf_null`）。环境变量 **`SHELLSTACK_CACHE_VARY_UA=0`** 时 field 不含 UA（仅按 URL 维度）。指纹前缀为 `btwaf_cms_cache:` + field。
+- **键名规则**：整页缓存在 **Redis STRING**，键名 **`btwaf_cms_cache:`** + **md5(签名串)**；签名由 `PAGE_CACHE_SIGN_COMPONENTS` 决定（默认含 `site` / `uri` / `args` / `ua`）。可增删项：`referer`；`headers` 或 `headers:all` / `headers:*`（全部请求头，名小写、按名字排序）；`headers:cookie,accept-language`（仅列出头，缺省按空值参与签名）。与官方 `waf.lua` 一致：无 UA 时为 `btwaf_null`。
 - **存取格式**：缓存值为 **JSON**，经 `cjson` 编码后写入 Redis；读取时再解码为 Lua 表。
-- **默认过期时间**：`DEFAULT_TTL = 180` 秒（3 分钟，可在模块内按需调整）。
+- **默认过期时间**：`PAGE_CACHE_TTL_SECONDS`（默认 180 秒）；写入用 **SETEX**，过期由 Redis TTL 管理。
 - **对外接口**（模块 `return` 表）：
   - `try_access_cache_hit()`：access 阶段调用，命中则直接响应并 `ngx.exit(200)`，未命中则返回。
-  - `schedule_body_page_cache(ttl, whole)`：body_filter 在整页响应后异步写入 Redis。
-  - `get_cached_content(uri, query_string, explicit_site?, explicit_ua?)`：HGET；无 ngx 且开启 UA 分桶时需传 `explicit_ua`。
-  - `set_cached_content(uri, query_string, content, ttl, explicit_site?, explicit_ua?)`：HSET + `expires_at`。
-  - `delete_cache(uri, query_string, explicit_site?, explicit_ua?)`：HDEL 当前 UA 分桶；全量用 `clear_all_cache()`。
-  - `clear_all_cache()`：删除主 Hash、`btwaf_cms_cache:*` 遗留键，并清理旧版 `php_cache:*`（依赖 `KEYS`，数据量大时注意 Redis 影响）。
+  - `schedule_body_page_cache(ttl, whole)`：body_filter 在整页响应后异步 **SETEX** 写入 Redis。
+  - `get_cached_content(uri, query_string, explicit_site?, explicit_ua?, opts?)`：**GET**；无 ngx 且签名含 `ua` / `referer` / `headers:*` 时须在 `opts` 中传 `{ referer = "...", headers = { ... } }`。
+  - `set_cached_content(uri, query_string, content, ttl, explicit_site?, explicit_ua?, opts?)`：**SETEX**。
+  - `delete_cache(uri, query_string, explicit_site?, explicit_ua?, opts?)`：**DEL** 当前签名对应键；全量用 `clear_all_cache()`。
+  - `clear_all_cache()`：删除 `btwaf_cms_cache:*`，并清理旧版 `php_cache:*`（依赖 `KEYS`，数据量大时注意 Redis 影响）。
 
 ### 与配置的关系
 
-`btwaf/lib/config.lua` 中另有 **cache 相关配置项**（如 `prefix`、`default_ttl`、`max_ttl`），与面板 JSON 配置配合使用；`cache.lua` 内 Redis 连接以环境变量 **`SHELLSTACK_REDIS_*`** 为准，Hash 名可用 **`SHELLSTACK_CACHE_HASH_KEY`** 覆盖默认 `btwaf_cms_cache`。
+`btwaf/lib/config.lua` 中另有 **cache 相关配置项**（如 `prefix`、`default_ttl`、`max_ttl`），与面板 JSON 配置配合使用；`cache.lua` 内 Redis 连接以环境变量 **`SHELLSTACK_REDIS_*`** 为准；页缓存键前缀、签名段、默认 TTL 在 **`cache.lua` 顶部常量**中修改。
 
 ### 依赖
 

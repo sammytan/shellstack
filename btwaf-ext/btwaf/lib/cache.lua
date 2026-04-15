@@ -43,29 +43,163 @@ local function cache_log_redis_connect_err(event, err_msg)
     end
 end
 
--- Cache configuration
-local CACHE_PREFIX = "btwaf_cms_cache:"
--- 整页缓存在**单个 Redis Hash**（默认 btwaf_cms_cache）下：
--- field = md5(server|uri|args) 或 md5(server|uri|args|UA)（适应模式，与官方 waf 对 UA 的处理一致）。
--- SHELLSTACK_CACHE_HASH_KEY 覆盖 Hash 名；SHELLSTACK_CACHE_VARY_UA=0 关闭按 UA 分桶（仅 URL 维度）。
-local DEFAULT_CACHE_HASH_KEY = "btwaf_cms_cache"
-local DEFAULT_TTL = 180 -- 3 minutes in seconds
+-- Cache configuration（只改本段即可；无需为 key/TTL/签名设环境变量）
+-- Redis **STRING**：key = CACHE_KEY_PREFIX .. md5(签名串)，过期 = SETEX(..., PAGE_CACHE_TTL_SECONDS, ...)
+-- PAGE_CACHE_SIGN_COMPONENTS：参与 md5 的段，按顺序用 | 拼接。可选：
+--   "site"|"server"|"domain"|"domain_server" → cache_page_site()
+--   "uri" → ngx.var.uri
+--   "args"|"query" → ngx.var.args
+--   "ua"|"user_agent" → 与官方 waf 一致（无则 btwaf_null）；不需要 UA 分桶时从表中删掉 "ua" 即可
+--   "referer"|"referrer" → ngx.var.http_referer（无则空串）
+--   "headers" 或 "headers:all"|"headers:*" → 全部请求头（名小写、名字典序，多值逗号拼接）
+--   "headers:cookie,accept-language" → 仅列出头（名小写后字典序；缺省头按空值参与签名）
+local CACHE_KEY_PREFIX = "btwaf_cms_cache:"
+local PAGE_CACHE_TTL_SECONDS = 180
+local PAGE_CACHE_SIGN_COMPONENTS = { "site", "uri", "args" }
+
 local redis_missing_logged = false
 
-local function cache_vary_by_ua_enabled()
-    local v = os.getenv("SHELLSTACK_CACHE_VARY_UA")
-    if v == "0" or v == "off" or v == "no" or v == "false" then
-        return false
+-- 任一项为 headers:* 时才会 ngx.req.get_headers()（略省开销）
+local sign_config_uses_headers = false
+
+local function trim_str(s)
+    if type(s) ~= "string" then
+        return ""
     end
-    return true
+    return (string.match(s, "^%s*(.-)%s*$")) or s
 end
 
-local function get_page_cache_hash_key()
-    local k = os.getenv("SHELLSTACK_CACHE_HASH_KEY")
-    if k and k ~= "" then
-        return k
+-- 返回 nil，或 { kind = "all" }，或 { kind = "keys", keys = { "cookie", ... } }（已小写、已排序）
+local function component_header_spec(comp)
+    local s = trim_str(tostring(comp or ""))
+    local slow = string.lower(s)
+    if slow == "headers" then
+        return { kind = "all" }
     end
-    return DEFAULT_CACHE_HASH_KEY
+    if string.sub(slow, 1, 8) ~= "headers:" then
+        return nil
+    end
+    local rest = trim_str(string.sub(s, 9))
+    local rlow = string.lower(rest)
+    if rest == "" or rlow == "all" or rlow == "*" then
+        return { kind = "all" }
+    end
+    local keys = {}
+    for part in string.gmatch(rest, "[^,]+") do
+        local p = trim_str(part)
+        if p ~= "" then
+            keys[#keys + 1] = string.lower(p)
+        end
+    end
+    if #keys == 0 then
+        return { kind = "all" }
+    end
+    table.sort(keys)
+    return { kind = "keys", keys = keys }
+end
+
+for _, comp in ipairs(PAGE_CACHE_SIGN_COMPONENTS) do
+    if component_header_spec(comp) then
+        sign_config_uses_headers = true
+        break
+    end
+end
+
+local function header_value_string_for_sign(v)
+    if v == nil then
+        return ""
+    end
+    if type(v) == "string" then
+        return v
+    end
+    if type(v) == "table" then
+        local out = {}
+        for i = 1, #v do
+            out[#out + 1] = tostring(v[i])
+        end
+        return table.concat(out, ", ")
+    end
+    return tostring(v)
+end
+
+local function headers_tbl_lookup(headers_tbl, canon_name)
+    if type(headers_tbl) ~= "table" then
+        return nil
+    end
+    local v = headers_tbl[canon_name]
+    if v ~= nil then
+        return v
+    end
+    for hk, hv in pairs(headers_tbl) do
+        if string.lower(tostring(hk)) == canon_name then
+            return hv
+        end
+    end
+    return nil
+end
+
+local function headers_sign_segment(headers_tbl, spec)
+    if spec.kind == "all" then
+        if type(headers_tbl) ~= "table" then
+            return ""
+        end
+        local names = {}
+        for k, _ in pairs(headers_tbl) do
+            names[#names + 1] = string.lower(tostring(k))
+        end
+        table.sort(names)
+        local lines = {}
+        for _, name in ipairs(names) do
+            local v = headers_tbl_lookup(headers_tbl, name)
+            lines[#lines + 1] = name .. ":" .. header_value_string_for_sign(v)
+        end
+        return table.concat(lines, "\n")
+    end
+    -- keys
+    local lines = {}
+    for _, name in ipairs(spec.keys) do
+        local v = headers_tbl_lookup(headers_tbl, name)
+        lines[#lines + 1] = name .. ":" .. header_value_string_for_sign(v)
+    end
+    return table.concat(lines, "\n")
+end
+
+-- ctx: { site, uri, args, ua, referer, headers }
+local function sign_component_value(comp, ctx)
+    local c = string.lower(tostring(comp))
+    if c == "site" or c == "server" or c == "domain" or c == "domain_server" then
+        return ctx.site or ""
+    end
+    if c == "uri" then
+        return ctx.uri or ""
+    end
+    if c == "args" or c == "query" then
+        return ctx.args or ""
+    end
+    if c == "ua" or c == "user_agent" then
+        return ctx.ua or "btwaf_null"
+    end
+    if c == "referer" or c == "referrer" then
+        return ctx.referer or ""
+    end
+    return ""
+end
+
+local function cache_field_signing_string_from_ctx(ctx)
+    local parts = {}
+    for _, comp in ipairs(PAGE_CACHE_SIGN_COMPONENTS) do
+        local hspec = component_header_spec(comp)
+        if hspec then
+            parts[#parts + 1] = headers_sign_segment(ctx.headers, hspec)
+        else
+            parts[#parts + 1] = sign_component_value(comp, ctx)
+        end
+    end
+    return table.concat(parts, "|")
+end
+
+local function page_cache_redis_key(field_hex)
+    return CACHE_KEY_PREFIX .. field_hex
 end
 
 -- 与 BTwaf 站点键一致：优先 ngx.ctx.server_name（Public.get_server_name_waf），否则 nginx 变量
@@ -107,43 +241,59 @@ local function cache_page_user_agent()
     return "btwaf_null"
 end
 
-local function cache_field_signing_string(site, uri, args, ua_token)
-    site = site or ""
-    uri = uri or ""
-    args = args or ""
-    if cache_vary_by_ua_enabled() then
-        ua_token = ua_token or "btwaf_null"
-        return site .. "|" .. uri .. "|" .. args .. "|" .. ua_token
+local function capture_headers_for_sign()
+    if not sign_config_uses_headers then
+        return nil
     end
-    return site .. "|" .. uri .. "|" .. args
+    if ngx and ngx.req and type(ngx.req.get_headers) == "function" then
+        local ok, h = pcall(ngx.req.get_headers)
+        if ok and type(h) == "table" then
+            return h
+        end
+    end
+    return {}
 end
 
 local function cache_page_field_hex()
-    return ngx.md5(cache_field_signing_string(
-        cache_page_site(),
-        ngx.var.uri or "",
-        ngx.var.args or "",
-        cache_page_user_agent()
-    ))
+    local ctx = {
+        site = cache_page_site(),
+        uri = ngx.var.uri or "",
+        args = ngx.var.args or "",
+        ua = cache_page_user_agent(),
+        referer = ngx.var.http_referer or "",
+        headers = capture_headers_for_sign(),
+    }
+    return ngx.md5(cache_field_signing_string_from_ctx(ctx))
 end
 
--- 供 delete/get/set_cached_content；explicit_ua 在无 ngx 时必须传入（与 vary 开启时一致）
-local function cache_page_field_hex_for(site, uri, args, explicit_ua)
+-- 供 delete/get/set_cached_content。无 ngx 时：签名含 ua / referer / headers 须传对应显式参数（见下方 opts）
+local function cache_page_field_hex_for(site, uri, args, explicit_ua, opts)
+    opts = opts or {}
     local ua_tok = explicit_ua
     if ua_tok == nil and ngx and ngx.var then
         ua_tok = cache_page_user_agent()
     elseif ua_tok == nil then
         ua_tok = "btwaf_null"
     end
-    return ngx.md5(cache_field_signing_string(site, uri, args, ua_tok))
-end
-
-local function cache_payload_expired(data)
-    local t = data and data.expires_at
-    if type(t) ~= "number" then
-        return false
+    local ref = opts.referer
+    if ref == nil and ngx and ngx.var then
+        ref = ngx.var.http_referer or ""
+    elseif ref == nil then
+        ref = ""
     end
-    return ngx.time() > t
+    local hdrs = opts.headers
+    if hdrs == nil and sign_config_uses_headers then
+        hdrs = capture_headers_for_sign()
+    end
+    local ctx = {
+        site = site or "",
+        uri = uri or "",
+        args = args or "",
+        ua = ua_tok,
+        referer = ref,
+        headers = hdrs,
+    }
+    return ngx.md5(cache_field_signing_string_from_ctx(ctx))
 end
 
 -- body_filter 里 whole 多为已解压正文，但 ngx.header 可能仍带 gzip / attachment，命中时若照搬会导致浏览器乱码或「变成下载」
@@ -641,17 +791,18 @@ local function resolve_cache_site(explicit_site)
     return ""
 end
 
--- Function to get cached content（与整页缓存共用 Hash + field；可选 explicit_site / explicit_ua）
-local function get_cached_content(uri, query_string, explicit_site, explicit_ua)
+-- Function to get cached content（Redis STRING：key = page_cache_redis_key(md5)；可选 explicit_site / explicit_ua）
+-- opts（可选）：{ referer = "...", headers = { ["cookie"] = "..." } }，与 PAGE_CACHE_SIGN_COMPONENTS 中含 referer / headers:* 时配合；无 ngx 时必须提供
+local function get_cached_content(uri, query_string, explicit_site, explicit_ua, opts)
     local client = get_redis_client()
     if not client then
         cache_log(ngx.ERR, "get_client_nil", "Redis client nil")
         return nil
     end
-    local main_key = get_page_cache_hash_key()
-    local field = cache_page_field_hex_for(resolve_cache_site(explicit_site), uri, query_string, explicit_ua)
-    local trace = main_key .. "#" .. key_trace(CACHE_PREFIX .. field)
-    local cached_data, err = client:hget(main_key, field)
+    local field = cache_page_field_hex_for(resolve_cache_site(explicit_site), uri, query_string, explicit_ua, opts)
+    local redis_key = page_cache_redis_key(field)
+    local trace = key_trace(redis_key)
+    local cached_data, err = client:get(redis_key)
     if not cached_data or cached_data == ngx.null then
         cache_log_op("get_miss", "key=", trace, err and (", err=" .. tostring(err)) or "")
         return nil
@@ -661,37 +812,35 @@ local function get_cached_content(uri, query_string, explicit_site, explicit_ua)
         cache_log_op("get_miss", "key=", trace, ", err=decode_fail")
         return nil
     end
-    if cache_payload_expired(decoded) then
-        cache_log_op("get_miss", "key=", trace, ", err=expired")
-        return nil
-    end
     cache_log_op("get_hit", "key=", trace, ", payload_bytes=", tostring(#cached_data))
     return decoded
 end
 
 -- Function to set cache content
-local function set_cached_content(uri, query_string, content, ttl, explicit_site, explicit_ua)
+local function set_cached_content(uri, query_string, content, ttl, explicit_site, explicit_ua, opts)
     local client = get_redis_client()
     if not client then
         cache_log(ngx.ERR, "set_client_nil", "Redis client nil")
         return
     end
-    ttl = ttl or DEFAULT_TTL
+    ttl = tonumber(ttl) or PAGE_CACHE_TTL_SECONDS
+    if ttl < 1 then
+        ttl = PAGE_CACHE_TTL_SECONDS
+    end
     if type(content) ~= "table" then
         cache_log(ngx.ERR, "set_fail", "content must be a table")
         return
     end
-    local main_key = get_page_cache_hash_key()
-    local field = cache_page_field_hex_for(resolve_cache_site(explicit_site), uri, query_string, explicit_ua)
-    local trace = main_key .. "#" .. key_trace(CACHE_PREFIX .. field)
+    local field = cache_page_field_hex_for(resolve_cache_site(explicit_site), uri, query_string, explicit_ua, opts)
+    local redis_key = page_cache_redis_key(field)
+    local trace = key_trace(redis_key)
     local payload_tbl = {}
     for k, v in pairs(content) do
         payload_tbl[k] = v
     end
-    payload_tbl.expires_at = ngx.time() + ttl
     local data = cjson.encode(payload_tbl)
     cache_log_op("set_try", "key=", trace, " ttl=", tostring(ttl), " payload_bytes=", tostring(#data))
-    local ok, err = client:hset(main_key, field, data)
+    local ok, err = client:setex(redis_key, ttl, data)
     if ok then
         cache_log_op("set_ok", "key=", trace, " ttl=", tostring(ttl))
     else
@@ -699,21 +848,20 @@ local function set_cached_content(uri, query_string, content, ttl, explicit_site
     end
 end
 
--- Function to delete cache（仅删除当前 UA 分桶；要清整站用 clear_all_cache）
-local function delete_cache(uri, query_string, explicit_site, explicit_ua)
+-- Function to delete cache（当前签名对应的一条 STRING；整库清理由 clear_all_cache）
+local function delete_cache(uri, query_string, explicit_site, explicit_ua, opts)
     local client = get_redis_client()
     if not client then return end
-    local main_key = get_page_cache_hash_key()
-    local field = cache_page_field_hex_for(resolve_cache_site(explicit_site), uri, query_string, explicit_ua)
-    client:hdel(main_key, field)
+    local field = cache_page_field_hex_for(resolve_cache_site(explicit_site), uri, query_string, explicit_ua, opts)
+    client:del(page_cache_redis_key(field))
 end
 
--- Function to clear all cache（主 Hash + btwaf_cms_cache:* 遗留 string 键；另清 php_cache:* 便于从旧版迁移）
+-- Function to clear all cache（btwaf_cms_cache:*；另清旧版整页 Hash 键 btwaf_cms_cache 与 php_cache:*）
 local function clear_all_cache()
     local client = get_redis_client()
     if not client then return end
-    client:del(get_page_cache_hash_key())
-    local keys, err = client:keys(CACHE_PREFIX .. "*")
+    client:del("btwaf_cms_cache")
+    local keys, err = client:keys(CACHE_KEY_PREFIX .. "*")
     if keys and type(keys) == "table" then
         for _, key in ipairs(keys) do
             client:del(key)
@@ -728,10 +876,10 @@ local function clear_all_cache()
 end
 
 local function page_cache_trace_key(field_hex)
-    return get_page_cache_hash_key() .. "#" .. key_trace(CACHE_PREFIX .. field_hex)
+    return key_trace(page_cache_redis_key(field_hex))
 end
 
-local function async_redis_hset_page(premature, main_key, field, value)
+local function async_redis_setex_page(premature, redis_key, ttl_sec, value)
     if premature then return end
     if not redis_available() then return end
     local cfg = get_redis_config()
@@ -745,13 +893,17 @@ local function async_redis_hset_page(premature, main_key, field, value)
     if cfg.db and cfg.db > 0 then
         red:select(cfg.db)
     end
-    local ok1, err_set = red:hset(main_key, field, value)
+    local ttl = tonumber(ttl_sec) or PAGE_CACHE_TTL_SECONDS
+    if ttl < 1 then
+        ttl = PAGE_CACHE_TTL_SECONDS
+    end
+    local ok1, err_set = red:setex(redis_key, ttl, value)
     if not ok1 then
-        cache_log(ngx.ERR, "async_set_fail", "key=", page_cache_trace_key(field), " err=", err_set or "")
+        cache_log(ngx.ERR, "async_set_fail", "key=", key_trace(redis_key), " err=", err_set or "")
         return
     end
     red:set_keepalive(10000, 10)
-    cache_log_op("async_set_ok", "key=", page_cache_trace_key(field), " payload_bytes=", tostring(#value))
+    cache_log_op("async_set_ok", "key=", key_trace(redis_key), " payload_bytes=", tostring(#value))
 end
 
 -- 供 body_filter 在拼装完整响应体后异步写入 Redis（GET 200、非白名单）
@@ -779,25 +931,20 @@ local function try_access_cache_hit()
         stash_shellstack_cache_state("OFF", "redis_connect_or_db_failed", nil)
         return
     end
-    local main_key = get_page_cache_hash_key()
     local field = cache_page_field_hex()
+    local redis_key = page_cache_redis_key(field)
     local trace = page_cache_trace_key(field)
-    local raw, err = client:hget(main_key, field)
+    local raw, err = client:get(redis_key)
     client:set_keepalive(10000, 10)
     if not raw or raw == ngx.null then
-        stash_shellstack_cache_state("MISS", "redis_key_miss", CACHE_PREFIX .. field)
+        stash_shellstack_cache_state("MISS", "redis_key_miss", redis_key)
         cache_log_op("access_miss", "key=", trace, err and (", err=" .. tostring(err)) or "")
         return
     end
     local ok, data = pcall(cjson.decode, raw)
     if not ok or type(data) ~= "table" or type(data.content) ~= "string" then
-        stash_shellstack_cache_state("MISS", "corrupt_cache_entry", CACHE_PREFIX .. field)
+        stash_shellstack_cache_state("MISS", "corrupt_cache_entry", redis_key)
         cache_log(ngx.ERR, "access_decode_fail", trace)
-        return
-    end
-    if cache_payload_expired(data) then
-        stash_shellstack_cache_state("MISS", "cache_entry_expired", CACHE_PREFIX .. field)
-        cache_log_op("access_miss", "key=", trace, ", err=expired")
         return
     end
     if data.headers and type(data.headers) == "table" then
@@ -814,7 +961,7 @@ local function try_access_cache_hit()
     end
     local body_out = repair_generic_content_type_and_body(data)
     ngx.header["Content-Length"] = tostring(#body_out)
-    stash_shellstack_cache_state("HIT", "served_from_redis", CACHE_PREFIX .. field)
+    stash_shellstack_cache_state("HIT", "served_from_redis", redis_key)
     ngx.ctx.shellstack_cache.replay_content_type = ngx.header["Content-Type"]
     ngx.ctx.shellstack_cache.replay_content_length = ngx.header["Content-Length"]
     cache_log_op("access_hit", "key=", trace, " body_bytes=", tostring(#body_out))
@@ -823,7 +970,10 @@ local function try_access_cache_hit()
 end
 
 local function schedule_body_page_cache(ttl, whole)
-    ttl = ttl or DEFAULT_TTL
+    ttl = tonumber(ttl) or PAGE_CACHE_TTL_SECONDS
+    if ttl < 1 then
+        ttl = PAGE_CACHE_TTL_SECONDS
+    end
     if ngx.req.get_method() ~= "GET" then return end
     if ngx.status ~= 200 then return end
     if ngx.ctx.white_rule then return end
@@ -841,8 +991,8 @@ local function schedule_body_page_cache(ttl, whole)
     end
     ensure_ctx_server_name_for_cache()
     local hreq = ngx.req.get_headers()
-    local main_key = get_page_cache_hash_key()
     local field = cache_page_field_hex()
+    local redis_key = page_cache_redis_key(field)
     local trace = page_cache_trace_key(field)
     whole = normalize_page_cache_payload_before_store(headers, whole)
     local payload = cjson.encode({
@@ -852,10 +1002,9 @@ local function schedule_body_page_cache(ttl, whole)
         args = ngx.var.args,
         site = cache_page_site(),
         user_agent = hreq["user-agent"] or hreq["User-Agent"],
-        accept = hreq["Accept"] or hreq["accept"],
-        expires_at = ngx.time() + ttl
+        accept = hreq["Accept"] or hreq["accept"]
     })
-    local ok, err = ngx.timer.at(0, async_redis_hset_page, main_key, field, payload)
+    local ok, err = ngx.timer.at(0, async_redis_setex_page, redis_key, ttl, payload)
     if not ok then
         cache_log(ngx.ERR, "timer_fail", err or "")
     else
