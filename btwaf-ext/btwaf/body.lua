@@ -69,7 +69,10 @@ end
 
 --替换body中的敏感词
 function body_filter.run_body()
-    if BTWAF_RULES.body_character_len==0 and ngx.ctx.crawler_html==false then return false end
+    -- shellstack_body_page_cache（仓库覆盖版：勿删过早 return 与下方 schedule）
+    -- 官方此处曾直接 return：无「敏感词替换」且非 crawler 时整段 eof 逻辑被跳过，
+    -- 导致页缓存永远不会 schedule_body_page_cache → Redis 无写入、access 永远 MISS。
+    -- 无敏感词时下方 for 不执行即可，仍需合并 whole 并尝试缓存。
     local whole=""
     local chunk, eof = ngx.arg[1], ngx.arg[2]
     local buffered = ngx.ctx.buffered
@@ -114,8 +117,11 @@ function body_filter.run_body()
             ngx.arg[1]=whole
         end
 
-        if cache and type(cache.schedule_body_page_cache) == "function" then
-            cache.schedule_body_page_cache(180, whole)
+        do
+            local okc, c = pcall(require, "cache")
+            if okc and c and type(c.schedule_body_page_cache) == "function" then
+                c.schedule_body_page_cache(180, whole)
+            end
         end
     end
 end

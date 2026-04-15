@@ -264,6 +264,34 @@ _btwaf_ensure_nginx_btwaf_conf_cache_shared() {
 }
 
 # 在官方 header.lua 末尾追加一行：header_filter 阶段把 shellstack 缓存状态写入响应头（对抗 proxy 覆盖 access 阶段 ngx.header）
+# 官方 body.lua：run_body 在 body_character_len==0 且非 crawler 时直接 return，eof 从不执行 → Redis 永不写入。
+# 去掉该行并在 ngx.arg[1]=whole 后注入 schedule_body_page_cache（与 lib/cache.lua 配套）。
+_btwaf_ensure_body_lua_page_cache() {
+  local bf="${BTWAF_INSTALL_DIR:-/www/server/btwaf}/body.lua"
+  [[ -f "$bf" ]] || {
+    warn "未找到 $bf，跳过 body 页缓存修补"
+    return 0
+  }
+  if grep -q 'shellstack_body_page_cache' "$bf" 2>/dev/null; then
+    log "body.lua 已含 shellstack_body_page_cache 标记，跳过自动修补"
+    return 0
+  fi
+  _btwaf_chattr_unlock_path "$bf"
+  if ! command -v perl >/dev/null 2>&1; then
+    warn "未检测到 perl，无法自动修补 body.lua；请使用仓库 btwaf-ext/btwaf/body.lua 覆盖 $bf"
+    return 0
+  fi
+  perl -0777 -i -pe '
+  s/\n[ \t]*if BTWAF_RULES\.body_character_len==0 and ngx\.ctx\.crawler_html==false then return false end\n/\n-- shellstack_body_page_cache: removed early return\n/s;
+  s/(ngx\.arg\[1\]=whole)\n(\s+end)/$1\n            -- shellstack_body_page_cache\n            do\n                local okc, c = pcall(require, "cache")\n                if okc and c and type(c.schedule_body_page_cache) == "function" then\n                    c.schedule_body_page_cache(180, whole)\n                end\n            end\n$2/s;
+' "$bf" 2>>"$LOG_FILE" || true
+  if grep -q 'shellstack_body_page_cache' "$bf" 2>/dev/null && grep -q 'schedule_body_page_cache' "$bf" 2>/dev/null; then
+    log "已修补 $bf（允许无敏感词规则时仍写入 Redis 页缓存）"
+    return 0
+  fi
+  warn "body.lua 自动修补未完全生效，请手动复制仓库 btwaf-ext/btwaf/body.lua 到 $bf"
+}
+
 _btwaf_ensure_header_lua_shellstack_hook() {
   local hf="${BTWAF_INSTALL_DIR:-/www/server/btwaf}/header.lua"
   [[ -f "$hf" ]] || {
@@ -558,6 +586,7 @@ extend_btwaf_cache_bundle() {
 
   _btwaf_install_redis_via_panel
   _btwaf_overlay_repo_lua_files
+  _btwaf_ensure_body_lua_page_cache
   _btwaf_ensure_lib_resty_redis
   _btwaf_ensure_waf_cache_hit_hook
   _btwaf_ensure_init_requires_cache_module
