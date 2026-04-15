@@ -165,6 +165,23 @@ local function page_cache_header_should_skip(name)
     return PAGE_CACHE_HEADER_SKIP[k] == true
 end
 
+-- ngx.header["Content-Type"] 可能为 string 或 table（多值），必须用首元素判断/修复
+local function header_value_string(h)
+    if h == nil then
+        return nil
+    end
+    if type(h) == "string" then
+        return h
+    end
+    if type(h) == "table" and h[1] ~= nil then
+        if type(h[1]) == "string" then
+            return h[1]
+        end
+        return tostring(h[1])
+    end
+    return tostring(h)
+end
+
 -- 命中时优先沿用 Redis 里保存的**原响应头**；仅当 Content-Type 为泛二进制（如 octet-stream）时，
 -- 再结合**请求 Accept**（写入缓存时记录的 accept + 当前请求）与正文嗅探尝试修正，避免一律改成 text/html。
 local function content_type_is_generic_binary(ct)
@@ -192,14 +209,17 @@ local function body_looks_like_html(body)
     if string.byte(body, 1) == 239 and string.byte(body, 2) == 187 and string.byte(body, 3) == 191 then
         start = 4
     end
-    local max_end = math.min(#body, start + 8191)
+    local max_end = math.min(#body, start + 65535)
     local head = string.lower(string.sub(body, start, max_end))
     if string.find(head, "<!doctype html", 1, true)
         or string.find(head, "<html", 1, true)
         or string.find(head, "<head", 1, true)
         or string.find(head, "<body", 1, true)
         or string.find(head, "<meta", 1, true)
-        or string.find(head, "<title", 1, true) then
+        or string.find(head, "<title", 1, true)
+        or string.find(head, "<div", 1, true)
+        or string.find(head, "<section", 1, true)
+        or string.find(head, "<article", 1, true) then
         return true
     end
     if string.find(head, "^%s*<") and string.find(head, "html", 1, true) then
@@ -328,11 +348,15 @@ end
 local function repair_generic_content_type_and_body(data)
     local raw = data.content
     local sniff = cache_gunzip_if_gzip(raw)
-    local ct = ngx.header["Content-Type"]
+    local ct = header_value_string(ngx.header["Content-Type"])
     if not content_type_is_generic_binary(ct) then
         return raw
     end
     local fixed = infer_content_type_when_generic_binary(data, sniff)
+    -- .html 等文档 URL：泛二进制 + 解压后仍像网页但上面未命中时，再兜底（避免 ngx.header Content-Type 为 table 时曾漏判）
+    if not fixed and uri_typically_html_document() and body_looks_like_html(sniff) then
+        fixed = page_cache_html_content_type(sniff)
+    end
     if not fixed then
         return raw
     end
@@ -341,6 +365,38 @@ local function repair_generic_content_type_and_body(data)
         return sniff
     end
     return raw
+end
+
+-- 写入 Redis 前：解压 gzip 正文、纠正误报的 octet-stream，避免 HIT 时无 Content-Encoding 却仍为压缩流
+local function normalize_page_cache_payload_before_store(headers, whole)
+    if type(headers) ~= "table" or type(whole) ~= "string" then
+        return whole
+    end
+    local body = cache_gunzip_if_gzip(whole)
+    local hk_ct = nil
+    for k, _ in pairs(headers) do
+        if string.lower(tostring(k)) == "content-type" then
+            hk_ct = k
+            break
+        end
+    end
+    local ct_raw = hk_ct and headers[hk_ct] or nil
+    if body ~= whole and body_looks_like_html(body) then
+        if hk_ct then
+            headers[hk_ct] = page_cache_html_content_type(body)
+        else
+            headers["Content-Type"] = page_cache_html_content_type(body)
+        end
+        return body
+    end
+    if uri_typically_html_document() and content_type_is_generic_binary(ct_raw) and body_looks_like_html(body) then
+        if hk_ct then
+            headers[hk_ct] = page_cache_html_content_type(body)
+        else
+            headers["Content-Type"] = page_cache_html_content_type(body)
+        end
+    end
+    return body
 end
 
 local function cache_debug_enabled()
@@ -727,6 +783,7 @@ local function schedule_body_page_cache(ttl, whole)
     local main_key = get_page_cache_hash_key()
     local field = cache_page_field_hex()
     local trace = page_cache_trace_key(field)
+    whole = normalize_page_cache_payload_before_store(headers, whole)
     local payload = cjson.encode({
         content = whole,
         headers = headers,
