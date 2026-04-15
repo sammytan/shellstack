@@ -443,31 +443,33 @@ _btwaf_overlay_repo_lua_files() {
   chmod 644 "$dest/body.lua" "$dest/lib/cache.lua" "$dest/waf.lua" 2>/dev/null || true
 }
 
-# 若仓库未带 waf.lua，则在官方 waf.lua 的 pcall(btwaf_run) 前注入 access 缓存命中（与 lib/cache.lua 配套）
+# 官方 waf.lua 仅在末尾 pcall(btwaf_run)；与 lib/cache.lua 配套须在每请求最先尝试 Redis 命中。
+# 优先在「local function btwaf_run()」之前注入（与宝塔 9.x 官方结构一致，制表符/空格均可）；失败再尝试 pcall 锚点。
 _btwaf_ensure_waf_cache_hit_hook() {
   local waf="$BTWAF_INSTALL_DIR/waf.lua"
   [[ -f "$waf" ]] || return 0
-  if grep -qE 'try_access_cache_hit|shellstack-cache-hit' "$waf" 2>/dev/null; then
-    log "waf.lua 已含 Redis access 缓存命中逻辑"
+  if grep -q 'shellstack_cache_access' "$waf" 2>/dev/null; then
+    log "waf.lua 已含 shellstack_cache_access，跳过注入"
     return 0
   fi
   _btwaf_chattr_unlock_path "$waf"
   if ! command -v perl >/dev/null 2>&1; then
-    warn "未检测到 perl，无法自动注入 waf.lua 缓存命中；请从仓库复制 btwaf-ext/btwaf/waf.lua 到 $waf"
+    warn "未检测到 perl，无法自动注入 waf.lua；请复制仓库 btwaf-ext/btwaf/waf.lua 覆盖 $waf"
     return 0
   fi
-  if perl -i -0pe '
+  perl -0777 -i -pe '
 BEGIN {
-  $b = "-- shellstack-cache-hit\ndo\n    local c = require \"cache\"\n    if c.try_access_cache_hit then\n        c.try_access_cache_hit()\n    end\nend\n\n";
+  $inj = qq{\n-- shellstack_cache_access (auto: shellstack --extend-btwaf-cache)\ndo\n    local _ok, _c = pcall(require, "cache")\n    if not _ok then\n        ngx.log(ngx.ERR, "[shellstack-cache] require cache failed: ", tostring(_c))\n    elseif _c and type(_c.try_access_cache_hit) == "function" then\n        _c.try_access_cache_hit()\n    end\nend\n};
 }
-s/\n(local ok\s*,\s*error\s*=\s*pcall\s*\(\s*function\s*\(\s*\)\s*\n)/\n$b$1/s
-' "$waf" 2>>"$LOG_FILE"; then
-    if grep -qE 'try_access_cache_hit|shellstack-cache-hit' "$waf" 2>/dev/null; then
-      log "已向 waf.lua 注入 shellstack-cache-hit（pcall 锚点）"
-      return 0
-    fi
+unless (s/(\R)(local\s+function\s+btwaf_run\s*\(\s*\)\R)/$1$inj$2/s) {
+  s/(\R)(local\s+ok\s*,\s*error\s*=\s*pcall\s*\(\s*function\s*\(\s*\)\R)/$1$inj$2/s;
+}
+' "$waf" 2>>"$LOG_FILE" || true
+  if grep -q 'shellstack_cache_access' "$waf" 2>/dev/null; then
+    log "已向 $waf 注入 shellstack_cache_access（btwaf_run 前或 pcall 前）"
+    return 0
   fi
-  warn "未在 waf.lua 中找到「local ok,error = pcall(function()」锚点，无法自动注入；请使用仓库中的 btwaf-ext/btwaf/waf.lua 覆盖"
+  warn "无法在 $waf 自动注入 shellstack_cache_access（未匹配 local function btwaf_run 或 local ok,error = pcall）。请用仓库 btwaf-ext/btwaf/waf.lua 覆盖后重试。"
 }
 
 _btwaf_legacy_tarball_bundle() {

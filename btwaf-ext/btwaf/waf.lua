@@ -16,6 +16,16 @@ if not ngx.shared.spider:get("works"..worker_pid) then
     ngx.timer.every(60,Public.insert_request_total)-- 60秒更新一次规则命中记录
 end
 
+-- shellstack_cache_access（与官方 waf 结构一致：在 btwaf_run 定义之前执行，每请求优先尝试 Redis 页缓存）
+do
+    local _ok, _c = pcall(require, "cache")
+    if not _ok then
+        ngx.log(ngx.ERR, "[shellstack-cache] require cache failed: ", tostring(_c))
+    elseif _c and type(_c.try_access_cache_hit) == "function" then
+        _c.try_access_cache_hit()
+    end
+end
+
 local function btwaf_run()
     local time_str = ngx.localtime()
     ngx.ctx.white_rule=false
@@ -208,19 +218,6 @@ local function btwaf_run()
     ngx.ctx.white_rule=false
     ngx.ctx.proxy=true
     
-end
-
-do
-    local c = _G.cache
-    if not c then
-        local okm, m = pcall(require, "cache")
-        if okm then
-            c = m
-        end
-    end
-    if c and type(c.try_access_cache_hit) == "function" then
-        c.try_access_cache_hit()
-    end
 end
 
 local ok,error = pcall(function()
