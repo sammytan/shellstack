@@ -1,3 +1,11 @@
+-- 说明：未 require 官方 logs.lua（该文件是 Logs.start() 的入口脚本，不是通用日志 API）。
+-- 缓存相关行若调用 Public.logs，与 BTwaf 一致，写入 /www/wwwlogs/btwaf_debug.log；
+-- ngx.log 写入 Nginx 的 error_log（站点 error.log 或主配置里的 error_log，取决于上下文）。
+--
+-- 响应头：access 阶段设置 X-Shellstack-Cache / Reason / Fingerprint，便于辨别工作状态。
+-- Nginx 中 header_filter 早于 body_filter，无法在「本响应」里用头标明「是否已成功写入 Redis」；
+-- 写入是否成功：首请求多为 MISS，再次 GET 若变为 HIT 即链路正常。
+-- 关闭响应头：SHELLSTACK_CACHE_HEADERS=0
 local redis_ok, redis = pcall(require, "resty.redis")
 local cjson = require "cjson"
 
@@ -57,6 +65,33 @@ local function key_trace(k)
         return k
     end
     return string.sub(k, 1, 28) .. "..." .. string.sub(k, -16)
+end
+
+local function cache_headers_enabled()
+    local v = os.getenv("SHELLSTACK_CACHE_HEADERS")
+    if v == "0" or v == "off" or v == "no" then
+        return false
+    end
+    return true
+end
+
+-- 状态：HIT | MISS | SKIP | OFF（模块/连接不可用）
+local function set_shellstack_cache_headers(state, reason, key)
+    if not cache_headers_enabled() then
+        return
+    end
+    if state then
+        ngx.header["X-Shellstack-Cache"] = state
+    end
+    if reason then
+        ngx.header["X-Shellstack-Cache-Reason"] = reason
+    end
+    if key then
+        local fp = string.match(key, "^php_cache:([a-fA-F0-9]+)$")
+        if fp and #fp >= 8 then
+            ngx.header["X-Shellstack-Cache-Fingerprint"] = string.lower(string.sub(fp, -8))
+        end
+    end
 end
 
 local function cache_log(level, event, ...)
@@ -246,20 +281,35 @@ end
 -- 供 body_filter 在拼装完整响应体后异步写入 Redis（GET 200、非白名单）
 -- access 阶段：与 schedule_body_page_cache 使用同一 Redis 键；命中则 ngx.exit(200)，未命中返回（继续 WAF）
 local function try_access_cache_hit()
-    if ngx.req.get_method() ~= "GET" then return end
+    if ngx.req.get_method() ~= "GET" then
+        set_shellstack_cache_headers("SKIP", "method_not_get", nil)
+        return
+    end
     local sk = ngx.var.skip_cache
-    if sk == "1" or sk == "true" then return end
+    if sk == "1" or sk == "true" or sk == 1 then
+        set_shellstack_cache_headers("SKIP", "skip_cache_var", nil)
+        return
+    end
+    if not redis_available() then
+        set_shellstack_cache_headers("OFF", "redis_module_unavailable", nil)
+        return
+    end
     local client = get_redis_client_quiet()
-    if not client then return end
+    if not client then
+        set_shellstack_cache_headers("OFF", "redis_connect_or_db_failed", nil)
+        return
+    end
     local key = body_fingerprint_key()
     local raw, err = client:get(key)
     client:set_keepalive(10000, 10)
     if not raw or raw == ngx.null then
+        set_shellstack_cache_headers("MISS", "redis_key_miss", key)
         cache_log_op("access_miss", "key=", key_trace(key), err and (", err=" .. tostring(err)) or "")
         return
     end
     local ok, data = pcall(cjson.decode, raw)
     if not ok or type(data) ~= "table" or type(data.content) ~= "string" then
+        set_shellstack_cache_headers("MISS", "corrupt_cache_entry", key)
         cache_log(ngx.ERR, "access_decode_fail", key)
         return
     end
@@ -273,7 +323,7 @@ local function try_access_cache_hit()
             end
         end
     end
-    ngx.header["X-Shellstack-Cache"] = "HIT"
+    set_shellstack_cache_headers("HIT", "served_from_redis", key)
     cache_log_op("access_hit", "key=", key_trace(key), " body_bytes=", tostring(#data.content))
     ngx.print(data.content)
     ngx.exit(ngx.HTTP_OK)
