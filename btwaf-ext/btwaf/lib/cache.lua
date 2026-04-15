@@ -237,7 +237,39 @@ local function body_looks_like_json(body)
     return c == 123 or c == 91
 end
 
--- 缓存里常为 gzip 正文 + 错误的 octet-stream；用 BTwaf Public.ungzipbit（无 iconv）解压后再嗅探/回源
+-- 与 Public.ungzipbit 相同算法；access 阶段早于部分模块加载时 Public 可能不可用
+local function cache_gunzip_via_ffi_zlib(body)
+    local ok_mod, zlib = pcall(require, "ffi-zlib")
+    if not ok_mod or not zlib or type(zlib.inflateGzip) ~= "function" then
+        return nil
+    end
+    local output_table = {}
+    local output = function(data)
+        table.insert(output_table, data)
+    end
+    local count = 0
+    local input = function(bufsize)
+        local start = count > 0 and bufsize * count or 1
+        local finish = (bufsize * (count + 1)) - 1
+        count = count + 1
+        if bufsize == 1 then
+            start = count
+            finish = count
+        end
+        return body:sub(start, finish)
+    end
+    local ok_i, _err = zlib.inflateGzip(input, output, 15 + 32)
+    if not ok_i then
+        return nil
+    end
+    local out = table.concat(output_table, "")
+    if type(out) == "string" and #out > 0 and out ~= body then
+        return out
+    end
+    return nil
+end
+
+-- 缓存里常为 gzip 正文 + 错误的 octet-stream；Public.ungzipbit → ffi-zlib
 local function cache_gunzip_if_gzip(body)
     if type(body) ~= "string" or #body < 3 then
         return body
@@ -251,6 +283,10 @@ local function cache_gunzip_if_gzip(body)
         if ok and type(out) == "string" and #out > 0 and out ~= body then
             return out
         end
+    end
+    local out2 = cache_gunzip_via_ffi_zlib(body)
+    if out2 then
+        return out2
     end
     return body
 end
@@ -356,6 +392,15 @@ local function repair_generic_content_type_and_body(data)
     -- .html 等文档 URL：泛二进制 + 解压后仍像网页但上面未命中时，再兜底（避免 ngx.header Content-Type 为 table 时曾漏判）
     if not fixed and uri_typically_html_document() and body_looks_like_html(sniff) then
         fixed = page_cache_html_content_type(sniff)
+    end
+    if not fixed then
+        -- .html 仍无法推断但正文已解压且明显含 HTML 标签（模板前部过长等）
+        if uri_typically_html_document() and type(sniff) == "string" and #sniff > 100 then
+            local win = string.lower(string.sub(sniff, 1, math.min(#sniff, 98304)))
+            if string.find(win, "<html", 1, true) or string.find(win, "<!doctype", 1, true) then
+                fixed = page_cache_html_content_type(sniff)
+            end
+        end
     end
     if not fixed then
         return raw
@@ -478,6 +523,15 @@ local function apply_header_filter_headers()
     local s = ngx.ctx.shellstack_cache
     if not s or not s.state then
         return
+    end
+    -- Redis HIT 在 access 已设好 Content-Type/Length；header_filter 阶段可能被其它逻辑改回 octet-stream，此处强制恢复
+    if s.state == "HIT" then
+        if s.replay_content_type then
+            ngx.header["Content-Type"] = s.replay_content_type
+        end
+        if s.replay_content_length then
+            ngx.header["Content-Length"] = s.replay_content_length
+        end
     end
     ngx.header["X-Shellstack-Cache"] = s.state
     if s.reason then
@@ -749,13 +803,20 @@ local function try_access_cache_hit()
     if data.headers and type(data.headers) == "table" then
         for hk, hv in pairs(data.headers) do
             if type(hv) == "string" and not page_cache_header_should_skip(hk) then
-                ngx.header[hk] = hv
+                -- 误存的 application/octet-stream 先不写进 ngx.header，交给 repair 按解压后正文重写（否则下游可能锁死为下载）
+                if string.lower(tostring(hk)) == "content-type" and content_type_is_generic_binary(hv) then
+                    -- skip
+                else
+                    ngx.header[hk] = hv
+                end
             end
         end
     end
     local body_out = repair_generic_content_type_and_body(data)
     ngx.header["Content-Length"] = tostring(#body_out)
     stash_shellstack_cache_state("HIT", "served_from_redis", CACHE_PREFIX .. field)
+    ngx.ctx.shellstack_cache.replay_content_type = ngx.header["Content-Type"]
+    ngx.ctx.shellstack_cache.replay_content_length = ngx.header["Content-Length"]
     cache_log_op("access_hit", "key=", trace, " body_bytes=", tostring(#body_out))
     ngx.print(body_out)
     ngx.exit(ngx.HTTP_OK)
