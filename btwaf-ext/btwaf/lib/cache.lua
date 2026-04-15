@@ -7,15 +7,41 @@
 -- body 写入 Redis 仍无法在本响应头体现；首 MISS、次 HIT 即正常。
 -- 关闭响应头：SHELLSTACK_CACHE_HEADERS=0
 -- 排障：每请求 NOTICE 日志 SHELLSTACK_CACHE_TRACE=1（须 nginx env）
+-- Redis：默认 127.0.0.1:6379；可设 SHELLSTACK_REDIS_HOST / SHELLSTACK_REDIS_PORT / SHELLSTACK_REDIS_DB（nginx 主配置须 env 指令声明）
 local redis_ok, redis = pcall(require, "resty.redis")
 local cjson = require "cjson"
 
--- Redis configuration
-local redis_config = {
-    host = "127.0.0.1",
-    port = 6379,
-    db = 0
-}
+local function get_redis_config()
+    local h = os.getenv("SHELLSTACK_REDIS_HOST")
+    if not h or h == "" then
+        h = "127.0.0.1"
+    end
+    local port = tonumber(os.getenv("SHELLSTACK_REDIS_PORT") or "") or 6379
+    local db = tonumber(os.getenv("SHELLSTACK_REDIS_DB") or "") or 0
+    return { host = h, port = port, db = db }
+end
+
+local function redis_endpoint_hint()
+    local c = get_redis_config()
+    return " endpoint=" .. c.host .. ":" .. tostring(c.port) .. " (set SHELLSTACK_REDIS_HOST/PORT or start Redis; Baota: software store Redis + bind 127.0.0.1:6379)"
+end
+
+-- ngx.timer 内连接失败可能每请求一条，用 spider 字典 90s 内只打一条详细 ERR
+local function cache_log_redis_connect_err(event, err_msg)
+    local line = "[cache][" .. tostring(event) .. "] " .. tostring(err_msg or "") .. redis_endpoint_hint()
+    local d = ngx.shared.spider
+    if d then
+        local k = "shellstack_redis_conn_err"
+        if d:get(k) then
+            return
+        end
+        d:set(k, 1, 90)
+    end
+    ngx.log(ngx.ERR, line)
+    if _G.Public and type(_G.Public.logs) == "function" then
+        pcall(_G.Public.logs, line)
+    end
+end
 
 -- Cache configuration
 local CACHE_PREFIX = "php_cache:"
@@ -158,14 +184,15 @@ local function get_redis_client_quiet()
     if not redis_available() then
         return nil
     end
+    local cfg = get_redis_config()
     local client = redis:new()
     client:set_timeout(1000)
-    local ok, err = client:connect(redis_config.host, redis_config.port)
+    local ok, err = client:connect(cfg.host, cfg.port)
     if not ok then
         return nil
     end
-    if redis_config.db and redis_config.db > 0 then
-        local ok_db, err_db = client:select(redis_config.db)
+    if cfg.db and cfg.db > 0 then
+        local ok_db, err_db = client:select(cfg.db)
         if not ok_db then
             return nil
         end
@@ -178,16 +205,17 @@ local function get_redis_client()
     if not redis_available() then
         return nil
     end
+    local cfg = get_redis_config()
     local client = redis:new()
     client:set_timeout(1000) -- 1秒超时
-    cache_log(ngx.INFO, "connect_try", redis_config.host, ":", redis_config.port)
-    local ok, err = client:connect(redis_config.host, redis_config.port)
+    cache_log(ngx.INFO, "connect_try", cfg.host, ":", cfg.port)
+    local ok, err = client:connect(cfg.host, cfg.port)
     if not ok then
-        cache_log(ngx.ERR, "connect_fail", err or "")
+        cache_log(ngx.ERR, "connect_fail", err or "", redis_endpoint_hint())
         return nil
     end
-    if redis_config.db and redis_config.db > 0 then
-        local ok_db, err_db = client:select(redis_config.db)
+    if cfg.db and cfg.db > 0 then
+        local ok_db, err_db = client:select(cfg.db)
         if not ok_db then
             cache_log(ngx.ERR, "select_db_fail", err_db or "")
             return nil
@@ -275,15 +303,16 @@ end
 local function async_redis_setex(premature, key, ttl, value)
     if premature then return end
     if not redis_available() then return end
+    local cfg = get_redis_config()
     local red = redis:new()
     red:set_timeout(1000)
-    local ok, err = red:connect(redis_config.host, redis_config.port)
+    local ok, err = red:connect(cfg.host, cfg.port)
     if not ok then
-        cache_log(ngx.ERR, "async_connect_fail", err or "")
+        cache_log_redis_connect_err("async_connect_fail", err or "connect failed")
         return
     end
-    if redis_config.db and redis_config.db > 0 then
-        red:select(redis_config.db)
+    if cfg.db and cfg.db > 0 then
+        red:select(cfg.db)
     end
     local ok1, err_set = red:setex(key, ttl, value)
     if not ok1 then
