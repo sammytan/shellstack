@@ -1,4 +1,4 @@
-local redis = require "resty.redis"
+local redis_ok, redis = pcall(require, "resty.redis")
 local cjson = require "cjson"
 
 -- Redis configuration
@@ -11,6 +11,7 @@ local redis_config = {
 -- Cache configuration
 local CACHE_PREFIX = "php_cache:"
 local DEFAULT_TTL = 180 -- 3 minutes in seconds
+local redis_missing_logged = false
 
 local function cache_debug_enabled()
     if _G.Config and type(_G.Config) == "table" then
@@ -39,8 +40,26 @@ local function cache_log(level, event, ...)
     end
 end
 
+local function redis_available()
+    if redis_ok and redis then
+        return true
+    end
+    if not redis_missing_logged then
+        redis_missing_logged = true
+        cache_log(
+            ngx.ERR,
+            "redis_module_missing",
+            "module 'resty.redis' not found; cache disabled"
+        )
+    end
+    return false
+end
+
 -- access 阶段命中缓存用，避免每条请求打 ERR 日志
 local function get_redis_client_quiet()
+    if not redis_available() then
+        return nil
+    end
     local client = redis:new()
     client:set_timeout(1000)
     local ok, err = client:connect(redis_config.host, redis_config.port)
@@ -58,6 +77,9 @@ end
 
 -- 获取 Redis 客户端
 local function get_redis_client()
+    if not redis_available() then
+        return nil
+    end
     local client = redis:new()
     client:set_timeout(1000) -- 1秒超时
     cache_log(ngx.INFO, "connect_try", redis_config.host, ":", redis_config.port)
@@ -154,6 +176,7 @@ end
 
 local function async_redis_setex(premature, key, ttl, value)
     if premature then return end
+    if not redis_available() then return end
     local red = redis:new()
     red:set_timeout(1000)
     local ok, err = red:connect(redis_config.host, redis_config.port)
