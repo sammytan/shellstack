@@ -18,15 +18,15 @@ BTwaf 在 `init.lua` 中通过 `cache = require "cache"` 加载 **`btwaf/lib/cac
 ### 行为概要
 
 - **后端**：使用 `lua-resty-redis` 连接本机 Redis（默认 `127.0.0.1:6379`，数据库 `0`）。
-- **键名规则**：整页缓存在 **单个 Redis Hash**，默认键名 **`btwaf_cms_cache`**；field = **md5(server_name|uri|args)**（与 access/body 共用）。指纹/辅助前缀为 `btwaf_cms_cache:` + field。`get_cached_content` / `set_cached_content` / `delete_cache` 使用同一 Hash 与 field 规则。
+- **键名规则**：整页缓存在 **单个 Redis Hash**，默认键名 **`btwaf_cms_cache`**；field = **md5(server_name|uri|args|User-Agent)**（与官方 `waf.lua` 一致：无 UA 时为 `btwaf_null`）。环境变量 **`SHELLSTACK_CACHE_VARY_UA=0`** 时 field 不含 UA（仅按 URL 维度）。指纹前缀为 `btwaf_cms_cache:` + field。
 - **存取格式**：缓存值为 **JSON**，经 `cjson` 编码后写入 Redis；读取时再解码为 Lua 表。
 - **默认过期时间**：`DEFAULT_TTL = 180` 秒（3 分钟，可在模块内按需调整）。
 - **对外接口**（模块 `return` 表）：
   - `try_access_cache_hit()`：access 阶段调用，命中则直接响应并 `ngx.exit(200)`，未命中则返回。
   - `schedule_body_page_cache(ttl, whole)`：body_filter 在整页响应后异步写入 Redis。
-  - `get_cached_content(uri, query_string, explicit_site?)`：HGET 同上 field。
-  - `set_cached_content(uri, query_string, content, ttl, explicit_site?)`：HSET + JSON 内 `expires_at`。
-  - `delete_cache(uri, query_string, explicit_site?)`：HDEL 单 field。
+  - `get_cached_content(uri, query_string, explicit_site?, explicit_ua?)`：HGET；无 ngx 且开启 UA 分桶时需传 `explicit_ua`。
+  - `set_cached_content(uri, query_string, content, ttl, explicit_site?, explicit_ua?)`：HSET + `expires_at`。
+  - `delete_cache(uri, query_string, explicit_site?, explicit_ua?)`：HDEL 当前 UA 分桶；全量用 `clear_all_cache()`。
   - `clear_all_cache()`：删除主 Hash、`btwaf_cms_cache:*` 遗留键，并清理旧版 `php_cache:*`（依赖 `KEYS`，数据量大时注意 Redis 影响）。
 
 ### 与配置的关系

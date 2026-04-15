@@ -45,11 +45,20 @@ end
 
 -- Cache configuration
 local CACHE_PREFIX = "btwaf_cms_cache:"
--- 整页缓存（access + body）使用**单个 Redis Hash**：所有页面存在同一 key 下，field = md5(server|uri|args)，避免 UA / Accept-Encoding 导致大量重复 key。
--- 可通过 SHELLSTACK_CACHE_HASH_KEY 覆盖 Hash 名（须与 clear 逻辑一致）。
+-- 整页缓存在**单个 Redis Hash**（默认 btwaf_cms_cache）下：
+-- field = md5(server|uri|args) 或 md5(server|uri|args|UA)（适应模式，与官方 waf 对 UA 的处理一致）。
+-- SHELLSTACK_CACHE_HASH_KEY 覆盖 Hash 名；SHELLSTACK_CACHE_VARY_UA=0 关闭按 UA 分桶（仅 URL 维度）。
 local DEFAULT_CACHE_HASH_KEY = "btwaf_cms_cache"
 local DEFAULT_TTL = 180 -- 3 minutes in seconds
 local redis_missing_logged = false
+
+local function cache_vary_by_ua_enabled()
+    local v = os.getenv("SHELLSTACK_CACHE_VARY_UA")
+    if v == "0" or v == "off" or v == "no" or v == "false" then
+        return false
+    end
+    return true
+end
 
 local function get_page_cache_hash_key()
     local k = os.getenv("SHELLSTACK_CACHE_HASH_KEY")
@@ -86,19 +95,47 @@ local function ensure_ctx_server_name_for_cache()
     end
 end
 
-local function cache_page_field_hex()
-    local site = cache_page_site()
-    local uri = ngx.var.uri or ""
-    local args = ngx.var.args or ""
-    return ngx.md5(site .. "|" .. uri .. "|" .. args)
+-- 与官方 btwaf waf.lua 一致：有 User-Agent 用原值，否则 btwaf_null（access 早于 btwaf_run 时 ctx.ua 常未设置，用 $http_user_agent）
+local function cache_page_user_agent()
+    local ctx_ua = ngx.ctx and ngx.ctx.ua
+    if type(ctx_ua) == "string" and ctx_ua ~= "" then
+        return ctx_ua
+    end
+    if ngx.var.http_user_agent and ngx.var.http_user_agent ~= "" then
+        return ngx.var.http_user_agent
+    end
+    return "btwaf_null"
 end
 
--- 供 delete/get/set_cached_content（可能无 ngx 上下文时由调用方传入 site）
-local function cache_page_field_hex_for(site, uri, args)
+local function cache_field_signing_string(site, uri, args, ua_token)
     site = site or ""
     uri = uri or ""
     args = args or ""
-    return ngx.md5(site .. "|" .. uri .. "|" .. args)
+    if cache_vary_by_ua_enabled() then
+        ua_token = ua_token or "btwaf_null"
+        return site .. "|" .. uri .. "|" .. args .. "|" .. ua_token
+    end
+    return site .. "|" .. uri .. "|" .. args
+end
+
+local function cache_page_field_hex()
+    return ngx.md5(cache_field_signing_string(
+        cache_page_site(),
+        ngx.var.uri or "",
+        ngx.var.args or "",
+        cache_page_user_agent()
+    ))
+end
+
+-- 供 delete/get/set_cached_content；explicit_ua 在无 ngx 时必须传入（与 vary 开启时一致）
+local function cache_page_field_hex_for(site, uri, args, explicit_ua)
+    local ua_tok = explicit_ua
+    if ua_tok == nil and ngx and ngx.var then
+        ua_tok = cache_page_user_agent()
+    elseif ua_tok == nil then
+        ua_tok = "btwaf_null"
+    end
+    return ngx.md5(cache_field_signing_string(site, uri, args, ua_tok))
 end
 
 local function cache_payload_expired(data)
@@ -117,6 +154,7 @@ local PAGE_CACHE_HEADER_SKIP = {
     ["content-disposition"] = true,
     ["connection"] = true,
     ["keep-alive"] = true,
+    ["proxy-connection"] = true,
     ["upgrade"] = true,
     ["trailer"] = true,
     ["content-md5"] = true,
@@ -179,6 +217,55 @@ local function body_looks_like_json(body)
     return c == 123 or c == 91
 end
 
+-- 缓存里常为 gzip 正文 + 错误的 octet-stream；用 BTwaf Public.ungzipbit（无 iconv）解压后再嗅探/回源
+local function cache_gunzip_if_gzip(body)
+    if type(body) ~= "string" or #body < 3 then
+        return body
+    end
+    local b1, b2 = string.byte(body, 1, 2)
+    if b1 ~= 0x1f or b2 ~= 0x8b then
+        return body
+    end
+    if _G.Public and type(_G.Public.ungzipbit) == "function" then
+        local ok, out = pcall(_G.Public.ungzipbit, body)
+        if ok and type(out) == "string" and #out > 0 and out ~= body then
+            return out
+        end
+    end
+    return body
+end
+
+local function request_looks_like_top_level_document()
+    local h = ngx.req.get_headers()
+    local dest = h["Sec-Fetch-Dest"] or h["sec-fetch-dest"]
+    if dest == "document" then
+        return true
+    end
+    local mode = h["Sec-Fetch-Mode"] or h["sec-fetch-mode"]
+    if mode == "navigate" then
+        return true
+    end
+    return false
+end
+
+-- 常见整页 URL（用于 octet-stream + 浏览器导航时兜底为 HTML，避免「变成下载」）
+local function uri_typically_html_document()
+    local uri = ngx.var.uri or ""
+    if uri == "/" then
+        return true
+    end
+    if string.find(uri, ".html", 1, true) or string.find(uri, ".htm", 1, true) then
+        return true
+    end
+    if string.find(uri, ".php", 1, true) then
+        return true
+    end
+    if string.find(uri, ".asp", 1, true) or string.find(uri, ".jsp", 1, true) then
+        return true
+    end
+    return false
+end
+
 -- 从正文前部嗅探 HTML charset（GBK 等）；用于仅在需要把泛二进制改成 HTML 时
 local function page_cache_html_content_type(body)
     if type(body) ~= "string" or body == "" then
@@ -212,33 +299,48 @@ local function merge_accept_for_cache_hit(data)
     return table.concat(parts, ",")
 end
 
--- 仅在泛二进制时返回新 Content-Type；否则返回 nil（保留当前 ngx.header）
-local function infer_content_type_when_generic_binary(data)
-    local body = data.content
+-- 仅在泛二进制时返回新 Content-Type；sniff_body 可为解压后的正文（与 data.content 可能不同）
+local function infer_content_type_when_generic_binary(data, sniff_body)
+    sniff_body = sniff_body or data.content
     local accept = string.lower(merge_accept_for_cache_hit(data))
     if string.find(accept, "text/html", 1, true) then
-        if body_looks_like_html(body) then
-            return page_cache_html_content_type(body)
+        if body_looks_like_html(sniff_body) then
+            return page_cache_html_content_type(sniff_body)
         end
     end
-    if string.find(accept, "application/json", 1, true) and body_looks_like_json(body) then
+    if string.find(accept, "application/json", 1, true) and body_looks_like_json(sniff_body) then
         return "application/json; charset=utf-8"
     end
-    if body_looks_like_html(body) then
-        return page_cache_html_content_type(body)
+    -- */* 常见于内嵌 WebView / 少数客户端
+    if string.find(accept, "*/*", 1, true) and body_looks_like_html(sniff_body) then
+        return page_cache_html_content_type(sniff_body)
+    end
+    if body_looks_like_html(sniff_body) then
+        return page_cache_html_content_type(sniff_body)
+    end
+    if request_looks_like_top_level_document() and uri_typically_html_document() and body_looks_like_html(sniff_body) then
+        return page_cache_html_content_type(sniff_body)
     end
     return nil
 end
 
-local function repair_generic_content_type_if_needed(data)
+-- 返回实际应对浏览器输出的正文（gzip + octet-stream 时可能改为解压后的字符串）
+local function repair_generic_content_type_and_body(data)
+    local raw = data.content
+    local sniff = cache_gunzip_if_gzip(raw)
     local ct = ngx.header["Content-Type"]
     if not content_type_is_generic_binary(ct) then
-        return
+        return raw
     end
-    local fixed = infer_content_type_when_generic_binary(data)
-    if fixed then
-        ngx.header["Content-Type"] = fixed
+    local fixed = infer_content_type_when_generic_binary(data, sniff)
+    if not fixed then
+        return raw
     end
+    ngx.header["Content-Type"] = fixed
+    if sniff ~= raw then
+        return sniff
+    end
+    return raw
 end
 
 local function cache_debug_enabled()
@@ -429,15 +531,15 @@ local function resolve_cache_site(explicit_site)
     return ""
 end
 
--- Function to get cached content（与整页缓存共用 Hash + field；可选 explicit_site 用于无 ngx 上下文）
-local function get_cached_content(uri, query_string, explicit_site)
+-- Function to get cached content（与整页缓存共用 Hash + field；可选 explicit_site / explicit_ua）
+local function get_cached_content(uri, query_string, explicit_site, explicit_ua)
     local client = get_redis_client()
     if not client then
         cache_log(ngx.ERR, "get_client_nil", "Redis client nil")
         return nil
     end
     local main_key = get_page_cache_hash_key()
-    local field = cache_page_field_hex_for(resolve_cache_site(explicit_site), uri, query_string)
+    local field = cache_page_field_hex_for(resolve_cache_site(explicit_site), uri, query_string, explicit_ua)
     local trace = main_key .. "#" .. key_trace(CACHE_PREFIX .. field)
     local cached_data, err = client:hget(main_key, field)
     if not cached_data or cached_data == ngx.null then
@@ -458,7 +560,7 @@ local function get_cached_content(uri, query_string, explicit_site)
 end
 
 -- Function to set cache content
-local function set_cached_content(uri, query_string, content, ttl, explicit_site)
+local function set_cached_content(uri, query_string, content, ttl, explicit_site, explicit_ua)
     local client = get_redis_client()
     if not client then
         cache_log(ngx.ERR, "set_client_nil", "Redis client nil")
@@ -470,7 +572,7 @@ local function set_cached_content(uri, query_string, content, ttl, explicit_site
         return
     end
     local main_key = get_page_cache_hash_key()
-    local field = cache_page_field_hex_for(resolve_cache_site(explicit_site), uri, query_string)
+    local field = cache_page_field_hex_for(resolve_cache_site(explicit_site), uri, query_string, explicit_ua)
     local trace = main_key .. "#" .. key_trace(CACHE_PREFIX .. field)
     local payload_tbl = {}
     for k, v in pairs(content) do
@@ -487,12 +589,12 @@ local function set_cached_content(uri, query_string, content, ttl, explicit_site
     end
 end
 
--- Function to delete cache
-local function delete_cache(uri, query_string, explicit_site)
+-- Function to delete cache（仅删除当前 UA 分桶；要清整站用 clear_all_cache）
+local function delete_cache(uri, query_string, explicit_site, explicit_ua)
     local client = get_redis_client()
     if not client then return end
     local main_key = get_page_cache_hash_key()
-    local field = cache_page_field_hex_for(resolve_cache_site(explicit_site), uri, query_string)
+    local field = cache_page_field_hex_for(resolve_cache_site(explicit_site), uri, query_string, explicit_ua)
     client:hdel(main_key, field)
 end
 
@@ -595,11 +697,11 @@ local function try_access_cache_hit()
             end
         end
     end
-    repair_generic_content_type_if_needed(data)
-    ngx.header["Content-Length"] = tostring(#data.content)
+    local body_out = repair_generic_content_type_and_body(data)
+    ngx.header["Content-Length"] = tostring(#body_out)
     stash_shellstack_cache_state("HIT", "served_from_redis", CACHE_PREFIX .. field)
-    cache_log_op("access_hit", "key=", trace, " body_bytes=", tostring(#data.content))
-    ngx.print(data.content)
+    cache_log_op("access_hit", "key=", trace, " body_bytes=", tostring(#body_out))
+    ngx.print(body_out)
     ngx.exit(ngx.HTTP_OK)
 end
 
