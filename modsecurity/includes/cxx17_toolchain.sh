@@ -1,8 +1,9 @@
 #!/bin/bash
 # ModSecurity v3 的 configure 强制要求 C++17（AX_CXX_COMPILE_STDCXX 17）。
-# RHEL/CentOS 7 默认 GCC 4.8 不支持，需在构建前启用 devtoolset（GCC 9+）。
+# RHEL/CentOS 7 默认 GCC 4.8 不支持，需在构建前启用 devtoolset（GCC 8+）。
 
-# EL7：CentOS 7 已 EOL，默认 yum 源常缺 centos-release-scl；尝试 vault 直装 RPM，并依次尝试 devtoolset-11/10/9。
+# EL7：CentOS 7 已 EOL，mirror.centos.org 常不可用；依次尝试官方 yum → extras RPM → 写入 vault SCLo 仓库后再装 devtoolset。
+
 _cxx17_el7_try_install_scl_release() {
   local pkg_install="$1"
   if rpm -q centos-release-scl-rh >/dev/null 2>&1; then
@@ -13,12 +14,34 @@ _cxx17_el7_try_install_scl_release() {
   fi
   warn "从当前 yum 源安装 centos-release-scl 失败（CentOS 7 EOL 后常见），尝试 vault.centos.org 的 extras RPM..."
   local vbase="https://vault.centos.org/centos/7/extras/x86_64/Packages"
-  # 常见命名；若 404 可改版本号或手工下载后 yum localinstall
   local scl_rpm="${vbase}/centos-release-scl-2-3.el7.centos.noarch.rpm"
   local scl_rh_rpm="${vbase}/centos-release-scl-rh-2-3.el7.centos.noarch.rpm"
-  eval "$pkg_install" "$scl_rpm" >>"$LOG_FILE" 2>&1 || true
-  eval "$pkg_install" "$scl_rh_rpm" >>"$LOG_FILE" 2>&1 || true
+  # 须整段 eval，否则 URL 不会传给 yum
+  eval "$pkg_install $scl_rpm" >>"$LOG_FILE" 2>&1 || true
+  eval "$pkg_install $scl_rh_rpm" >>"$LOG_FILE" 2>&1 || true
   rpm -q centos-release-scl-rh >/dev/null 2>&1
+}
+
+# 不依赖 centos-release-scl-rh 是否安装成功：直接指向 vault 上仍保留的 SCLo rh 包目录
+_cxx17_el7_write_vault_sclo_rh_repo() {
+  local f=/etc/yum.repos.d/shellstack-vault-centos7-sclo-rh.repo
+  if [[ -f "$f" ]] && grep -q 'vault.centos.org/centos/7/sclo' "$f" 2>/dev/null; then
+    return 0
+  fi
+  warn "写入 fallback 仓库（vault SCLo rh），用于 EOL 后仍安装 devtoolset: $f"
+  cat > "$f" <<'EOF'
+[shellstack-vault-centos7-sclo-rh]
+name=ShellStack fallback — CentOS 7 SCLo rh (vault.centos.org)
+baseurl=https://vault.centos.org/centos/7/sclo/$basearch/rh/
+enabled=1
+gpgcheck=0
+repo_gpgcheck=0
+# gpg 在 EOL/最小化系统上常缺失 SIG key；仅用于本机编译工具链
+EOF
+  if command -v yum >/dev/null 2>&1; then
+    yum clean all >>"$LOG_FILE" 2>&1 || true
+  fi
+  return 0
 }
 
 _cxx17_el7_enable_devtoolset() {
@@ -43,6 +66,18 @@ _cxx17_el7_install_one_devtoolset() {
     fi
   fi
   return 1
+}
+
+_cxx17_el7_try_devtoolset_versions() {
+  local pkg_install="$1"
+  local ok=0
+  for n in 11 10 9 8; do
+    if _cxx17_el7_install_one_devtoolset "$pkg_install" "$n"; then
+      ok=1
+      break
+    fi
+  done
+  [[ "$ok" -eq 1 ]]
 }
 
 # 可被 main.sh 流程（已设置 PKG_INSTALL / SYSTEM_TYPE）或独立 install.sh 调用；
@@ -105,17 +140,27 @@ EOF
     log "在 EL 7 上安装 Software Collections（devtoolset）以提供 C++17..."
     _cxx17_el7_try_install_scl_release "$pkg_install" || true
     if ! rpm -q centos-release-scl-rh >/dev/null 2>&1; then
-      warn "仍未检测到 centos-release-scl-rh。若为 RHEL 7 请用订阅源启用 rh scl；若为其它 EL7 克隆请配置与 CentOS 7 vault 等价的 extras/SCL 仓库。"
+      warn "仍未检测到 centos-release-scl-rh，将尝试 vault 直链仓库（不依赖该包）。"
     fi
+
     local ok_ds=0
-    for n in 11 10 9; do
-      if _cxx17_el7_install_one_devtoolset "$pkg_install" "$n"; then
+    if _cxx17_el7_try_devtoolset_versions "$pkg_install"; then
+      ok_ds=1
+    else
+      _cxx17_el7_write_vault_sclo_rh_repo
+      if _cxx17_el7_try_devtoolset_versions "$pkg_install"; then
         ok_ds=1
-        break
       fi
-    done
+    fi
+
     if [[ "$ok_ds" -ne 1 ]]; then
-      error "无法在 EL 7 上安装 devtoolset（已尝试 11/10/9）。CentOS 7 自带 GCC 4.8 不能编译 ModSecurity v3。请任选其一：(1) 按日志检查 yum 源，手工安装: yum install -y centos-release-scl centos-release-scl-rh && yum install -y devtoolset-11-gcc-c++，再执行 source /opt/rh/devtoolset-11/enable 后重跑；(2) 使用 vault.centos.org 替换/补充 7.x 仓库；(3) 升级到 Rocky Linux 8/9 等新发行版。"
+      {
+        echo "---- yum repolist (诊断) ----"
+        yum repolist all 2>&1 || true
+        echo "---- 尝试列出 devtoolset（诊断） ----"
+        yum list available 'devtoolset-*-gcc-c++' 2>&1 | head -40 || true
+      } >>"$LOG_FILE" 2>&1 || true
+      error "无法在 EL 7 上安装 devtoolset（已尝试 11/10/9/8，且已尝试 vault SCLo 仓库）。请查看: $LOG_FILE 末尾诊断。可手工执行: (1) cat /etc/yum.repos.d/*.repo | grep -E baseurl|mirrorlist (2) curl -I https://vault.centos.org/centos/7/sclo/x86_64/rh/repodata/repomd.xml (3) 或升级到 Rocky Linux 8/9。"
     fi
   elif [[ "$sys_type" == "debian" ]]; then
     error "g++ 版本过旧，不支持 C++17。安装较新的 g++（例如 g++-9 或更高）或升级发行版后再运行本脚本。"
