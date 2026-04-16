@@ -543,13 +543,13 @@ _btwaf_overlay_repo_lua_files() {
   chmod 644 "$dest/body.lua" "$dest/lib/cache.lua" "$dest/waf.lua" 2>/dev/null || true
 }
 
-# 官方 waf.lua 仅在末尾 pcall(btwaf_run)；与 lib/cache.lua 配套须在每请求最先尝试 Redis 命中。
-# 优先在「local function btwaf_run()」之前注入（与宝塔 9.x 官方结构一致，制表符/空格均可）；失败再尝试 pcall 锚点。
+# 官方 waf.lua 仅在末尾 pcall(btwaf_run)。页缓存 try_access_cache_hit 必须在 btwaf_run 成功之后调用，
+# 否则 Redis HIT 会 ngx.exit(200) 并跳过整段宝塔 WAF。注入位置：将「if not ok then ... end」改为带 else 分支。
 _btwaf_ensure_waf_cache_hit_hook() {
   local waf="$BTWAF_INSTALL_DIR/waf.lua"
   [[ -f "$waf" ]] || return 0
-  if grep -q 'shellstack_cache_access' "$waf" 2>/dev/null; then
-    log "waf.lua 已含 shellstack_cache_access，跳过注入"
+  if grep -q 'shellstack_page_cache_after_btwaf' "$waf" 2>/dev/null; then
+    log "waf.lua 已将页缓存置于 WAF 之后（shellstack_page_cache_after_btwaf），跳过注入"
     return 0
   fi
   _btwaf_chattr_unlock_path "$waf"
@@ -558,18 +558,23 @@ _btwaf_ensure_waf_cache_hit_hook() {
     return 0
   fi
   perl -0777 -i -pe '
-BEGIN {
-  $inj = qq{\n-- shellstack_cache_access (auto: shellstack --extend-btwaf-cache)\ndo\n    local _ok, _c = pcall(require, "cache")\n    if not _ok then\n        ngx.log(ngx.ERR, "[shellstack-cache] require cache failed: ", tostring(_c))\n    elseif _c and type(_c.try_access_cache_hit) == "function" then\n        _c.try_access_cache_hit()\n    end\nend\n};
-}
-unless (s/(\R)(local\s+function\s+btwaf_run\s*\(\s*\)\R)/$1$inj$2/s) {
-  s/(\R)(local\s+ok\s*,\s*error\s*=\s*pcall\s*\(\s*function\s*\(\s*\)\R)/$1$inj$2/s;
-}
-' "$waf" 2>>"$LOG_FILE" || true
-  if grep -q 'shellstack_cache_access' "$waf" 2>/dev/null; then
-    log "已向 $waf 注入 shellstack_cache_access（btwaf_run 前或 pcall 前）"
+  BEGIN {
+    $else_blk = qq{\nelse\n    -- shellstack_page_cache_after_btwaf (auto: shellstack --extend-btwaf-cache)\n    do\n        local _ok, _c = pcall(require, "cache")\n        if not _ok then\n            ngx.log(ngx.ERR, "[shellstack-cache] require cache failed: ", tostring(_c))\n        elseif _c and type(_c.try_access_cache_hit) == "function" then\n            _c.try_access_cache_hit()\n        end\n    end};
+  }
+  # 去掉旧版「btwaf_run 之前」注入块，避免重复 try_access 且旁路 WAF
+  s{\R-- shellstack_cache_access[^\R]*\Rdo\R    local _ok, _c = pcall\(require, "cache"\)[\s\S]*?\Rend\R}{}s;
+  # 在「if not ok … btwaf_access … end」与文件末尾「end」之间插入 else 分支（兼容 180/360 等 TTL 与中间注释行）
+  s{(if not ok then\s*\R(?:[^\R]*\R)*?\s*if not ngx\.shared\.spider:get\("btwaf_access"\) then\s*\R\s*Public\.logs\(error\)\s*\R\s*ngx\.shared\.spider:set\("btwaf_access",1,\d+\)\s*\R\s*end\s*\R)(end\s*\z)}{$1$else_blk\R$2}s
+    or die "shellstack_waf_inject_no_match\n";
+' "$waf" 2>>"$LOG_FILE" || {
+    warn "无法在 $waf 自动注入页缓存（未识别宝塔 pcall 尾部或 perl 失败）。请用仓库 btwaf-ext/btwaf/waf.lua 覆盖后重试。"
+    return 0
+  }
+  if grep -q 'shellstack_page_cache_after_btwaf' "$waf" 2>/dev/null; then
+    log "已向 $waf 注入 shellstack_page_cache_after_btwaf（pcall 成功后，WAF 之后）"
     return 0
   fi
-  warn "无法在 $waf 自动注入 shellstack_cache_access（未匹配 local function btwaf_run 或 local ok,error = pcall）。请用仓库 btwaf-ext/btwaf/waf.lua 覆盖后重试。"
+  warn "waf.lua 注入后未找到 shellstack_page_cache_after_btwaf 标记，请检查 $waf"
 }
 
 _btwaf_legacy_tarball_bundle() {

@@ -16,16 +16,8 @@ if not ngx.shared.spider:get("works"..worker_pid) then
     ngx.timer.every(60,Public.insert_request_total)-- 60秒更新一次规则命中记录
 end
 
--- shellstack_cache_access（与官方 waf 结构一致：在 btwaf_run 定义之前执行，每请求优先尝试 Redis 页缓存）
-do
-    local _ok, _c = pcall(require, "cache")
-    if not _ok then
-        ngx.log(ngx.ERR, "[shellstack-cache] require cache failed: ", tostring(_c))
-    elseif _c and type(_c.try_access_cache_hit) == "function" then
-        _c.try_access_cache_hit()
-    end
-end
-
+-- shellstack 页缓存：必须在 btwaf_run 之后尝试命中。
+-- 若在文件顶部 try_access_cache_hit，则 Redis HIT 会 ngx.exit(200)，整段 WAF（黑白名单、CC、规则等）被跳过，等同旁路官方防火墙。
 local function btwaf_run()
     local time_str = ngx.localtime()
     ngx.ctx.white_rule=false
@@ -229,6 +221,16 @@ if not ok then
    if not ngx.shared.spider:get("btwaf_access") then 
         Public.logs(error)
         ngx.shared.spider:set("btwaf_access",1,360)
+    end
+else
+    -- shellstack_page_cache_after_btwaf（供部署脚本识别；页缓存须在 WAF 之后）
+    do
+        local _ok, _c = pcall(require, "cache")
+        if not _ok then
+            ngx.log(ngx.ERR, "[shellstack-cache] require cache failed: ", tostring(_c))
+        elseif _c and type(_c.try_access_cache_hit) == "function" then
+            _c.try_access_cache_hit()
+        end
     end
 end
 

@@ -5,6 +5,9 @@
 -- 响应头：在 access 写入 ngx.ctx.shellstack_cache，在 header_filter 调用 apply_header_filter_headers()
 -- 再写 X-Shellstack-*（避免 proxy_pass / fastcgi 上游覆盖 access 阶段 ngx.header）。
 -- body 写入 Redis 仍无法在本响应头体现；首 MISS、次 HIT 即正常。
+--
+-- 执行顺序（重要）：try_access_cache_hit 由 waf.lua 在 btwaf_run() 成功返回之后调用。
+-- 若早于 WAF 命中并 ngx.exit，会跳过宝塔整段防火墙逻辑（与「仅缓存已放行响应」相悖）。
 -- 关闭响应头：SHELLSTACK_CACHE_HEADERS=0
 -- 排障：每请求 NOTICE 日志 SHELLSTACK_CACHE_TRACE=1（须 nginx env）
 -- Redis：默认 127.0.0.1:6379；可设 SHELLSTACK_REDIS_HOST / SHELLSTACK_REDIS_PORT / SHELLSTACK_REDIS_DB（nginx 主配置须 env 指令声明）
