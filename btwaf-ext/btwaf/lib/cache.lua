@@ -56,6 +56,10 @@ end
 local CACHE_KEY_PREFIX = "btwaf_cms_cache:"
 local PAGE_CACHE_TTL_SECONDS = 180
 local PAGE_CACHE_SIGN_COMPONENTS = { "site", "uri", "args" }
+-- 无扩展名 URL 在误标 application/octet-stream 时按「网页」做路径兜底（子串匹配 ngx.var.uri，plain find）。
+-- 后台改目录后在此增删即可，无需改业务逻辑；设为空表 {} 则仅依赖 .php/.html 等内置规则。
+-- 默认含 "/e/" 兼容常见帝国 CMS 伪静态；若站点不用可删掉或换成实际前缀（如 "/yourapp/extend/"）。
+local PAGE_CACHE_HTML_PATH_HINTS = { "/e/" }
 
 local redis_missing_logged = false
 
@@ -455,6 +459,18 @@ local function request_looks_like_top_level_document()
 end
 
 -- 常见整页 URL（用于 octet-stream + 浏览器导航时兜底为 HTML，避免「变成下载」）
+local function uri_matches_html_path_hints(uri)
+    if type(uri) ~= "string" or uri == "" then
+        return false
+    end
+    for _, hint in ipairs(PAGE_CACHE_HTML_PATH_HINTS) do
+        if type(hint) == "string" and hint ~= "" and string.find(uri, hint, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
 local function uri_typically_html_document()
     local uri = ngx.var.uri or ""
     if uri == "/" then
@@ -467,6 +483,9 @@ local function uri_typically_html_document()
         return true
     end
     if string.find(uri, ".asp", 1, true) or string.find(uri, ".jsp", 1, true) then
+        return true
+    end
+    if uri_matches_html_path_hints(uri) then
         return true
     end
     return false
@@ -526,6 +545,10 @@ local function infer_content_type_when_generic_binary(data, sniff_body)
     end
     if request_looks_like_top_level_document() and uri_typically_html_document() and body_looks_like_html(sniff_body) then
         return page_cache_html_content_type(sniff_body)
+    end
+    -- 空正文无法嗅探标签；路径已表明是常见 CMS/PHP 路由时，勿让 octet-stream 触发「下载」
+    if type(sniff_body) == "string" and #sniff_body == 0 and uri_typically_html_document() then
+        return "text/html; charset=utf-8"
     end
     return nil
 end
@@ -589,6 +612,13 @@ local function normalize_page_cache_payload_before_store(headers, whole)
             headers[hk_ct] = page_cache_html_content_type(body)
         else
             headers["Content-Type"] = page_cache_html_content_type(body)
+        end
+    end
+    if type(whole) == "string" and #whole == 0 and uri_typically_html_document() and content_type_is_generic_binary(ct_raw) then
+        if hk_ct then
+            headers[hk_ct] = "text/html; charset=utf-8"
+        else
+            headers["Content-Type"] = "text/html; charset=utf-8"
         end
     end
     return body

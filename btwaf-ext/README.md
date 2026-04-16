@@ -31,7 +31,7 @@ BTwaf 在 `init.lua` 中通过 `cache = require "cache"` 加载 **`btwaf/lib/cac
 
 ### 与配置的关系
 
-`btwaf/lib/config.lua` 中另有 **cache 相关配置项**（如 `prefix`、`default_ttl`、`max_ttl`），与面板 JSON 配置配合使用；`cache.lua` 内 Redis 连接以环境变量 **`SHELLSTACK_REDIS_*`** 为准；页缓存键前缀、签名段、默认 TTL 在 **`cache.lua` 顶部常量**中修改。
+`btwaf/lib/config.lua` 中另有 **cache 相关配置项**（如 `prefix`、`default_ttl`、`max_ttl`），与面板 JSON 配置配合使用；`cache.lua` 内 Redis 连接以环境变量 **`SHELLSTACK_REDIS_*`** 为准；页缓存键前缀、签名段、默认 TTL、**`PAGE_CACHE_HTML_PATH_HINTS`**（无扩展名但应按网页兜底的 URI 子串表，后台改目录时改此表即可）在 **`cache.lua` 顶部常量**中修改。
 
 ### 依赖
 
