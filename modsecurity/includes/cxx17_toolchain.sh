@@ -160,7 +160,7 @@ EOF
         echo "---- 尝试列出 devtoolset（诊断） ----"
         yum list available 'devtoolset-*-gcc-c++' 2>&1 | head -40 || true
       } >>"$LOG_FILE" 2>&1 || true
-      error "无法在 EL 7 上安装 devtoolset（已尝试 11/10/9/8，且已尝试 vault SCLo 仓库）。请查看: $LOG_FILE 末尾诊断。可手工执行: (1) cat /etc/yum.repos.d/*.repo | grep -E baseurl|mirrorlist (2) curl -I https://vault.centos.org/centos/7/sclo/x86_64/rh/repodata/repomd.xml (3) 或升级到 Rocky Linux 8/9。"
+      error "无法在 EL 7 上安装 devtoolset（已尝试 11/10/9/8，且已尝试 vault SCLo 仓库）。若 yum 报 mirrorlist.centos.org 无法解析，请先以 root 执行: bash modsecurity/includes/centos7_eol_yum_vault_fix.sh（将系统 repo 切到 vault），再重跑安装。详情见: $LOG_FILE 末尾诊断。亦可升级到 Rocky Linux 8/9。"
     fi
   elif [[ "$sys_type" == "debian" ]]; then
     error "g++ 版本过旧，不支持 C++17。安装较新的 g++（例如 g++-9 或更高）或升级发行版后再运行本脚本。"

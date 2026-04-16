@@ -232,6 +232,7 @@ download_module_dependencies() {
     "os_check.sh"
     "require_packages.sh"
     "cxx17_toolchain.sh"
+    "centos7_eol_yum_vault_fix.sh"
     "lib_paths.sh"
     "modsecurity_clone.sh"
     "modsecurity_clone_env.sh"

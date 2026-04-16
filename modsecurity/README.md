@@ -24,6 +24,16 @@ mosecurity/
 
 ## 🚀 快速开始
 
+### CentOS 7（已 EOL）yum 无法解析 mirrorlist.centos.org
+
+若出现 `Could not resolve host: mirrorlist.centos.org` 或 `Cannot find a valid baseurl for repo: centos-sclo-sclo`，请先执行（**root**）：
+
+```bash
+sudo bash includes/centos7_eol_yum_vault_fix.sh
+```
+
+脚本会把 `/etc/yum.repos.d` 里仍指向 `mirror.centos.org` / `mirrorlist.centos.org` 的配置改为 **`vault.centos.org`**，并备份原文件。然后再执行 `yum install` 或本仓库 `main.sh`。
+
 ### 基本安装
 
 ```bash
