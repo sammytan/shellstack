@@ -32,7 +32,13 @@ mosecurity/
 sudo bash includes/centos7_eol_yum_vault_fix.sh
 ```
 
-脚本会把 `/etc/yum.repos.d` 里仍指向 `mirror.centos.org` / `mirrorlist.centos.org` 的配置改为 **`vault.centos.org`**，并备份原文件。然后再执行 `yum install` 或本仓库 `main.sh`。
+默认把 `mirror.centos.org` 换成 **阿里云** `mirrors.aliyun.com/centos-vault/centos`（国内一般更快）。要用海外官方归档（无公共 Google yum 源，等同于 vault）：
+
+```bash
+sudo CENTOS7_YUM_MIRROR=vault bash includes/centos7_eol_yum_vault_fix.sh
+```
+
+可选：`CENTOS7_YUM_MIRROR=tsinghua`。脚本会备份 `.repo` 后再改，并执行 `yum makecache`。然后再执行 `yum install` 或本仓库 `main.sh`。
 
 ### 基本安装
 
