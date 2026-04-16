@@ -25,17 +25,25 @@ _baota_detect_nginx_bin() {
 }
 
 _baota_detect_nginx_setup_path() {
+  # 与真实 sbin/nginx 同前缀的目录最可靠（避免 /www/server/nginx 与 /www/server/nginx/nginx 各有一份 version_check.pl 时读到陈旧那份）
+  local bin d
+  bin="$(_baota_detect_nginx_bin 2>/dev/null)" || true
+  if [[ -n "$bin" ]]; then
+    d="$(cd "$(dirname "$bin")/.." 2>/dev/null && pwd)"
+    if [[ -n "$d" && -d "$d" ]]; then
+      echo "$d"
+      return 0
+    fi
+  fi
   local candidates=(
     "/www/server/nginx/nginx"
     "/www/server/nginx"
   )
   local p
-  # 优先返回真正的运行目录（含 version_check.pl 或 sbin/nginx）
   for p in "${candidates[@]}"; do
     [[ -f "${p}/version_check.pl" ]] && { echo "$p"; return 0; }
     [[ -x "${p}/sbin/nginx" ]] && { echo "$p"; return 0; }
   done
-  # 兜底返回存在的目录
   for p in "${candidates[@]}"; do
     [[ -d "$p" ]] && { echo "$p"; return 0; }
   done
@@ -90,24 +98,38 @@ _baota_run_panel_nginx_build() {
   return 0
 }
 
-# version_check.pl 首行通常为 openresty-x.y.z...，与宝塔版本键 openresty / openresty127 仅要求「是 OpenResty」即可
+# version_check.pl 与 nginx -v：可能是 openresty-1.x、openresty/1.x、OpenResty 等；旧逻辑只认「openresty-」易误判已成功的安装
 _baota_version_line_is_openresty() {
   local line="$1"
   local lc
   lc="$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')"
-  [[ "$lc" == *openresty-* ]]
+  [[ "$lc" == *openresty* ]]
+}
+
+# 以正在使用的二进制为准（install_soft 成功后立刻验更可靠）
+_baota_bin_reports_openresty() {
+  local bin="$1"
+  [[ -x "$bin" ]] || return 1
+  local out lc
+  out="$("$bin" -v 2>&1)" || return 1
+  lc="$(printf '%s' "$out" | tr '[:upper:]' '[:lower:]')"
+  [[ "$lc" == *openresty* ]]
 }
 
 _baota_version_matches_request() {
   local want="$1"
-  local setup_path
-  setup_path="$(_baota_detect_nginx_setup_path 2>/dev/null)" || return 1
-  local vchk="${setup_path}/version_check.pl"
-  [[ -f "$vchk" ]] || return 1
-  local line
-  line="$(head -1 "$vchk" | tr -d '[:space:]')"
   case "$want" in
     openresty127|openresty)
+      local nginx_bin
+      nginx_bin="$(_baota_detect_nginx_bin 2>/dev/null || true)"
+      if [[ -n "$nginx_bin" ]] && _baota_bin_reports_openresty "$nginx_bin"; then
+        return 0
+      fi
+      local setup_path vchk line
+      setup_path="$(_baota_detect_nginx_setup_path 2>/dev/null)" || return 1
+      vchk="${setup_path}/version_check.pl"
+      [[ -f "$vchk" ]] || return 1
+      line="$(grep -m1 -v '^[[:space:]]*$' "$vchk" 2>/dev/null | tr -d '[:space:]')"
       _baota_version_line_is_openresty "$line"
       ;;
     *)
@@ -215,11 +237,17 @@ _baota_skip_openresty_rebuild_if_current() {
   [[ -f "$vchk" ]] || return 1
 
   local line
-  line=$(head -1 "$vchk" | tr -d '[:space:]')
+  line="$(grep -m1 -v '^[[:space:]]*$' "$vchk" 2>/dev/null | tr -d '[:space:]')"
 
   case "$want" in
     openresty127|openresty)
-      _baota_version_line_is_openresty "$line" || return 1
+      if _baota_version_line_is_openresty "$line"; then
+        :
+      elif _baota_bin_reports_openresty "$nginx_bin"; then
+        :
+      else
+        return 1
+      fi
       ;;
     *)
       return 1
