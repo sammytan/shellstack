@@ -6,6 +6,22 @@
 
 # 安装基础工具
 install_basic_tools() {
+  local miss=0
+  for cmd in gcc g++ make wget tar gzip git; do
+    command -v "$cmd" >/dev/null 2>&1 || miss=1
+  done
+  if [[ "$SYSTEM_TYPE" == "debian" ]]; then
+    if ! command -v ifup >/dev/null 2>&1 && [[ ! -x /sbin/ifup ]]; then
+      miss=1
+    fi
+  fi
+  if [[ "$miss" -eq 0 ]]; then
+    log "基础工具已就绪（gcc、g++、make、wget、tar、gzip、git 等），跳过安装"
+    GCC_VERSION=$(gcc --version 2>/dev/null | head -n1 | awk '{print $3}' | cut -d. -f1 || echo "unknown")
+    log "检测到 GCC 版本: $GCC_VERSION"
+    return 0
+  fi
+
   log "安装基础工具..."
 
   eval "$PKG_UPDATE" >> "$LOG_FILE" 2>&1

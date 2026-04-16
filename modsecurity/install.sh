@@ -1209,6 +1209,22 @@ compile_dependencies() {
 
 # 安装基础工具
 install_basic_tools() {
+  local need=0
+  for cmd in gcc g++ make wget tar gzip git; do
+    command -v "$cmd" >/dev/null 2>&1 || need=1
+  done
+  if [ -f /etc/debian_version ]; then
+    if ! command -v ifup >/dev/null 2>&1 && [ ! -x /sbin/ifup ]; then
+      need=1
+    fi
+  fi
+  if [ "$need" -eq 0 ]; then
+    log "基础工具已就绪（gcc、g++、make、wget、tar、gzip、git 等），跳过安装"
+    GCC_VERSION=$(gcc --version 2>/dev/null | head -n1 | awk '{print $3}' | cut -d. -f1)
+    [ -n "$GCC_VERSION" ] && log "检测到 GCC 版本: $GCC_VERSION"
+    return 0
+  fi
+
   log "安装基础工具..."
 
   # 检测系统类型
