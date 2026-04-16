@@ -153,6 +153,21 @@ EOF
       fi
     fi
 
+    # 远程/管道安装时修复脚本与 cxx17 同属 includes/，勿写死 modsecurity/includes 相对路径
+    if [[ "$ok_ds" -ne 1 ]]; then
+      local _inc_dir _yum_fix
+      _inc_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || _inc_dir=""
+      _yum_fix="${_inc_dir}/centos7_eol_yum_vault_fix.sh"
+      if [[ "${EUID:-0}" -eq 0 && -f "$_yum_fix" ]]; then
+        warn "devtoolset 仍失败，自动执行 CentOS 7 yum 源修复后再试: $_yum_fix"
+        bash "$_yum_fix" 2>&1 | tee -a "$LOG_FILE" || true
+        _cxx17_el7_try_install_scl_release "$pkg_install" || true
+        if _cxx17_el7_try_devtoolset_versions "$pkg_install"; then
+          ok_ds=1
+        fi
+      fi
+    fi
+
     if [[ "$ok_ds" -ne 1 ]]; then
       {
         echo "---- yum repolist (诊断) ----"
@@ -160,7 +175,17 @@ EOF
         echo "---- 尝试列出 devtoolset（诊断） ----"
         yum list available 'devtoolset-*-gcc-c++' 2>&1 | head -40 || true
       } >>"$LOG_FILE" 2>&1 || true
-      error "无法在 EL 7 上安装 devtoolset（已尝试 11/10/9/8，且已尝试 vault SCLo 仓库）。若 yum 报 mirrorlist.centos.org 无法解析，请先以 root 执行: bash modsecurity/includes/centos7_eol_yum_vault_fix.sh（将系统 repo 切到 vault），再重跑安装。详情见: $LOG_FILE 末尾诊断。亦可升级到 Rocky Linux 8/9。"
+      local _inc_dir _yum_fix _bu _yum_hint
+      _inc_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || _inc_dir=""
+      _yum_fix="${_inc_dir}/centos7_eol_yum_vault_fix.sh"
+      _bu="${SHELLSTACK_BASE_URL:-${BASE_URL:-https://shellstack.910918920801.xyz}}"
+      _bu="${_bu%/}"
+      if [[ -f "$_yum_fix" ]]; then
+        _yum_hint="以 root 执行（与当前安装脚本同目录下载的 includes）: bash ${_yum_fix}  默认切阿里云；海外可加 CENTOS7_YUM_MIRROR=vault。"
+      else
+        _yum_hint="本机未找到同目录下的 centos7_eol_yum_vault_fix.sh，可从 ShellStack 站点下载: curl -fsSL ${_bu}/modsecurity/includes/centos7_eol_yum_vault_fix.sh -o /tmp/centos7_eol_yum_vault_fix.sh && bash /tmp/centos7_eol_yum_vault_fix.sh"
+      fi
+      error "无法在 EL 7 上安装 devtoolset（已尝试 11/10/9/8、vault SCLo 及可选自动 yum 源修复）。若 yum 报 mirrorlist.centos.org 无法解析或 baseurl 无效：${_yum_hint}  然后重跑本安装。详情见: $LOG_FILE 末尾诊断。亦可升级到 Rocky Linux 8/9。"
     fi
   elif [[ "$sys_type" == "debian" ]]; then
     error "g++ 版本过旧，不支持 C++17。安装较新的 g++（例如 g++-9 或更高）或升级发行版后再运行本脚本。"

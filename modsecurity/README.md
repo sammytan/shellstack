@@ -40,6 +40,13 @@ sudo CENTOS7_YUM_MIRROR=vault bash includes/centos7_eol_yum_vault_fix.sh
 
 可选：`CENTOS7_YUM_MIRROR=tsinghua`。脚本会备份 `.repo` 后再改，并执行 `yum makecache`。然后再执行 `yum install` 或本仓库 `main.sh`。
 
+**仅远程管道安装、本机没有仓库目录时**（把 `BASE_URL` 换成你实际使用的 ShellStack 站点，与 `curl …/shellstack.sh` 一致）：
+
+```bash
+curl -fsSL "${BASE_URL:-https://shellstack.910918920801.xyz}/modsecurity/includes/centos7_eol_yum_vault_fix.sh" -o /tmp/centos7_eol_yum_vault_fix.sh
+sudo bash /tmp/centos7_eol_yum_vault_fix.sh
+```
+
 ### 基本安装
 
 ```bash
