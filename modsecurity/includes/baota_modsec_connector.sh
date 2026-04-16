@@ -73,21 +73,29 @@ _baota_run_panel_nginx_build() {
     return 1
   fi
 
-  # install_soft 有时会忽略版本键回落到默认（如 tengine），这里做强校验并二次重试 update
+  # install_soft 有时会忽略版本键回落到默认（如 tengine），这里校验「是否为 OpenResty」并二次重试 update（不要求与 openresty127 等键逐字对应的小版本）
   if [[ "$ver" == "openresty" || "$ver" == "openresty127" ]]; then
     if ! _baota_version_matches_request "$ver"; then
-      warn "install_soft 返回成功，但实际版本未匹配 ${ver}，尝试 install_soft update 重试一次"
+      warn "install_soft 返回成功，但 version_check.pl 未显示为 OpenResty，尝试 install_soft update 重试一次"
       log "执行: cd ${install_dir} && bash install_soft.sh 3 update nginx ${ver}"
       if ! ( cd "$install_dir" && bash "$BT_PANEL_INSTALL_SOFT_SH" 3 update nginx "${ver}" >>"$LOG_FILE" 2>&1 ); then
         return 1
       fi
       if ! _baota_version_matches_request "$ver"; then
-        warn "install_soft 仍未应用版本键 ${ver}（面板源脚本可能忽略该键，回落到默认版本）"
+        warn "重试后仍未检测到 OpenResty（version_check.pl 首行应含 openresty-；面板可能仍回落到 tengine/官方 nginx）"
         return 1
       fi
     fi
   fi
   return 0
+}
+
+# version_check.pl 首行通常为 openresty-x.y.z...，与宝塔版本键 openresty / openresty127 仅要求「是 OpenResty」即可
+_baota_version_line_is_openresty() {
+  local line="$1"
+  local lc
+  lc="$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')"
+  [[ "$lc" == *openresty-* ]]
 }
 
 _baota_version_matches_request() {
@@ -99,11 +107,8 @@ _baota_version_matches_request() {
   local line
   line="$(head -1 "$vchk" | tr -d '[:space:]')"
   case "$want" in
-    openresty127)
-      [[ "$line" == *openresty-1.27* ]] || [[ "$line" == *openresty-1.28* ]] || [[ "$line" == *openresty-1.29* ]]
-      ;;
-    openresty)
-      [[ "$line" == *openresty-1.25* ]] || [[ "$line" == *openresty-1.24* ]] || [[ "$line" == *openresty-1.23* ]] || [[ "$line" == *openresty-1.26* ]]
+    openresty127|openresty)
+      _baota_version_line_is_openresty "$line"
       ;;
     *)
       return 0
@@ -213,11 +218,8 @@ _baota_skip_openresty_rebuild_if_current() {
   line=$(head -1 "$vchk" | tr -d '[:space:]')
 
   case "$want" in
-    openresty127)
-      [[ "$line" == *openresty-1.27* ]] || [[ "$line" == *openresty-1.28* ]] || [[ "$line" == *openresty-1.29* ]] || return 1
-      ;;
-    openresty)
-      [[ "$line" == *openresty-1.25* ]] || [[ "$line" == *openresty-1.24* ]] || [[ "$line" == *openresty-1.23* ]] || [[ "$line" == *openresty-1.26* ]] || return 1
+    openresty127|openresty)
+      _baota_version_line_is_openresty "$line" || return 1
       ;;
     *)
       return 1
@@ -400,7 +402,7 @@ baota_install_openresty_with_modsecurity_connector() {
     local setup_path cur_ver
     setup_path="$(_baota_detect_nginx_setup_path 2>/dev/null || true)"
     cur_ver="$(head -1 "${setup_path}/version_check.pl" 2>/dev/null | tr -d '\n')"
-    log "当前 OpenResty（version_check.pl: ${cur_ver:-unknown}）已包含 ModSecurity，且与 --bt-openresty=${BT_OPENRESTY_VERSION} 一致，跳过重复执行 nginx.sh update。"
+    log "当前为 OpenResty（version_check.pl: ${cur_ver:-unknown}），nginx -V 已含 ModSecurity；按 --bt-openresty=${BT_OPENRESTY_VERSION} 视为满足（不校验具体 1.27/1.25 等号段），跳过重复 nginx.sh update。"
     log "若需强制重新编译 Nginx，请设置: export MODSECURITY_FORCE_BT_NGINX_REBUILD=1 后重跑。"
     if [[ -n "$nginx_bin" ]] && "$nginx_bin" -V 2>&1 | grep -qi modsecurity; then
       log "验证: nginx -V 已包含 modsecurity"
