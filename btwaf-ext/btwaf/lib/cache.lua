@@ -60,6 +60,11 @@ local PAGE_CACHE_SIGN_COMPONENTS = { "site", "uri", "args" }
 -- 后台改目录后在此增删即可，无需改业务逻辑；设为空表 {} 则仅依赖 .php/.html 等内置规则。
 -- 默认含 "/e/" 兼容常见帝国 CMS 伪静态；若站点不用可删掉或换成实际前缀（如 "/yourapp/extend/"）。
 local PAGE_CACHE_HTML_PATH_HINTS = { "/e/" }
+-- 是否与 Nginx 变量 $skip_cache 联动。宝塔里 $skip_cache 主要给 **FastCGI 缓存**（fastcgi_no_cache / fastcgi_cache_bypass）用。
+-- 默认 **false**：Redis 整页缓存与 FastCGI 缓存**解耦**，二者可同时开；POST/带 Cookie 等仍可按你站点规则绕过 FastCGI，不影响 ShellStack 读写 Redis。
+-- 若希望 Redis 与 FastCGI **共用同一套绕过条件**，改为 true。
+-- 仅跳过 Redis、不动 FastCGI 时：在 Nginx 里对特定 location `set $shellstack_skip_cache 1;`（须先在 server 里 `set $shellstack_skip_cache 0;` 初始化）。
+local PAGE_CACHE_HONOR_NGINX_SKIP_CACHE = false
 
 local redis_missing_logged = false
 
@@ -936,6 +941,21 @@ local function async_redis_setex_page(premature, redis_key, ttl_sec, value)
     cache_log_op("async_set_ok", "key=", key_trace(redis_key), " payload_bytes=", tostring(#value))
 end
 
+-- 返回跳过原因字符串，不跳过则返回 nil（供响应头 X-Shellstack-Cache-Reason）
+local function page_cache_shellstack_skip_reason()
+    local ss = ngx.var.shellstack_skip_cache
+    if ss == "1" or ss == "true" or ss == 1 then
+        return "shellstack_skip_cache_var"
+    end
+    if PAGE_CACHE_HONOR_NGINX_SKIP_CACHE == true then
+        local sk = ngx.var.skip_cache
+        if sk == "1" or sk == "true" or sk == 1 then
+            return "skip_cache_var"
+        end
+    end
+    return nil
+end
+
 -- 供 body_filter 在拼装完整响应体后异步写入 Redis（GET 200、非白名单）
 -- access 阶段：与 schedule_body_page_cache 使用同一 Redis 键；命中则 ngx.exit(200)，未命中返回（继续 WAF）
 local function try_access_cache_hit()
@@ -946,9 +966,9 @@ local function try_access_cache_hit()
         stash_shellstack_cache_state("SKIP", "method_not_get", nil)
         return
     end
-    local sk = ngx.var.skip_cache
-    if sk == "1" or sk == "true" or sk == 1 then
-        stash_shellstack_cache_state("SKIP", "skip_cache_var", nil)
+    local skip_rs = page_cache_shellstack_skip_reason()
+    if skip_rs then
+        stash_shellstack_cache_state("SKIP", skip_rs, nil)
         return
     end
     if not redis_available() then
@@ -1007,6 +1027,7 @@ local function schedule_body_page_cache(ttl, whole)
     if ngx.req.get_method() ~= "GET" then return end
     if ngx.status ~= 200 then return end
     if ngx.ctx.white_rule then return end
+    if page_cache_shellstack_skip_reason() then return end
     local headers = {}
     for k, v in pairs(ngx.header) do
         if not page_cache_header_should_skip(k) then

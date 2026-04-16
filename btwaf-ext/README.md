@@ -8,7 +8,7 @@
    `https://<你的站点>/btwaf-ext/btwaf/lib/cache.lua`  
    脚本在本地找不到目录时会自动 **curl/wget 下载**；④ 仅缺 `cache.lua` 时可设 **`SHELLSTACK_BTWAF_CACHE_LUA_URL`** 为单文件直链（如 GitHub raw）。
 2. 执行 ModSecurity 主脚本的 `--extend-btwaf-cache`：脚本会依次运行 **`/www/server/panel/plugin/btwaf/install.sh install`**（需已安装面板「宝塔网站防火墙」插件）、通过 **`install_soft.sh` 安装 Redis**（若 6379 未就绪）、再将 **`btwaf-ext/btwaf`** 中的 **`lib/cache.lua`、`body.lua`、`waf.lua`** 覆盖到 **`/www/server/btwaf`**（若未带 `waf.lua` 会尝试向官方 `waf.lua` **自动注入** access 缓存命中块），并在 **`nginx` 的 `btwaf.conf`** 中按需加入 `lua_shared_dict cache_shared 5000m;`，在 **`init.lua`** 中若无则自动插入 `cache = require "cache"`（支持 sed / perl，无需手改）。
-3. **部署后即用**：`lib/cache.lua` 提供 **`try_access_cache_hit`**（access 阶段读 Redis，键与 body 阶段写入一致）与 **`schedule_body_page_cache`**（body_filter 异步写）；`waf.lua` 在 `pcall(btwaf_run)` 之前调用前者，无需再改 `header.lua`。注意：命中在 **WAF 主逻辑之前**执行以降低延迟；若需先过拦截再缓存，需在业务上自行调整顺序或使用 `skip_cache` 等变量。
+3. **部署后即用**：`lib/cache.lua` 提供 **`try_access_cache_hit`**（access 阶段读 Redis，键与 body 阶段写入一致）与 **`schedule_body_page_cache`**（body_filter 异步写）；`waf.lua` 在 `pcall(btwaf_run)` 之前调用前者，无需再改 `header.lua`。默认 **Redis 页缓存不读宝塔的 `$skip_cache`**，可与 **FastCGI 缓存**同时开（FastCGI 仍用 `$skip_cache` 绕过）；仅跳过 Redis 时在站点 `server` 内初始化 `set $shellstack_skip_cache 0;`，需要处再 `set $shellstack_skip_cache 1;`。若要让 Redis 与 FastCGI 共用绕过条件，在 `cache.lua` 设 **`PAGE_CACHE_HONOR_NGINX_SKIP_CACHE = true`**。
 4. **不建议**整目录替换官方 WAF；若必须用旧版 `btwaf.tar.gz` 全量包，可设 **`SHELLSTACK_BTWAF_LEGACY_TARBALL=1`**（仍建议随后再 overlay 扩展文件）。
 
 ## 内置缓存 Lua 模块（`btwaf/lib/cache.lua`）
@@ -31,7 +31,7 @@ BTwaf 在 `init.lua` 中通过 `cache = require "cache"` 加载 **`btwaf/lib/cac
 
 ### 与配置的关系
 
-`btwaf/lib/config.lua` 中另有 **cache 相关配置项**（如 `prefix`、`default_ttl`、`max_ttl`），与面板 JSON 配置配合使用；`cache.lua` 内 Redis 连接以环境变量 **`SHELLSTACK_REDIS_*`** 为准；页缓存键前缀、签名段、默认 TTL、**`PAGE_CACHE_HTML_PATH_HINTS`**（无扩展名但应按网页兜底的 URI 子串表，后台改目录时改此表即可）在 **`cache.lua` 顶部常量**中修改。
+`btwaf/lib/config.lua` 中另有 **cache 相关配置项**（如 `prefix`、`default_ttl`、`max_ttl`），与面板 JSON 配置配合使用；`cache.lua` 内 Redis 连接以环境变量 **`SHELLSTACK_REDIS_*`** 为准；页缓存键前缀、签名段、默认 TTL、**`PAGE_CACHE_HTML_PATH_HINTS`**、**`PAGE_CACHE_HONOR_NGINX_SKIP_CACHE`**（默认 `false`，与 FastCGI 的 `$skip_cache` 解耦；改为 `true` 则与 FastCGI 同步绕过）在 **`cache.lua` 顶部常量**中修改。
 
 ### 依赖
 
