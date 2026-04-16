@@ -266,6 +266,14 @@ ModSecurity 核心库安装脚本
   # 在 main.sh 中仅使用 exporter（关闭默认内核/终端优化）
   $0 --with-exporter=http://consul.example.com:8500 --disable-kernel-opt --disable-terminal
 
+  # 远程：用 ShellStack 拉取并执行本模块（bash -s 后第一项必须是 modsecurity，其余为 main.sh 参数；勿用 bash shellstack.sh）
+  curl -fsSL https://shellstack.example/shellstack.sh | sudo bash -s modsecurity --bt-openresty=openresty127 --deploy-conf --extend-btwaf-cache --with-exporter=http://consul:8500 --with-consul-token=secret
+  CONSUL_HTTP_TOKEN=secret curl -fsSL https://shellstack.example/shellstack.sh | sudo bash -s modsecurity --with-exporter=http://consul:8500
+
+  # 仅安装 node_exporter + Consul 注册（不跑完整 modsecurity/main.sh）：直接执行 includes/exporter.sh
+  sudo bash /path/to/modsecurity/includes/exporter.sh http://127.0.0.1:8500
+  curl -fsSL https://shellstack.example/modsecurity/includes/exporter.sh | sudo bash -s -- --consul-token=secret http://consul:8500
+
   # 宝塔面板：安装 libmodsecurity、升级 OpenResty 并编译 ModSecurity-nginx，并下发 CRS/自定义规则
   $0 --deploy-conf
 

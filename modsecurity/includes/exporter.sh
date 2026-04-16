@@ -1,7 +1,14 @@
 #!/bin/bash
 # 安装 node exporter 并通过 Consul Agent API 注册服务（供 Prometheus consul_sd 发现）
 # 架构：本机/目标机运行 node_exporter → 注册到 Consul → Prometheus 用 consul_sd_configs 抓取
-# 依赖 shared.sh: log warn error
+#
+# 单独使用本文件（不必跑 main.sh）：
+#   ./exporter.sh http://127.0.0.1:8500
+#   ./exporter.sh --consul-token=SECRET http://consul.example.com:8500
+#   CONSUL_HTTP_TOKEN=secret ./exporter.sh http://127.0.0.1:8500
+# 与 includes 同目录时有 shared.sh 会加载（完整日志）；仅下载本文件时会用简易日志。
+#
+# 被 main.sh 加载时：由 shared.sh 提供 log / warn；直接执行时见文末 _exporter_cli_main
 #
 # 环境变量（可选）：
 #   EXPORTER_LISTEN_PORT      默认 9100
@@ -165,7 +172,7 @@ EOF
   fi
 
   warn "Consul 注册失败 HTTP ${http_code:-?}：${out:-（无响应体）}"
-  warn "请检查 Consul 地址、网络；若启用 ACL 请设置 CONSUL_HTTP_TOKEN 或 main.sh --with-consul-token=..."
+  warn "请检查 Consul 地址、网络；若启用 ACL 请设置 CONSUL_HTTP_TOKEN、本脚本 --consul-token= 或 main.sh --with-consul-token=..."
   warn "或手工执行: PUT ${consul_base}/v1/agent/service/register（Header: X-Consul-Token）"
   return 1
 }
@@ -177,7 +184,7 @@ setup_exporter_and_register() {
     return 1
   fi
   log "=========================================="
-  log "--with-exporter：安装 node_exporter 并注册到 Consul（Prometheus 经 consul_sd 发现）"
+  log "exporter：安装 node_exporter 并注册到 Consul（Prometheus 经 consul_sd 发现）"
   log "=========================================="
 
   local consul_base
@@ -208,3 +215,100 @@ setup_exporter_and_register() {
 #     consul_sd_configs:
 #       - server: '127.0.0.1:8500'
 #         services: ['shellstack-node-exporter']
+
+# ---------------------------------------------------------------------------
+# 直接执行本脚本（不经过 modsecurity/main.sh）
+# ---------------------------------------------------------------------------
+_exporter_cli_usage() {
+  cat <<'EOF'
+用法: exporter.sh [选项] <Consul HTTP 地址>
+  exporter.sh http://127.0.0.1:8500
+  exporter.sh --consul-token=SECRET http://consul.example.com:8500
+
+与 main.sh 相同的环境变量仍可用：CONSUL_HTTP_ADDR、CONSUL_HTTP_TOKEN、EXPORTER_LISTEN_PORT、
+CONSUL_SERVICE_NAME、CONSUL_SERVICE_ID、CONSUL_SERVICE_TAGS 等。
+
+选项:
+  -h, --help                  显示本帮助
+  --consul-token=TOKEN        设置 ACL Token（等价 export CONSUL_HTTP_TOKEN）
+  --with-consul-token=TOKEN 同上（与 main.sh 参数名一致）
+
+远程仅拉取本脚本（无 shared.sh 时为简易日志）:
+  curl -fsSL https://<站点>/modsecurity/includes/exporter.sh | sudo bash -s -- http://127.0.0.1:8500
+  curl -fsSL .../exporter.sh | sudo bash -s -- --consul-token=SECRET http://consul:8500
+EOF
+}
+
+_exporter_cli_bootstrap() {
+  local here
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ -f "$here/shared.sh" ]]; then
+    # shellcheck source=shared.sh
+    source "$here/shared.sh"
+  else
+    LOG_FILE="${LOG_FILE:-/tmp/shellstack_exporter.log}"
+    log() {
+      echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+    }
+    warn() {
+      echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] 警告: $*" | tee -a "$LOG_FILE" >&2
+    }
+  fi
+}
+
+# 被 source 时：本文件路径在 BASH_SOURCE[0]，与调用脚本的 $0 不同，不跑 CLI。
+# 直接执行或 curl | bash -s 时：要么 BASH_SOURCE[0]==$0，要么 BASH_SOURCE 为空（stdin 脚本）。
+if [[ -n "${BASH_SOURCE[0]:-}" ]] && [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+  :
+else
+  case "${1:-}" in
+    -h|--help)
+      _exporter_cli_usage
+      exit 0
+      ;;
+  esac
+  _exporter_cli_bootstrap
+  consul_arg=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        _exporter_cli_usage
+        exit 0
+        ;;
+      --consul-token=*|--with-consul-token=*)
+        CONSUL_HTTP_TOKEN="${1#*=}"
+        export CONSUL_HTTP_TOKEN
+        shift
+        ;;
+      --consul-token|--with-consul-token)
+        CONSUL_HTTP_TOKEN="${2:-}"
+        export CONSUL_HTTP_TOKEN
+        shift 2
+        ;;
+      -*)
+        warn "未知选项: $1"
+        _exporter_cli_usage
+        exit 1
+        ;;
+      *)
+        consul_arg="$1"
+        shift
+        break
+        ;;
+    esac
+  done
+  if [[ $# -gt 0 ]]; then
+    warn "多余参数: $*"
+    _exporter_cli_usage
+    exit 1
+  fi
+  if [[ -z "$consul_arg" ]]; then
+    consul_arg="${CONSUL_HTTP_ADDR:-}"
+  fi
+  if [[ -z "$consul_arg" ]]; then
+    warn "请提供 Consul HTTP 地址（参数或环境变量 CONSUL_HTTP_ADDR）"
+    _exporter_cli_usage
+    exit 1
+  fi
+  setup_exporter_and_register "$consul_arg" || exit $?
+fi
