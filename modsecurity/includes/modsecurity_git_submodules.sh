@@ -3,13 +3,14 @@
 # 依赖: modsecurity_clone_env.sh、log/warn/error、LOG_FILE
 
 _modsecurity_others_submodule_paths() {
-  local -n _ms_paths_out="$1"
-  _ms_paths_out=()
-  [[ -f .gitmodules ]] || return 0
+  local _varname="$1"
+  local -a _acc=()
+  [[ -f .gitmodules ]] || { eval "${_varname}=()"; return 0; }
   local p
   while IFS= read -r p; do
-    [[ -n "$p" ]] && _ms_paths_out+=("$p")
+    [[ -n "$p" ]] && _acc+=("$p")
   done < <(git config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null | awk '$2 ~ /^others\// {print $2}')
+  eval "${_varname}=(\"\${_acc[@]}\")"
 }
 
 _modsecurity_submodule_url_for_path() {

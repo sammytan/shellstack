@@ -20,33 +20,35 @@ _modsecurity_ipinfo_country_code() {
   [[ "$code" =~ ^[A-Z]{2}$ ]] && echo "$code"
 }
 
-# 根据环境变量与 IP 地区，写入「是否 GitHub 优先」及原因（nameref：$1、$2 为变量名）
+# 根据环境变量与 IP 地区，写入「是否 GitHub 优先」及原因（$1、$2 为输出变量名；不用 nameref 以兼容 CentOS 7 自带 Bash 4.2）
 _modsecurity_clone_mirror_decision() {
-  local -n _ms_out_github_first="$1"
-  local -n _ms_out_reason="$2"
-  _ms_out_github_first=0
-  _ms_out_reason=""
+  local _out_gh="$1"
+  local _out_reason="$2"
+  local github_first=0
+  local reason=""
   if [[ "${MODSECURITY_PREFER_GITHUB:-}" == "1" ]] || [[ "${MODSECURITY_PREFER_GITEE:-}" == "0" ]]; then
-    _ms_out_github_first=1
-    _ms_out_reason="已手动指定 GitHub 优先（MODSECURITY_PREFER_GITHUB=1 或 MODSECURITY_PREFER_GITEE=0）"
+    github_first=1
+    reason="已手动指定 GitHub 优先（MODSECURITY_PREFER_GITHUB=1 或 MODSECURITY_PREFER_GITEE=0）"
   elif [[ "${MODSECURITY_AUTO_MIRROR_BY_IP:-1}" != "1" ]]; then
-    _ms_out_github_first=0
-    _ms_out_reason="已关闭 MODSECURITY_AUTO_MIRROR_BY_IP，默认 Gitee 优先"
+    github_first=0
+    reason="已关闭 MODSECURITY_AUTO_MIRROR_BY_IP，默认 Gitee 优先"
   else
     local cc
     cc=$(_modsecurity_ipinfo_country_code) || true
     if [[ -n "$cc" ]]; then
       if [[ "$cc" == "CN" ]]; then
-        _ms_out_github_first=0
-        _ms_out_reason="ipinfo.io 判断出口 IP 位于中国大陆（$cc），Gitee 优先"
+        github_first=0
+        reason="ipinfo.io 判断出口 IP 位于中国大陆（$cc），Gitee 优先"
       else
-        _ms_out_github_first=1
-        _ms_out_reason="ipinfo.io 判断出口 IP 区域为 $cc（非中国大陆），GitHub 优先"
+        github_first=1
+        reason="ipinfo.io 判断出口 IP 区域为 $cc（非中国大陆），GitHub 优先"
       fi
     else
-      _ms_out_github_first=0
-      _ms_out_reason="无法从 ipinfo.io 获取国家码，回退 Gitee 优先"
+      github_first=0
+      reason="无法从 ipinfo.io 获取国家码，回退 Gitee 优先"
       warn "无法从 ${MODSECURITY_IPINFO_COUNTRY_URL:-https://ipinfo.io/country} 获取地区（超时或受限）。可设置 MODSECURITY_PREFER_GITHUB=1 强制 GitHub，或检查网络。"
     fi
   fi
+  printf -v "$_out_gh" '%s' "$github_first"
+  printf -v "$_out_reason" '%s' "$reason"
 }
