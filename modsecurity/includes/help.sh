@@ -201,15 +201,16 @@ ModSecurity 核心库安装脚本
   --install-bt           安装宝塔面板（BT11）；若已安装则自动跳过。可与 --force/--deploy-conf 连用
   --extend-btwaf-cache   宝塔：执行面板 btwaf install（已装则跳过）、Redis、再下发扩展 Lua；本地无 btwaf-ext 时从 \$SHELLSTACK_BASE_URL/btwaf-ext/btwaf/ 下载；见 SHELLSTACK_BTWAF_OVERLAY_SRC / SHELLSTACK_BTWAF_CACHE_LUA_URL
   --force                强制覆盖安装：等效 --bt-openresty=openresty --deploy-conf --extend-btwaf-cache，并强制重编译 Nginx / 重注入 nginx.conf / 重装 BTwaf / 执行 Redis 安装流程
-  --with-exporter=ADDR   安装 node exporter，并尝试自动注册到 Prometheus 服务端（ADDR 可为 IP/域名 或 http(s):// 地址）
+  --with-exporter=ADDR   安装 node exporter，并通过 Consul Agent API 注册服务（ADDR 为 Consul HTTP 地址，如 http://127.0.0.1:8500；Prometheus 使用 consul_sd_configs 从 Consul 发现 target）
+  --with-consul-token[=TOKEN]  Consul ACL Token，写入请求头 X-Consul-Token（与官方 CONSUL_HTTP_TOKEN 等价；启用 ACL 时注册一般必填）。可写为 --with-consul-token=xxx 或两行参数 --with-consul-token xxx
   --deploy-conf          宝塔环境：部署 ModSecurity / OWASP CRS / custom 规则、nginx.conf 引用，并在 nginx.conf 与 enable-php-*.conf 中开启 FastCGI 缓存（需宝塔 Nginx）
   --bt-openresty=VER    宝塔 nginx.sh 的 OpenResty 版本键（默认 openresty127，可选 openresty 等）
   说明: 使用 --deploy-conf 或 --bt-openresty 时须已安装宝塔面板与 BTwaf；--extend-btwaf-cache 仅需宝塔面板（将调用面板 WAF 安装脚本并下发扩展）。
   说明: --deploy-conf 写入 nginx.conf 时仅在 \`nginx -V\` 含 modsecurity 时注入 modsecurity 指令；SHELLSTACK_DEPLOY_FASTCGI_CACHE=0 可关闭 fastcgi 共享区与 enable-php 缓存；编译 ModSecurity-nginx 后可用 SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK=1 删除旧块并重注入。
   说明: --deploy-conf 从 ModSecurity 仓库复制 modsecurity.conf-recommended / unicode.mapping；若 git 失败会回退从 raw.githubusercontent.com/owasp-modsecurity/ModSecurity 下载（MODSECURITY_CONF_SAMPLES_TAG 默认 v3.0.10）。
   说明: --extend-btwaf-cache 环境变量：SHELLSTACK_BTWAF_PANEL_INSTALL=0 跳过面板 install.sh；已安装 BTwaf（/www/server/btwaf/socket 存在）默认不重复 install；SHELLSTACK_BTWAF_FORCE_PANEL_INSTALL=1 强制重装；SHELLSTACK_BTWAF_OVERLAY_SRC=目录 指定本地扩展；SHELLSTACK_BTWAF_OVERLAY_BASE_URL=URL 覆盖 HTTP 根；SHELLSTACK_BTWAF_CACHE_LUA_URL=单文件 仅拉 cache.lua；SHELLSTACK_BTWAF_HTTP_DEBUG=1 拉取 cache.lua 校验失败时输出样本；SHELLSTACK_BTWAF_DOWNLOAD_UA= 自定义下载 User-Agent；SHELLSTACK_BTWAF_OFFICIAL_REF=目录 指定官方参考树（含 resty/redis.lua），用于补齐 /www/server/btwaf/lib/resty/redis.lua（与 init.lua 的 package.path 一致；不下载）；SHELLSTACK_INSTALL_REDIS=0 跳过 Redis；SHELLSTACK_REDIS_VER 可填宝塔版本号（如 8.0.5/8.2.3/8.4.0，传 8.0/8.2 会自动映射）；页缓存 Lua 连接 Redis 默认 127.0.0.1:6379，可设 SHELLSTACK_REDIS_HOST / SHELLSTACK_REDIS_PORT / SHELLSTACK_REDIS_DB（nginx 主配置须 env 同名声明）；整页缓存为 **Redis STRING**，键 `btwaf_cms_cache:`+md5(签名串)，**SETEX** 控制 TTL；签名段与默认 TTL 在 `lib/cache.lua` 的 `PAGE_CACHE_SIGN_COMPONENTS` / `PAGE_CACHE_TTL_SECONDS`（无需为键形状设环境变量）；SHELLSTACK_BTWAF_LEGACY_TARBALL=1 旧版全量 tar；SHELLSTACK_BTWAF_OVERLAY_INIT_LUA=1 覆盖 init.lua。
-  说明: --with-exporter 会尝试通过包管理器安装 node exporter（默认端口 9100，可设 EXPORTER_LISTEN_PORT），并优先以 file_sd 方式注册到 Prometheus；远端 Prometheus 会尝试免密 SSH(root@host) 写入并重载，失败则给出手工注册提示。
-  说明: --with-exporter 可在 main.sh 中单独使用（例如仅部署 exporter + 注册 Prometheus）；如不希望执行默认内核/终端优化，可同时加 --disable-kernel-opt --disable-terminal。
+  说明: --with-exporter 会尝试通过包管理器安装 node exporter（默认端口 9100，可设 EXPORTER_LISTEN_PORT），并向 ADDR 发起 PUT /v1/agent/service/register 注册到 Consul（需本机可访问 Consul HTTP）。**Consul 启用 ACL 时须提供 token**：环境变量 CONSUL_HTTP_TOKEN，或命令行 --with-consul-token=。监控栈为 Prometheus + Consul 服务发现 + node_exporter；Prometheus 侧配置 consul_sd_configs，不再由本脚本写 Prometheus file_sd 或 SSH。
+  说明: --with-exporter 可在 main.sh 中单独使用（例如仅部署 exporter + Consul 注册）；如不希望执行默认内核/终端优化，可同时加 --disable-kernel-opt --disable-terminal。环境变量 EXPORTER_CONSUL_ADDR 与旧名 EXPORTER_PROMETHEUS_SERVER（已弃用，仍可读作 Consul 地址）等价。
   说明: --install-bt 使用 BT11 安装命令下载并执行 install_panel.sh（默认地址: https://bt11.btmb.cc/install/install_panel.sh）；可用 BT_INSTALL_SCRIPT_URL / BT_INSTALL_ARG 覆盖。
   说明: 未显式使用 --bt-openresty/--deploy-conf（或 --force）时，不会触发宝塔 Nginx 重编译；仅 --extend-btwaf-cache 不会重装 Nginx。
   说明: 若 Nginx 已含 ModSecurity 且与当前 --bt-openresty 版本一致，将跳过重复编译；强制重编可设 MODSECURITY_FORCE_BT_NGINX_REBUILD=1。
@@ -255,11 +256,15 @@ ModSecurity 核心库安装脚本
   # 先安装宝塔，再执行强制覆盖安装流程
   $0 --install-bt --force
 
-  # 安装 exporter 并注册到 Prometheus 服务端
-  $0 --with-exporter=10.0.0.10
+  # 安装 exporter 并注册到 Consul（Prometheus 通过 consul_sd 抓取）
+  $0 --with-exporter=http://10.0.0.10:8500
+
+  # Consul 启用 ACL 时须带 token（任选其一）
+  $0 --with-exporter=http://10.0.0.10:8500 --with-consul-token=your-secret-id
+  CONSUL_HTTP_TOKEN=your-secret-id $0 --with-exporter=http://10.0.0.10:8500
 
   # 在 main.sh 中仅使用 exporter（关闭默认内核/终端优化）
-  $0 --with-exporter=https://prom.example.com:9090 --disable-kernel-opt --disable-terminal
+  $0 --with-exporter=http://consul.example.com:8500 --disable-kernel-opt --disable-terminal
 
   # 宝塔面板：安装 libmodsecurity、升级 OpenResty 并编译 ModSecurity-nginx，并下发 CRS/自定义规则
   $0 --deploy-conf

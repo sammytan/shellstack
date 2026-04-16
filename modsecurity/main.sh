@@ -107,7 +107,8 @@ ENABLE_OPENRESTY=0
 ENABLE_KERNEL_OPT=1
 ENABLE_TERMINAL=1
 ENABLE_EXPORTER=0
-EXPORTER_PROMETHEUS_SERVER="${EXPORTER_PROMETHEUS_SERVER:-}"
+# Consul HTTP 基址（例 http://127.0.0.1:8500）；兼容旧环境变量 EXPORTER_PROMETHEUS_SERVER
+EXPORTER_CONSUL_ADDR="${EXPORTER_CONSUL_ADDR:-${EXPORTER_PROMETHEUS_SERVER:-}}"
 INSTALL_BAOTA_PANEL=0
 # 宝塔：从站点下载 btwaf.tar.gz 覆盖 /www/server/btwaf
 EXTEND_BTWAF_CACHE=0
@@ -227,14 +228,24 @@ parse_args() {
         ;;
       --with-exporter=*)
         ENABLE_EXPORTER=1
-        EXPORTER_PROMETHEUS_SERVER="${1#*=}"
-        export EXPORTER_PROMETHEUS_SERVER
+        EXPORTER_CONSUL_ADDR="${1#*=}"
+        export EXPORTER_CONSUL_ADDR
         shift
         ;;
       --with-exporter)
         ENABLE_EXPORTER=1
-        EXPORTER_PROMETHEUS_SERVER="$2"
-        export EXPORTER_PROMETHEUS_SERVER
+        EXPORTER_CONSUL_ADDR="$2"
+        export EXPORTER_CONSUL_ADDR
+        shift 2
+        ;;
+      --with-consul-token=*)
+        CONSUL_HTTP_TOKEN="${1#*=}"
+        export CONSUL_HTTP_TOKEN
+        shift
+        ;;
+      --with-consul-token)
+        CONSUL_HTTP_TOKEN="$2"
+        export CONSUL_HTTP_TOKEN
         shift 2
         ;;
       --bt-openresty=*)
@@ -399,13 +410,13 @@ main_install() {
   fi
 
   if [ "$ENABLE_EXPORTER" = "1" ]; then
-    if [[ -z "${EXPORTER_PROMETHEUS_SERVER:-}" ]]; then
-      warn "已启用 --with-exporter 但未提供 Prometheus 地址，跳过 exporter 安装/注册"
+    if [[ -z "${EXPORTER_CONSUL_ADDR:-}" ]]; then
+      warn "已启用 --with-exporter 但未提供 Consul 地址，跳过 exporter 安装/注册（示例: --with-exporter=http://127.0.0.1:8500）"
     else
-      setup_exporter_and_register "$EXPORTER_PROMETHEUS_SERVER"
+      setup_exporter_and_register "$EXPORTER_CONSUL_ADDR"
     fi
   else
-    log "未使用 --with-exporter，跳过 exporter 安装与 Prometheus 注册"
+    log "未使用 --with-exporter，跳过 exporter 安装与 Consul 注册"
   fi
   
   # 可选功能安装

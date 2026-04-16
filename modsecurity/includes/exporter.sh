@@ -1,11 +1,19 @@
 #!/bin/bash
-# 安装 node exporter 并尽量自动注册到 Prometheus
+# 安装 node exporter 并通过 Consul Agent API 注册服务（供 Prometheus consul_sd 发现）
+# 架构：本机/目标机运行 node_exporter → 注册到 Consul → Prometheus 用 consul_sd_configs 抓取
 # 依赖 shared.sh: log warn error
+#
+# 环境变量（可选）：
+#   EXPORTER_LISTEN_PORT      默认 9100
+#   CONSUL_HTTP_ADDR        未传参时 setup_exporter_and_register 可回退使用该 Consul 基址（须含端口）
+#   CONSUL_HTTP_TOKEN       Consul ACL Token（请求头 X-Consul-Token）；集群启用 ACL 时注册/写 catalog 通常必需
+#   或在 main.sh 使用 --with-consul-token=TOKEN（等价导出 CONSUL_HTTP_TOKEN）
+#   CONSUL_SERVICE_ID       覆盖自动生成的服务 ID
+#   CONSUL_SERVICE_NAME     默认 shellstack-node-exporter
+#   CONSUL_SERVICE_TAGS     额外标签，逗号分隔，追加到默认 tags
 
 EXPORTER_LISTEN_PORT="${EXPORTER_LISTEN_PORT:-9100}"
-PROM_FILE_SD_DIR="${PROM_FILE_SD_DIR:-/etc/prometheus/file_sd}"
-PROM_FILE_SD_FILE="${PROM_FILE_SD_FILE:-shellstack-node-exporter.json}"
-PROM_CONFIG_FILE="${PROM_CONFIG_FILE:-/etc/prometheus/prometheus.yml}"
+CONSUL_SERVICE_NAME="${CONSUL_SERVICE_NAME:-shellstack-node-exporter}"
 
 _exporter_local_ip() {
   local ip
@@ -58,102 +66,126 @@ _exporter_ensure_service_running() {
     log "检测到 ${EXPORTER_LISTEN_PORT} 端口已监听，视为 exporter 可用"
     return 0
   fi
-  warn "未检测到 exporter 服务监听 ${EXPORTER_LISTEN_PORT}，自动注册仍会继续"
+  warn "未检测到 exporter 服务监听 ${EXPORTER_LISTEN_PORT}，Consul 健康检查可能失败"
 }
 
-_exporter_is_local_prometheus_server() {
+# 将参数规范为 Consul HTTP 基址（无尾部斜杠），默认端口 8500
+_exporter_normalize_consul_base() {
   local raw="$1"
-  local host="$raw"
-  host="${host#http://}"
-  host="${host#https://}"
-  host="${host%%/*}"
-  host="${host%%:*}"
-
-  [[ "$host" == "127.0.0.1" || "$host" == "localhost" ]] && return 0
-  [[ "$host" == "$(hostname -f 2>/dev/null)" || "$host" == "$(hostname 2>/dev/null)" ]] && return 0
-  hostname -I 2>/dev/null | tr ' ' '\n' | grep -qx "$host"
-}
-
-_exporter_register_local_prometheus() {
-  local target="$1"
-  mkdir -p "$PROM_FILE_SD_DIR"
-  cat > "${PROM_FILE_SD_DIR}/${PROM_FILE_SD_FILE}" <<EOF
-[
-  {
-    "labels": {
-      "job": "shellstack-node-exporter",
-      "module": "modsecurity"
-    },
-    "targets": ["${target}"]
-  }
-]
-EOF
-  log "已写入 Prometheus file_sd: ${PROM_FILE_SD_DIR}/${PROM_FILE_SD_FILE}"
-
-  if [[ -f "$PROM_CONFIG_FILE" ]]; then
-    if ! grep -q "${PROM_FILE_SD_DIR}/\\*\\.json" "$PROM_CONFIG_FILE"; then
-      cat >> "$PROM_CONFIG_FILE" <<EOF
-
-# shellstack auto managed
-scrape_configs:
-  - job_name: 'shellstack-node-exporter'
-    file_sd_configs:
-      - files:
-        - '${PROM_FILE_SD_DIR}/*.json'
-EOF
-      warn "已追加 scrape_configs 到 $PROM_CONFIG_FILE，请确认未与原配置冲突"
+  local scheme rest authority
+  raw="${raw%/}"
+  if [[ "$raw" =~ ^https?:// ]]; then
+    scheme="${raw%%://*}"
+    rest="${raw#*://}"
+    authority="${rest%%/*}"
+    if [[ "$authority" != *:* ]]; then
+      echo "${scheme}://${authority}:8500"
+    else
+      echo "${scheme}://${authority}"
     fi
   else
-    warn "未找到 Prometheus 配置文件: $PROM_CONFIG_FILE"
-  fi
-
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl reload prometheus >>"$LOG_FILE" 2>&1 || systemctl restart prometheus >>"$LOG_FILE" 2>&1 || \
-      warn "Prometheus 重载失败，请手工重载"
+    authority="${raw%%/*}"
+    if [[ "$authority" != *:* ]]; then
+      echo "http://${authority}:8500"
+    else
+      echo "http://${authority}"
+    fi
   fi
 }
 
-_exporter_register_remote_prometheus_via_ssh() {
-  local prom="$1"
-  local target="$2"
-  local host="$prom"
-  host="${host#http://}"
-  host="${host#https://}"
-  host="${host%%/*}"
-  host="${host%%:*}"
+_exporter_json_escape() {
+  # 最小 JSON 字符串转义（反斜杠与双引号）
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "$s"
+}
 
-  if ! command -v ssh >/dev/null 2>&1; then
-    warn "本机无 ssh，无法自动写入远端 Prometheus；请手工注册 target: $target"
-    return 0
+_exporter_consul_register() {
+  local consul_base="$1"
+  local bind_addr="$2"
+  local port="$3"
+
+  if ! command -v curl >/dev/null 2>&1; then
+    warn "未找到 curl，无法调用 Consul API；请安装 curl 或手工注册服务"
+    return 1
   fi
 
-  local ssh_target="root@${host}"
-  if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "$ssh_target" "echo ok" >/dev/null 2>&1; then
-    warn "无法免密 SSH 到 ${ssh_target}，请在 Prometheus 侧手工添加 target: $target"
-    return 0
+  local safe_host sid tags_json extra_tag
+  safe_host="$(hostname -s 2>/dev/null | tr -cd '[:alnum:]-' | head -c 48)"
+  [[ -z "$safe_host" ]] && safe_host="host"
+  sid="${CONSUL_SERVICE_ID:-${CONSUL_SERVICE_NAME}-${safe_host}-${port}}"
+
+  tags_json='"shellstack","modsecurity","node-exporter"'
+  if [[ -n "${CONSUL_SERVICE_TAGS:-}" ]]; then
+    IFS=',' read -ra _extra_tags <<< "${CONSUL_SERVICE_TAGS}"
+    for extra_tag in "${_extra_tags[@]}"; do
+      extra_tag="$(echo "$extra_tag" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      [[ -n "$extra_tag" ]] || continue
+      tags_json+=",\"$(_exporter_json_escape "$extra_tag")\""
+    done
   fi
 
-  ssh -o BatchMode=yes "$ssh_target" "mkdir -p '${PROM_FILE_SD_DIR}'" >>"$LOG_FILE" 2>&1 || true
-  ssh -o BatchMode=yes "$ssh_target" "cat > '${PROM_FILE_SD_DIR}/${PROM_FILE_SD_FILE}' <<'EOF'
-[
-  {
-    \"labels\": {\"job\": \"shellstack-node-exporter\", \"module\": \"modsecurity\"},
-    \"targets\": [\"${target}\"]
+  local check_url
+  check_url="http://${bind_addr}:${port}/metrics"
+
+  local payload http_code out
+  payload="$(cat <<EOF
+{
+  "ID": "$(_exporter_json_escape "$sid")",
+  "Name": "$(_exporter_json_escape "$CONSUL_SERVICE_NAME")",
+  "Tags": [${tags_json}],
+  "Address": "$(_exporter_json_escape "$bind_addr")",
+  "Port": ${port},
+  "Meta": {
+    "module": "modsecurity",
+    "source": "shellstack-exporter"
+  },
+  "Check": {
+    "HTTP": "$(_exporter_json_escape "$check_url")",
+    "Interval": "15s",
+    "Timeout": "5s",
+    "DeregisterCriticalServiceAfter": "30m"
   }
-]
-EOF" >>"$LOG_FILE" 2>&1 || warn "写入远端 file_sd 失败"
+}
+EOF
+)"
 
-  ssh -o BatchMode=yes "$ssh_target" "systemctl reload prometheus || systemctl restart prometheus" >>"$LOG_FILE" 2>&1 || \
-    warn "远端 Prometheus 重载失败，请手工重载"
-  log "已尝试远端注册 Prometheus target: ${target} -> ${ssh_target}"
+  local curl_opts=(-fsS -o /tmp/shellstack-consul-reg.out -w "%{http_code}" -X PUT)
+  [[ -n "${CONSUL_HTTP_TOKEN:-}" ]] && curl_opts+=(-H "X-Consul-Token: ${CONSUL_HTTP_TOKEN}")
+  curl_opts+=(--data-binary "$payload" "${consul_base}/v1/agent/service/register")
+
+  http_code="$(curl "${curl_opts[@]}" 2>>"$LOG_FILE")" || true
+  out="$(cat /tmp/shellstack-consul-reg.out 2>/dev/null || true)"
+  rm -f /tmp/shellstack-consul-reg.out
+
+  if [[ "$http_code" == "200" ]]; then
+    log "已注册到 Consul: service_id=${sid} target=${bind_addr}:${port} consul=${consul_base}"
+    return 0
+  fi
+
+  warn "Consul 注册失败 HTTP ${http_code:-?}：${out:-（无响应体）}"
+  warn "请检查 Consul 地址、网络；若启用 ACL 请设置 CONSUL_HTTP_TOKEN 或 main.sh --with-consul-token=..."
+  warn "或手工执行: PUT ${consul_base}/v1/agent/service/register（Header: X-Consul-Token）"
+  return 1
 }
 
 setup_exporter_and_register() {
-  local prom_server="$1"
+  local consul_raw="${1:-${CONSUL_HTTP_ADDR:-}}"
+  if [[ -z "$consul_raw" ]]; then
+    warn "未提供 Consul 地址（--with-exporter= 或 CONSUL_HTTP_ADDR）"
+    return 1
+  fi
   log "=========================================="
-  log "--with-exporter：安装 exporter 并注册到 Prometheus"
+  log "--with-exporter：安装 node_exporter 并注册到 Consul（Prometheus 经 consul_sd 发现）"
   log "=========================================="
-  log "Prometheus 地址: $prom_server"
+
+  local consul_base
+  consul_base="$(_exporter_normalize_consul_base "$consul_raw")"
+  log "Consul HTTP 基址: $consul_base"
+  if [[ -z "${CONSUL_HTTP_TOKEN:-}" ]]; then
+    log "提示: 未设置 CONSUL_HTTP_TOKEN / --with-consul-token；若 Consul 启用 ACL，注册需带 token（见 --help）"
+  fi
 
   _exporter_install_node_exporter
   _exporter_ensure_service_running
@@ -161,16 +193,18 @@ setup_exporter_and_register() {
   local ip
   ip="$(_exporter_local_ip)"
   if [[ -z "$ip" ]]; then
-    warn "无法识别本机 IP，使用 127.0.0.1 注册 exporter 目标"
+    warn "无法识别本机 IP，使用 127.0.0.1 作为注册 Address（请确认 Prometheus 能否访问）"
     ip="127.0.0.1"
   fi
-  local target="${ip}:${EXPORTER_LISTEN_PORT}"
 
-  if _exporter_is_local_prometheus_server "$prom_server"; then
-    _exporter_register_local_prometheus "$target"
-  else
-    _exporter_register_remote_prometheus_via_ssh "$prom_server" "$target"
-  fi
-
-  log "Exporter 扩展完成，目标地址: $target"
+  _exporter_consul_register "$consul_base" "$ip" "${EXPORTER_LISTEN_PORT}"
+  log "Exporter 流程结束；Prometheus 侧请配置 consul_sd_configs 指向同一 Consul 集群"
 }
+
+# Prometheus 抓取示例（服务名见 CONSUL_SERVICE_NAME，默认 shellstack-node-exporter）：
+# scrape_configs:
+#   - job_name: shellstack-node-exporter
+#     metrics_path: /metrics
+#     consul_sd_configs:
+#       - server: '127.0.0.1:8500'
+#         services: ['shellstack-node-exporter']
