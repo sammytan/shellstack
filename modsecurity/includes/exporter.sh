@@ -402,7 +402,7 @@ _exporter_nginx_has_modsecurity_connector() {
   case $v in
     *ngx_http_modsecurity_module*) return 0 ;;
   esac
-  if printf '%s' "$v" | grep -qiE '--add-(dynamic-)?module=[^ ]*[Mm]od[Ss]ecurity'; then
+  if printf '%s' "$v" | grep -qiE -- '--add-(dynamic-)?module=[^ ]*[Mm]od[Ss]ecurity'; then
     return 0
   fi
   if printf '%s' "$v" | grep -qiF 'modsecurity-nginx'; then
@@ -418,17 +418,21 @@ _exporter_write_baota_shellstack_status_conf() {
   local out="/www/server/nginx/conf/shellstack_status.conf"
   local fcgi_line="fastcgi_params"
   local root_dir="/www/server/nginx/html"
+  local _fpmstub="/tmp/.shellstack_fpm_status_stub"
   local _has_ms=0
   [[ -d "$root_dir" ]] || root_dir="/tmp"
   [[ -f /www/server/nginx/conf/fastcgi.conf ]] && fcgi_line="/www/server/nginx/conf/fastcgi.conf"
   if _exporter_nginx_has_modsecurity_connector "$ngx_bin"; then
     _has_ms=1
   fi
+  # FPM status 需要指向存在的 SCRIPT_FILENAME；fastcgi.conf 否则会拼成 \$document_root/shellstack-fpm-status-xx → File not found
+  touch "$_fpmstub" 2>/dev/null || true
+  chmod 0644 "$_fpmstub" 2>/dev/null || true
 
   {
     echo "# shellstack exporter 生成：127.0.0.1:${port}，仅供本机采集；重跑 --with-exporter 会覆盖"
     echo "# Nginx: GET /nginx_stub_status"
-    echo "# PHP-FPM: GET /shellstack-fpm-status-<ver> → 需在对应 www.conf 等 pool 中启用 pm.status_path = /status（与 fastcgi 参数一致）"
+    echo "# PHP-FPM: GET /shellstack-fpm-status-<ver>；pool 须 pm.status_path = /status；占位文件 ${_fpmstub}"
     echo "server {"
     echo "    listen 127.0.0.1:${port};"
     echo "    server_name 127.0.0.1;"
@@ -457,8 +461,11 @@ _exporter_write_baota_shellstack_status_conf() {
       echo "        allow all;"
       echo "        include ${fcgi_line};"
       echo "        fastcgi_pass unix:${sk};"
-      echo "        fastcgi_param REQUEST_URI /status;"
+      echo "        fastcgi_param SCRIPT_FILENAME ${_fpmstub};"
       echo "        fastcgi_param SCRIPT_NAME /status;"
+      echo "        fastcgi_param REQUEST_URI /status;"
+      echo "        fastcgi_param REQUEST_METHOD GET;"
+      echo "        fastcgi_param QUERY_STRING \"\";"
       echo "    }"
     } >>"$out"
   done < <(_exporter_baota_list_php_fpm_status_sockets)
