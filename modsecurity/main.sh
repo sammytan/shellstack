@@ -234,9 +234,14 @@ parse_args() {
         ;;
       --with-exporter)
         ENABLE_EXPORTER=1
-        EXPORTER_CONSUL_ADDR="$2"
+        if [[ -n "${2:-}" ]] && [[ "${2:-}" != -* ]]; then
+          EXPORTER_CONSUL_ADDR="$2"
+          shift 2
+        else
+          EXPORTER_CONSUL_ADDR=""
+          shift
+        fi
         export EXPORTER_CONSUL_ADDR
-        shift 2
         ;;
       --with-consul-token=*)
         CONSUL_HTTP_TOKEN="${1#*=}"
@@ -410,11 +415,7 @@ main_install() {
   fi
 
   if [ "$ENABLE_EXPORTER" = "1" ]; then
-    if [[ -z "${EXPORTER_CONSUL_ADDR:-}" ]]; then
-      warn "已启用 --with-exporter 但未提供 Consul 地址，跳过 exporter 安装/注册（示例: --with-exporter=http://127.0.0.1:8500）"
-    else
-      setup_exporter_and_register "$EXPORTER_CONSUL_ADDR"
-    fi
+    setup_exporter_and_register "${EXPORTER_CONSUL_ADDR:-}"
   else
     log "未使用 --with-exporter，跳过 exporter 安装与 Consul 注册"
   fi

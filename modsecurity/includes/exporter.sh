@@ -2,7 +2,14 @@
 # 安装 node exporter 并通过 Consul Agent API 注册服务（供 Prometheus consul_sd 发现）
 # 架构：本机/目标机运行 node_exporter → 注册到 Consul → Prometheus 用 consul_sd_configs 抓取
 #
+# 指标覆盖：
+#   - 常规系统：CPU/内存/负载/磁盘空间/磁盘 IO/网络流量 等由 node_exporter 默认 collectors 提供
+#     （node_cpu_*、node_memory_*、node_load*、node_filesystem_*、node_disk_*、node_network_* 等）
+#   - 宝塔 / Nginx / PHP-FPM / MySQL / Redis：本脚本安装 textfile 采集脚本 + cron，输出 shellstack_* 指标
+#   - Nginx 连接负载：若本机可访问 stub_status（见下方 URL），输出 shellstack_nginx_* 指标
+#
 # 单独使用本文件（不必跑 main.sh）：
+#   ./exporter.sh
 #   ./exporter.sh http://127.0.0.1:8500
 #   ./exporter.sh --consul-token=SECRET http://consul.example.com:8500
 #   CONSUL_HTTP_TOKEN=secret ./exporter.sh http://127.0.0.1:8500
@@ -12,15 +19,24 @@
 #
 # 环境变量（可选）：
 #   EXPORTER_LISTEN_PORT      默认 9100
-#   CONSUL_HTTP_ADDR        未传参时 setup_exporter_and_register 可回退使用该 Consul 基址（须含端口）
-#   CONSUL_HTTP_TOKEN       Consul ACL Token（请求头 X-Consul-Token）；集群启用 ACL 时注册/写 catalog 通常必需
-#   或在 main.sh 使用 --with-consul-token=TOKEN（等价导出 CONSUL_HTTP_TOKEN）
+#   CONSUL_HTTP_ADDR        未传参时回退；再回退内置默认 Consul（见 SHELLSTACK_EXPORTER_DEFAULT_CONSUL_ADDR）
+#   CONSUL_HTTP_TOKEN       未设置时自动使用内置默认，并写入 /etc/profile.d/shellstack-consul-env.sh
+#   SHELLSTACK_EXPORTER_NO_BUILTIN_TOKEN=1  不注入内置 Token、不写 Token 到 profile.d（自行 export）
+#   SHELLSTACK_EXPORTER_SKIP_PERSIST_ENV=1  不写入 /etc/profile.d/shellstack-consul-env.sh
+#   SHELLSTACK_EXPORTER_DEFAULT_CONSUL_ADDR / SHELLSTACK_EXPORTER_DEFAULT_CONSUL_TOKEN 覆盖内置默认
+#   SHELLSTACK_NGINX_STUB_URLS   逗号分隔的 stub_status URL；未设置且探测失败时会尝试自动注入见下
+#   SHELLSTACK_NGINX_STUB_INJECT  默认 1：stub 全失败且存在 /www/server/nginx 时注入独立 127.0.0.1 端口 stub；设 0 关闭
+#   SHELLSTACK_NGINX_STUB_LISTEN_PORT  注入时监听端口，默认 8899（仅 127.0.0.1）
 #   CONSUL_SERVICE_ID       覆盖自动生成的服务 ID
 #   CONSUL_SERVICE_NAME     默认 shellstack-node-exporter
 #   CONSUL_SERVICE_TAGS     额外标签，逗号分隔，追加到默认 tags
 
 EXPORTER_LISTEN_PORT="${EXPORTER_LISTEN_PORT:-9100}"
 CONSUL_SERVICE_NAME="${CONSUL_SERVICE_NAME:-shellstack-node-exporter}"
+
+# 内置默认 Consul（本流程自动注入当前 shell，并持久化到 profile.d，无需手敲 export）
+SHELLSTACK_EXPORTER_DEFAULT_CONSUL_ADDR="${SHELLSTACK_EXPORTER_DEFAULT_CONSUL_ADDR:-http://47.243.128.122:8500}"
+SHELLSTACK_EXPORTER_DEFAULT_CONSUL_TOKEN="${SHELLSTACK_EXPORTER_DEFAULT_CONSUL_TOKEN:-4c3ff895-c21c-4e1c-a0c3-8bf64cdb2897}"
 
 _exporter_local_ip() {
   local ip
@@ -74,6 +90,312 @@ _exporter_ensure_service_running() {
     return 0
   fi
   warn "未检测到 exporter 服务监听 ${EXPORTER_LISTEN_PORT}，Consul 健康检查可能失败"
+}
+
+_exporter_apply_builtin_consul_defaults() {
+  if [[ -z "${CONSUL_HTTP_TOKEN:-}" ]] && [[ "${SHELLSTACK_EXPORTER_NO_BUILTIN_TOKEN:-}" != "1" ]]; then
+    CONSUL_HTTP_TOKEN="$SHELLSTACK_EXPORTER_DEFAULT_CONSUL_TOKEN"
+    export CONSUL_HTTP_TOKEN
+    log "已自动设置 CONSUL_HTTP_TOKEN（内置默认，当前进程已 export）"
+  fi
+}
+
+# 登录 shell 自动加载（仅当外部未设置同名变量时生效）；便于后续手工 curl Consul 与脚本复用
+_exporter_persist_consul_env_for_shells() {
+  local addr="$1"
+  local tok="${2:-}"
+  [[ "${SHELLSTACK_EXPORTER_SKIP_PERSIST_ENV:-}" == "1" ]] && return 0
+  local d="/etc/profile.d"
+  if [[ ! -d "$d" ]]; then
+    warn "无目录 $d，跳过 Consul 环境持久化"
+    return 0
+  fi
+  local f="$d/shellstack-consul-env.sh"
+  local qa qt
+  qa="$(printf '%q' "$addr")"
+  umask 022
+  {
+    echo "# 由 shellstack exporter.sh 生成；重跑 --with-exporter 会覆盖。未在外部设置变量时才 export。"
+    echo "[ -z \"\${CONSUL_HTTP_ADDR:-}\" ] && export CONSUL_HTTP_ADDR=${qa}"
+    if [[ -n "$tok" ]]; then
+      qt="$(printf '%q' "$tok")"
+      echo "[ -z \"\${CONSUL_HTTP_TOKEN:-}\" ] && export CONSUL_HTTP_TOKEN=${qt}"
+    fi
+  } >"$f"
+  chmod 0644 "$f" 2>/dev/null || true
+  log "已写入 $f（新 SSH 登录自动加载 CONSUL_HTTP_*；当前会话已 export，无需再手动设置）"
+}
+
+_exporter_node_exporter_textfile_dir() {
+  local d
+  for d in /var/lib/prometheus/node-exporter /var/lib/node_exporter/textfile_collector /var/lib/prometheus/node_exporter; do
+    [[ -d "$d" ]] && { echo "$d"; return 0; }
+  done
+  d="/var/lib/prometheus/node-exporter"
+  mkdir -p "$d" 2>/dev/null || true
+  echo "$d"
+}
+
+_exporter_nginx_stub_urls_probe_ok() {
+  local urls="$1" url body
+  IFS=',' read -ra _probe_arr <<< "$urls"
+  for url in "${_probe_arr[@]}"; do
+    url="$(echo "$url" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [[ -n "$url" ]] || continue
+    body="$(curl -fsS -m 2 "$url" 2>/dev/null || true)"
+    [[ -n "$body" ]] && echo "$body" | grep -q 'Active connections' && return 0
+  done
+  return 1
+}
+
+# 在宝塔 nginx.conf 的 http{} 内 include 独立 stub（仅 127.0.0.1），供本机 textfile 采集
+_exporter_inject_baota_nginx_stub_status() {
+  local port="${1:-8899}"
+  local ngx_bin="/www/server/nginx/sbin/nginx"
+  local ngx_main="/www/server/nginx/conf/nginx.conf"
+  local snip="/www/server/nginx/conf/shellstack_stub_status.conf"
+  [[ -x "$ngx_bin" ]] || return 1
+  [[ -f "$ngx_main" ]] || return 1
+
+  if ss -lnt 2>/dev/null | grep -qE ":${port}[[:space:]]"; then
+    warn "端口 ${port} 已被占用，跳过注入 stub_status（可设 SHELLSTACK_NGINX_STUB_LISTEN_PORT 为其他端口）"
+    return 1
+  fi
+
+  cat >"$snip" <<EOF
+# shellstack exporter 生成：仅 127.0.0.1:${port}，供 Prometheus textfile 读取 stub_status
+server {
+    listen 127.0.0.1:${port};
+    server_name 127.0.0.1;
+    location /nginx_stub_status {
+        stub_status on;
+        access_log off;
+        allow 127.0.0.1;
+        deny all;
+    }
+}
+EOF
+  chmod 644 "$snip" 2>/dev/null || true
+
+  if grep -qF 'include /www/server/nginx/conf/shellstack_stub_status.conf' "$ngx_main" 2>/dev/null; then
+    log "nginx.conf 已包含 shellstack_stub_status.conf，仅刷新片段文件"
+  else
+    if ! sed -i.bak-shellstack '/^[[:space:]]*http[[:space:]]*{/a\    include /www/server/nginx/conf/shellstack_stub_status.conf;' "$ngx_main" 2>>"$LOG_FILE"; then
+      warn "向 nginx.conf 插入 include 失败"
+      return 1
+    fi
+  fi
+
+  if ! "$ngx_bin" -t >>"$LOG_FILE" 2>&1; then
+    warn "nginx -t 未通过，回滚 nginx.conf（恢复 sed 备份）"
+    if [[ -f "${ngx_main}.bak-shellstack" ]]; then
+      mv -f "${ngx_main}.bak-shellstack" "$ngx_main" 2>/dev/null || cp -a "${ngx_main}.bak-shellstack" "$ngx_main" 2>/dev/null || true
+    fi
+    return 1
+  fi
+  rm -f "${ngx_main}.bak-shellstack" 2>/dev/null || true
+
+  if "$ngx_bin" -s reload >>"$LOG_FILE" 2>&1; then
+    log "已注入 stub_status：http://127.0.0.1:${port}/nginx_stub_status 并重载 Nginx"
+    return 0
+  fi
+  if systemctl reload nginx >>"$LOG_FILE" 2>&1 || /etc/init.d/nginx reload >>"$LOG_FILE" 2>&1; then
+    log "已注入 stub_status：http://127.0.0.1:${port}/nginx_stub_status 并重载 Nginx（systemctl/init）"
+    return 0
+  fi
+  warn "stub 配置已写入但重载失败，请手动: nginx -s reload"
+  return 1
+}
+
+_exporter_patch_node_exporter_textfile_arg() {
+  local dir="$1"
+  local svc="" f
+  if systemctl list-unit-files 2>/dev/null | grep -q '^prometheus-node-exporter\.service'; then
+    svc="prometheus-node-exporter"
+  elif systemctl list-unit-files 2>/dev/null | grep -q '^node_exporter\.service'; then
+    svc="node_exporter"
+  fi
+  [[ -n "$svc" ]] || return 0
+
+  if [[ -f /etc/default/prometheus-node-exporter ]]; then
+    f="/etc/default/prometheus-node-exporter"
+    if grep -qF 'collector.textfile.directory' "$f" 2>/dev/null; then
+      :
+    elif grep -qE '^ARGS=' "$f" 2>/dev/null; then
+      sed -i.bak-shellstack "s|^ARGS=\"\\(.*\\)\"|ARGS=\"\\1 --collector.textfile.directory=${dir}\"|" "$f" 2>/dev/null || true
+    else
+      echo "ARGS=\"--collector.textfile.directory=${dir}\"" >>"$f"
+    fi
+  elif [[ -f /etc/sysconfig/node_exporter ]]; then
+    f="/etc/sysconfig/node_exporter"
+    grep -qF 'collector.textfile.directory' "$f" 2>/dev/null || echo "NODE_EXPORTER_OPTS=\"--collector.textfile.directory=${dir}\"" >>"$f"
+  else
+    local drop="/etc/systemd/system/${svc}.service.d"
+    mkdir -p "$drop" 2>/dev/null || true
+    if [[ -d "$drop" ]]; then
+      cat >"${drop}/shellstack-textfile.conf" <<EOF
+[Service]
+Environment="EXTRA_FLAGS=--collector.textfile.directory=${dir}"
+EOF
+    fi
+  fi
+  systemctl daemon-reload >>"$LOG_FILE" 2>&1 || true
+  systemctl restart "$svc" >>"$LOG_FILE" 2>&1 || warn "重启 $svc 以应用 textfile 目录失败，请手动检查"
+}
+
+_exporter_install_baota_textfile_collector() {
+  local dir
+  dir="$(_exporter_node_exporter_textfile_dir)"
+  mkdir -p "$dir" || true
+  _exporter_patch_node_exporter_textfile_arg "$dir"
+
+  local bin="/usr/local/bin/shellstack-node-exporter-textfile.sh"
+  cat >"$bin" <<'EOSCRIPT'
+#!/bin/bash
+# Prometheus textfile collector：宝塔栈 + nginx stub_status（由 exporter.sh 部署）
+set -euo pipefail
+DIR="${TEXTFILE_DIR:-/var/lib/prometheus/node-exporter}"
+mkdir -p "$DIR"
+OUT="$DIR/shellstack_baota.prom"
+TMP="$OUT.$$"
+trap 'rm -f "$TMP"' EXIT
+
+STUB_URLS="${SHELLSTACK_NGINX_STUB_URLS:-http://127.0.0.1/nginx_status,http://127.0.0.1/stub_status,http://127.0.0.1/nginx_stub_status}"
+
+emit_up() {
+  local role="$1" detail="$2" val="$3"
+  printf 'shellstack_process_up{role="%s",detail="%s"} %s\n' "$role" "$detail" "$val"
+}
+
+{
+  echo "# HELP shellstack_process_up 关键进程/服务是否存活（1=是）"
+  echo "# TYPE shellstack_process_up gauge"
+  echo "# HELP shellstack_php_fpm_up 宝塔 PHP 版本目录下 php-fpm master 是否存活"
+  echo "# TYPE shellstack_php_fpm_up gauge"
+  echo "# HELP shellstack_nginx_stub_active_connections stub_status Active connections"
+  echo "# TYPE shellstack_nginx_stub_active_connections gauge"
+  echo "# HELP shellstack_nginx_stub_reading stub_status Reading"
+  echo "# TYPE shellstack_nginx_stub_reading gauge"
+  echo "# HELP shellstack_nginx_stub_writing stub_status Writing"
+  echo "# TYPE shellstack_nginx_stub_writing gauge"
+  echo "# HELP shellstack_nginx_stub_waiting stub_status Waiting"
+  echo "# TYPE shellstack_nginx_stub_waiting gauge"
+
+  # Nginx（宝塔路径优先）
+  if [[ -x /www/server/nginx/sbin/nginx ]]; then
+    if pgrep -x nginx >/dev/null 2>&1 || pgrep -f '/www/server/nginx/sbin/nginx' >/dev/null 2>&1; then
+      emit_up nginx baota_sbin 1
+    else
+      emit_up nginx baota_sbin 0
+    fi
+  elif systemctl is-active --quiet nginx 2>/dev/null; then
+    emit_up nginx systemd 1
+  else
+    pgrep -x nginx >/dev/null 2>&1 && emit_up nginx process 1 || emit_up nginx process 0
+  fi
+
+  # MySQL / MariaDB
+  if systemctl is-active --quiet mysqld 2>/dev/null || systemctl is-active --quiet mysql 2>/dev/null || systemctl is-active --quiet mariadb 2>/dev/null; then
+    emit_up mysql systemd 1
+  elif pgrep -x mysqld >/dev/null 2>&1 || pgrep -x mariadbd >/dev/null 2>&1; then
+    emit_up mysql process 1
+  else
+    emit_up mysql none 0
+  fi
+
+  # Redis
+  if systemctl is-active --quiet redis 2>/dev/null || systemctl is-active --quiet redis-server 2>/dev/null; then
+    emit_up redis systemd 1
+  elif pgrep -x redis-server >/dev/null 2>&1; then
+    emit_up redis process 1
+  else
+    emit_up redis none 0
+  fi
+
+  # 宝塔面板
+  if pgrep -f 'BT-Panel' >/dev/null 2>&1 || pgrep -f '/www/server/panel/BT-Panel' >/dev/null 2>&1; then
+    emit_up baota_panel process 1
+  else
+    emit_up baota_panel process 0
+  fi
+
+  # PHP-FPM：扫描 /www/server/php/<ver>/
+  if [[ -d /www/server/php ]]; then
+    for d in /www/server/php/*/; do
+      [[ -d "$d" ]] || continue
+      ver="$(basename "$d")"
+      bin="${d}sbin/php-fpm"
+      if [[ -x "$bin" ]]; then
+        if pgrep -af 'php-fpm: master process' 2>/dev/null | grep -qF "/www/server/php/${ver}/"; then
+          printf 'shellstack_php_fpm_up{version="%s"} 1\n' "$ver"
+        else
+          printf 'shellstack_php_fpm_up{version="%s"} 0\n' "$ver"
+        fi
+      fi
+    done
+  fi
+
+  # nginx stub_status（负载/连接数）
+  parsed=0
+  IFS=',' read -ra _uarr <<< "$STUB_URLS"
+  for url in "${_uarr[@]}"; do
+    url="$(echo "$url" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [[ -n "$url" ]] || continue
+    body="$(curl -fsS -m 2 "$url" 2>/dev/null || true)"
+    [[ -n "$body" ]] || continue
+    if echo "$body" | grep -q 'Active connections'; then
+      ac="$(echo "$body" | head -1 | awk '/Active connections/ {print $3}')"
+      rd="$(echo "$body" | awk '/Reading:/ {print $2}' | tr -d ',')"
+      wr="$(echo "$body" | awk '/Reading:/ {print $4}' | tr -d ',')"
+      wt="$(echo "$body" | awk '/Reading:/ {print $6}' | tr -d ',')"
+      [[ "$ac" =~ ^[0-9]+$ ]] && echo "shellstack_nginx_stub_active_connections $ac"
+      [[ "$rd" =~ ^[0-9]+$ ]] && echo "shellstack_nginx_stub_reading $rd"
+      [[ "$wr" =~ ^[0-9]+$ ]] && echo "shellstack_nginx_stub_writing $wr"
+      [[ "$wt" =~ ^[0-9]+$ ]] && echo "shellstack_nginx_stub_waiting $wt"
+      parsed=1
+      break
+    fi
+  done
+  if [[ "$parsed" -eq 0 ]]; then
+    echo "shellstack_nginx_stub_active_connections 0"
+    echo "shellstack_nginx_stub_reading 0"
+    echo "shellstack_nginx_stub_writing 0"
+    echo "shellstack_nginx_stub_waiting 0"
+  fi
+} >"$TMP"
+mv -f "$TMP" "$OUT"
+chmod 644 "$OUT" 2>/dev/null || true
+EOSCRIPT
+  chmod 755 "$bin"
+
+  local stub_port inject_url default_urls effective_urls
+  stub_port="${SHELLSTACK_NGINX_STUB_LISTEN_PORT:-8899}"
+  inject_url="http://127.0.0.1:${stub_port}/nginx_stub_status"
+  default_urls="http://127.0.0.1/nginx_status,http://127.0.0.1/stub_status,http://127.0.0.1/nginx_stub_status"
+  effective_urls="${SHELLSTACK_NGINX_STUB_URLS:-$default_urls}"
+
+  if ! _exporter_nginx_stub_urls_probe_ok "$effective_urls"; then
+    if [[ -x /www/server/nginx/sbin/nginx ]] && [[ "${SHELLSTACK_NGINX_STUB_INJECT:-1}" != "0" ]]; then
+      log "未探测到可用 stub_status，尝试向宝塔 nginx.conf 注入 127.0.0.1:${stub_port} 专用 stub..."
+      if _exporter_inject_baota_nginx_stub_status "$stub_port"; then
+        effective_urls="${inject_url},${effective_urls}"
+      else
+        warn "stub 自动注入未成功，shellstack_nginx_stub_* 可能为 0（可手动配置 stub 或设 SHELLSTACK_NGINX_STUB_URLS）"
+      fi
+    fi
+  fi
+
+  local cronf="/etc/cron.d/shellstack-node-exporter-textfile"
+  cat >"$cronf" <<EOF
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+* * * * * root TEXTFILE_DIR=$dir SHELLSTACK_NGINX_STUB_URLS=$effective_urls $bin >/dev/null 2>&1
+EOF
+  chmod 644 "$cronf" 2>/dev/null || true
+
+  TEXTFILE_DIR="$dir" SHELLSTACK_NGINX_STUB_URLS="$effective_urls" bash "$bin" >>"$LOG_FILE" 2>&1 || warn "首次执行 textfile 采集脚本失败"
+  log "已部署宝塔/服务 textfile 采集: $bin → $dir/shellstack_baota.prom（cron: $cronf）"
+  log "stub_status 探测 URL 列表（cron 已写入）: $effective_urls"
 }
 
 # 将参数规范为 Consul HTTP 基址（无尾部斜杠），默认端口 8500
@@ -178,11 +500,21 @@ EOF
 }
 
 setup_exporter_and_register() {
+  _exporter_apply_builtin_consul_defaults
+
   local consul_raw="${1:-${CONSUL_HTTP_ADDR:-}}"
   if [[ -z "$consul_raw" ]]; then
-    warn "未提供 Consul 地址（--with-exporter= 或 CONSUL_HTTP_ADDR）"
-    return 1
+    consul_raw="$SHELLSTACK_EXPORTER_DEFAULT_CONSUL_ADDR"
+    log "未显式提供 Consul 地址，使用内置默认: $consul_raw"
   fi
+  CONSUL_HTTP_ADDR="$consul_raw"
+  export CONSUL_HTTP_ADDR
+  log "已设置 CONSUL_HTTP_ADDR（当前进程与 profile.d，供后续命令复用）"
+
+  local _tok_persist="${CONSUL_HTTP_TOKEN:-}"
+  [[ "${SHELLSTACK_EXPORTER_NO_BUILTIN_TOKEN:-}" == "1" ]] && _tok_persist=""
+  _exporter_persist_consul_env_for_shells "$consul_raw" "$_tok_persist"
+
   log "=========================================="
   log "exporter：安装 node_exporter 并注册到 Consul（Prometheus 经 consul_sd 发现）"
   log "=========================================="
@@ -191,11 +523,12 @@ setup_exporter_and_register() {
   consul_base="$(_exporter_normalize_consul_base "$consul_raw")"
   log "Consul HTTP 基址: $consul_base"
   if [[ -z "${CONSUL_HTTP_TOKEN:-}" ]]; then
-    log "提示: 未设置 CONSUL_HTTP_TOKEN / --with-consul-token；若 Consul 启用 ACL，注册需带 token（见 --help）"
+    warn "当前无 CONSUL_HTTP_TOKEN（若 Consul 要求 ACL，请 export 或去掉 SHELLSTACK_EXPORTER_NO_BUILTIN_TOKEN=1）"
   fi
 
   _exporter_install_node_exporter
   _exporter_ensure_service_running
+  _exporter_install_baota_textfile_collector
 
   local ip
   ip="$(_exporter_local_ip)"
@@ -206,6 +539,7 @@ setup_exporter_and_register() {
 
   _exporter_consul_register "$consul_base" "$ip" "${EXPORTER_LISTEN_PORT}"
   log "Exporter 流程结束；Prometheus 侧请配置 consul_sd_configs 指向同一 Consul 集群"
+  log "系统级指标见 node_exporter 默认指标；宝塔/Nginx/PHP/MySQL/Redis/stub 见 shellstack_* textfile 指标"
 }
 
 # Prometheus 抓取示例（服务名见 CONSUL_SERVICE_NAME，默认 shellstack-node-exporter）：
@@ -221,12 +555,16 @@ setup_exporter_and_register() {
 # ---------------------------------------------------------------------------
 _exporter_cli_usage() {
   cat <<'EOF'
-用法: exporter.sh [选项] <Consul HTTP 地址>
+用法: exporter.sh [选项] [Consul HTTP 地址]
+  exporter.sh
   exporter.sh http://127.0.0.1:8500
   exporter.sh --consul-token=SECRET http://consul.example.com:8500
 
+不传地址时默认使用 SHELLSTACK_EXPORTER_DEFAULT_CONSUL_ADDR（可环境变量覆盖）。
+未设置 CONSUL_HTTP_TOKEN 且未指定 SHELLSTACK_EXPORTER_NO_BUILTIN_TOKEN=1 时使用内置 Token。
+
 与 main.sh 相同的环境变量仍可用：CONSUL_HTTP_ADDR、CONSUL_HTTP_TOKEN、EXPORTER_LISTEN_PORT、
-CONSUL_SERVICE_NAME、CONSUL_SERVICE_ID、CONSUL_SERVICE_TAGS 等。
+CONSUL_SERVICE_NAME、CONSUL_SERVICE_ID、CONSUL_SERVICE_TAGS、SHELLSTACK_NGINX_STUB_URLS 等。
 
 选项:
   -h, --help                  显示本帮助
@@ -304,11 +642,6 @@ else
   fi
   if [[ -z "$consul_arg" ]]; then
     consul_arg="${CONSUL_HTTP_ADDR:-}"
-  fi
-  if [[ -z "$consul_arg" ]]; then
-    warn "请提供 Consul HTTP 地址（参数或环境变量 CONSUL_HTTP_ADDR）"
-    _exporter_cli_usage
-    exit 1
   fi
   setup_exporter_and_register "$consul_arg" || exit $?
 fi
