@@ -522,6 +522,11 @@ main() {
     exit 0
   fi
 
+  if [[ "$ENABLE_EXPORTER" == "1" ]]; then
+    log "提示: 当前将执行「完整 ModSecurity/宝塔」主流程（因已出现主安装类参数，例如 --force、--deploy-conf、--bt-openresty、--version、--extend-btwaf-cache 等）。"
+    log "提示: 「仅 exporter + Consul」与内置 Consul 地址/Token 时，请只写 --with-exporter 与/或 --with-consul-token（可省略 = 值），且不要加 --force 等主流程开关。"
+  fi
+
   # 可选：先安装宝塔面板，再做宝塔相关环境检查
   if [[ "${INSTALL_BAOTA_PANEL:-0}" == "1" ]]; then
     source "$INCLUDES_DIR/baota_install_panel.sh"
