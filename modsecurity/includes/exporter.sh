@@ -42,6 +42,7 @@
 #   SHELLSTACK_EXPORTER_GEO_CODE=HK         手工区域码（二位大写字母；与 PUBLIC_IP 可只设其一，另一项走 API）
 #   SHELLSTACK_EXPORTER_GEO_HOSTNAME=NAME    完全指定主机名（跳过 Geo/IP 拼接）
 #   SHELLSTACK_EXPORTER_FORCE=1  由 main.sh 在「仅 exporter + --force」时设置：强制重跑 exporter 各步骤（不触发 ModSecurity 主流程）
+#   textfile 采集（cron）可选：SHELLSTACK_MYSQL_SOCKET=socket路径  SHELLSTACK_REDIS_SOCKET=  SHELLSTACK_REDIS_HOST / SHELLSTACK_REDIS_PORT
 
 EXPORTER_LISTEN_PORT="${EXPORTER_LISTEN_PORT:-9100}"
 CONSUL_SERVICE_NAME="${CONSUL_SERVICE_NAME:-shellstack-node-exporter}"
@@ -464,6 +465,34 @@ emit_up() {
   echo "# TYPE shellstack_nginx_stub_writing gauge"
   echo "# HELP shellstack_nginx_stub_waiting stub_status Waiting"
   echo "# TYPE shellstack_nginx_stub_waiting gauge"
+  echo "# HELP shellstack_nginx_workers_total Nginx worker 进程数（负载侧写）"
+  echo "# TYPE shellstack_nginx_workers_total gauge"
+  echo "# HELP shellstack_nginx_stub_accepts_total stub_status accepts（累计）"
+  echo "# TYPE shellstack_nginx_stub_accepts_total counter"
+  echo "# HELP shellstack_nginx_stub_handled_total stub_status handled（累计）"
+  echo "# TYPE shellstack_nginx_stub_handled_total counter"
+  echo "# HELP shellstack_nginx_stub_requests_total stub_status requests（累计）"
+  echo "# TYPE shellstack_nginx_stub_requests_total counter"
+  echo "# HELP shellstack_php_fpm_workers_total 各版本 PHP-FPM pool 进程数"
+  echo "# TYPE shellstack_php_fpm_workers_total gauge"
+  echo "# HELP shellstack_redis_ping_ok redis-cli PING 是否成功（1/0）"
+  echo "# TYPE shellstack_redis_ping_ok gauge"
+  echo "# HELP shellstack_redis_used_memory_bytes Redis used_memory"
+  echo "# TYPE shellstack_redis_used_memory_bytes gauge"
+  echo "# HELP shellstack_redis_connected_clients Redis connected_clients"
+  echo "# TYPE shellstack_redis_connected_clients gauge"
+  echo "# HELP shellstack_redis_instantaneous_ops_per_sec Redis ops/s"
+  echo "# TYPE shellstack_redis_instantaneous_ops_per_sec gauge"
+  echo "# HELP shellstack_mysql_extstatus_ok mysqladmin extended-status 是否成功（1/0）"
+  echo "# TYPE shellstack_mysql_extstatus_ok gauge"
+  echo "# HELP shellstack_mysql_threads_connected 全局 Threads_connected"
+  echo "# TYPE shellstack_mysql_threads_connected gauge"
+  echo "# HELP shellstack_mysql_threads_running 全局 Threads_running"
+  echo "# TYPE shellstack_mysql_threads_running gauge"
+  echo "# HELP shellstack_mysql_queries_total 全局 Queries（累计）"
+  echo "# TYPE shellstack_mysql_queries_total counter"
+  echo "# HELP shellstack_mysql_uptime_seconds 全局 Uptime（秒）"
+  echo "# TYPE shellstack_mysql_uptime_seconds gauge"
 
   if [[ -d /www/server/panel ]]; then
     echo "shellstack_baota_paths_detected 1"
@@ -484,6 +513,10 @@ emit_up() {
   else
     pgrep -x nginx >/dev/null 2>&1 && emit_up nginx process 1 || emit_up nginx process 0
   fi
+  _nw=0
+  _nw="$(pgrep -cf 'nginx: worker process' 2>/dev/null)" || _nw=0
+  [[ "$_nw" =~ ^[0-9]+$ ]] || _nw=0
+  echo "shellstack_nginx_workers_total ${_nw:-0}"
 
   # MySQL / MariaDB
   if systemctl is-active --quiet mysqld 2>/dev/null || systemctl is-active --quiet mysql 2>/dev/null || systemctl is-active --quiet mariadb 2>/dev/null; then
@@ -494,6 +527,47 @@ emit_up() {
     emit_up mysql none 0
   fi
 
+  _madmin=""
+  for _cand in /www/server/mysql/bin/mysqladmin /www/server/mariadb/bin/mysqladmin /usr/bin/mysqladmin; do
+    [[ -x "$_cand" ]] && { _madmin="$_cand"; break; }
+  done
+  [[ -z "$_madmin" ]] && command -v mysqladmin >/dev/null 2>&1 && _madmin="$(command -v mysqladmin)"
+  _msock=""
+  for _s in ${SHELLSTACK_MYSQL_SOCKET:-} /tmp/mysql.sock /run/mysqld/mysqld.sock /var/run/mysqld/mysqld.sock /www/server/data/mysql.sock; do
+    [[ -z "$_s" ]] && continue
+    [[ -S "$_s" ]] || continue
+    if [[ -n "$_madmin" ]] && "$_madmin" --socket="$_s" --connect-timeout=2 ping >/dev/null 2>&1; then
+      _msock="$_s"
+      break
+    fi
+  done
+  if [[ -n "$_madmin" && -n "$_msock" ]]; then
+    _mst="$("$_madmin" --socket="$_msock" --connect-timeout=2 extended-status 2>/dev/null || true)"
+    if [[ -n "$_mst" ]] && echo "$_mst" | grep -qE 'Variable_name|Threads_connected'; then
+      echo "shellstack_mysql_extstatus_ok 1"
+      _v="$(echo "$_mst" | awk -F'|' 'NF>=3 { gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); if ($2=="Threads_connected") { gsub(/^[[:space:]]+|[[:space:]]+$/,"",$3); print $3+0; exit } }')"
+      [[ "$_v" =~ ^[0-9]+$ ]] && echo "shellstack_mysql_threads_connected $_v" || echo "shellstack_mysql_threads_connected 0"
+      _v="$(echo "$_mst" | awk -F'|' 'NF>=3 { gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); if ($2=="Threads_running") { gsub(/^[[:space:]]+|[[:space:]]+$/,"",$3); print $3+0; exit } }')"
+      [[ "$_v" =~ ^[0-9]+$ ]] && echo "shellstack_mysql_threads_running $_v" || echo "shellstack_mysql_threads_running 0"
+      _v="$(echo "$_mst" | awk -F'|' 'NF>=3 { gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); if ($2=="Uptime") { gsub(/^[[:space:]]+|[[:space:]]+$/,"",$3); print $3+0; exit } }')"
+      [[ "$_v" =~ ^[0-9]+$ ]] && echo "shellstack_mysql_uptime_seconds $_v" || echo "shellstack_mysql_uptime_seconds 0"
+      _v="$(echo "$_mst" | awk -F'|' 'NF>=3 { gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); if ($2=="Queries") { gsub(/^[[:space:]]+|[[:space:]]+$/,"",$3); print $3+0; exit } }')"
+      [[ "$_v" =~ ^[0-9]+$ ]] && echo "shellstack_mysql_queries_total $_v" || echo "shellstack_mysql_queries_total 0"
+    else
+      echo "shellstack_mysql_extstatus_ok 0"
+      echo "shellstack_mysql_threads_connected 0"
+      echo "shellstack_mysql_threads_running 0"
+      echo "shellstack_mysql_uptime_seconds 0"
+      echo "shellstack_mysql_queries_total 0"
+    fi
+  else
+    echo "shellstack_mysql_extstatus_ok 0"
+    echo "shellstack_mysql_threads_connected 0"
+    echo "shellstack_mysql_threads_running 0"
+    echo "shellstack_mysql_uptime_seconds 0"
+    echo "shellstack_mysql_queries_total 0"
+  fi
+
   # Redis
   if systemctl is-active --quiet redis 2>/dev/null || systemctl is-active --quiet redis-server 2>/dev/null; then
     emit_up redis systemd 1
@@ -501,6 +575,63 @@ emit_up() {
     emit_up redis process 1
   else
     emit_up redis none 0
+  fi
+
+  _rcli=""
+  for _cand in /www/server/redis/src/redis-cli /www/server/redis/redis-cli; do
+    [[ -x "$_cand" ]] && { _rcli="$_cand"; break; }
+  done
+  [[ -z "$_rcli" ]] && command -v redis-cli >/dev/null 2>&1 && _rcli="$(command -v redis-cli)"
+  if [[ -n "$_rcli" ]]; then
+    _inf=""
+    if [[ -n "${SHELLSTACK_REDIS_SOCKET:-}" ]]; then
+      if "$_rcli" -s "${SHELLSTACK_REDIS_SOCKET}" ping >/dev/null 2>&1; then
+        echo "shellstack_redis_ping_ok 1"
+        _inf="$("$_rcli" -s "${SHELLSTACK_REDIS_SOCKET}" INFO 2>/dev/null || true)"
+      else
+        echo "shellstack_redis_ping_ok 0"
+      fi
+    elif [[ -n "${SHELLSTACK_REDIS_HOST:-}" ]]; then
+      if "$_rcli" -h "${SHELLSTACK_REDIS_HOST}" -p "${SHELLSTACK_REDIS_PORT:-6379}" ping >/dev/null 2>&1; then
+        echo "shellstack_redis_ping_ok 1"
+        _inf="$("$_rcli" -h "${SHELLSTACK_REDIS_HOST}" -p "${SHELLSTACK_REDIS_PORT:-6379}" INFO 2>/dev/null || true)"
+      else
+        echo "shellstack_redis_ping_ok 0"
+      fi
+    else
+      if "$_rcli" ping >/dev/null 2>&1; then
+        echo "shellstack_redis_ping_ok 1"
+        _inf="$("$_rcli" INFO 2>/dev/null || true)"
+      elif [[ -S /tmp/redis.sock ]] && "$_rcli" -s /tmp/redis.sock ping >/dev/null 2>&1; then
+        echo "shellstack_redis_ping_ok 1"
+        _inf="$("$_rcli" -s /tmp/redis.sock INFO 2>/dev/null || true)"
+      elif [[ -S /www/server/redis/redis.sock ]] && "$_rcli" -s /www/server/redis/redis.sock ping >/dev/null 2>&1; then
+        echo "shellstack_redis_ping_ok 1"
+        _inf="$("$_rcli" -s /www/server/redis/redis.sock INFO 2>/dev/null || true)"
+      elif [[ -S /www/server/redis/run/redis.sock ]] && "$_rcli" -s /www/server/redis/run/redis.sock ping >/dev/null 2>&1; then
+        echo "shellstack_redis_ping_ok 1"
+        _inf="$("$_rcli" -s /www/server/redis/run/redis.sock INFO 2>/dev/null || true)"
+      else
+        echo "shellstack_redis_ping_ok 0"
+      fi
+    fi
+    if [[ -n "$_inf" ]]; then
+      _v="$(echo "$_inf" | awk -F: 'tolower($1)=="used_memory" {gsub(/\r/,"",$2); print $2+0; exit}')"
+      [[ "$_v" =~ ^[0-9]+$ ]] && echo "shellstack_redis_used_memory_bytes $_v" || echo "shellstack_redis_used_memory_bytes 0"
+      _v="$(echo "$_inf" | awk -F: 'tolower($1)=="connected_clients" {gsub(/\r/,"",$2); print $2+0; exit}')"
+      [[ "$_v" =~ ^[0-9]+$ ]] && echo "shellstack_redis_connected_clients $_v" || echo "shellstack_redis_connected_clients 0"
+      _v="$(echo "$_inf" | awk -F: 'tolower($1)=="instantaneous_ops_per_sec" {gsub(/\r/,"",$2); print $2+0; exit}')"
+      [[ "$_v" =~ ^[0-9]+$ ]] && echo "shellstack_redis_instantaneous_ops_per_sec $_v" || echo "shellstack_redis_instantaneous_ops_per_sec 0"
+    else
+      echo "shellstack_redis_used_memory_bytes 0"
+      echo "shellstack_redis_connected_clients 0"
+      echo "shellstack_redis_instantaneous_ops_per_sec 0"
+    fi
+  else
+    echo "shellstack_redis_ping_ok 0"
+    echo "shellstack_redis_used_memory_bytes 0"
+    echo "shellstack_redis_connected_clients 0"
+    echo "shellstack_redis_instantaneous_ops_per_sec 0"
   fi
 
   # 宝塔面板
@@ -519,8 +650,13 @@ emit_up() {
       if [[ -x "$bin" ]]; then
         if pgrep -af 'php-fpm: master process' 2>/dev/null | grep -qF "/www/server/php/${ver}/"; then
           printf 'shellstack_php_fpm_up{version="%s"} 1\n' "$ver"
+          _pc=0
+          _pc="$(pgrep -af 'php-fpm: pool' 2>/dev/null | grep -cF "/www/server/php/${ver}/" || true)"
+          [[ "$_pc" =~ ^[0-9]+$ ]] || _pc=0
+          printf 'shellstack_php_fpm_workers_total{version="%s"} %s\n' "$ver" "$_pc"
         else
           printf 'shellstack_php_fpm_up{version="%s"} 0\n' "$ver"
+          printf 'shellstack_php_fpm_workers_total{version="%s"} 0\n' "$ver"
         fi
       fi
     done
@@ -543,6 +679,19 @@ emit_up() {
       [[ "$rd" =~ ^[0-9]+$ ]] && echo "shellstack_nginx_stub_reading $rd"
       [[ "$wr" =~ ^[0-9]+$ ]] && echo "shellstack_nginx_stub_writing $wr"
       [[ "$wt" =~ ^[0-9]+$ ]] && echo "shellstack_nginx_stub_waiting $wt"
+      if echo "$body" | grep -q 'server accepts handled requests'; then
+        _al="$(echo "$body" | awk '/server accepts handled requests/{getline; print; exit}')"
+        _a1="$(echo "$_al" | awk '{print $1}')"
+        _a2="$(echo "$_al" | awk '{print $2}')"
+        _a3="$(echo "$_al" | awk '{print $3}')"
+        [[ "$_a1" =~ ^[0-9]+$ ]] && echo "shellstack_nginx_stub_accepts_total $_a1"
+        [[ "$_a2" =~ ^[0-9]+$ ]] && echo "shellstack_nginx_stub_handled_total $_a2"
+        [[ "$_a3" =~ ^[0-9]+$ ]] && echo "shellstack_nginx_stub_requests_total $_a3"
+      else
+        echo "shellstack_nginx_stub_accepts_total 0"
+        echo "shellstack_nginx_stub_handled_total 0"
+        echo "shellstack_nginx_stub_requests_total 0"
+      fi
       parsed=1
       break
     fi
@@ -552,6 +701,9 @@ emit_up() {
     echo "shellstack_nginx_stub_reading 0"
     echo "shellstack_nginx_stub_writing 0"
     echo "shellstack_nginx_stub_waiting 0"
+    echo "shellstack_nginx_stub_accepts_total 0"
+    echo "shellstack_nginx_stub_handled_total 0"
+    echo "shellstack_nginx_stub_requests_total 0"
   fi
 } >"$TMP"
 mv -f "$TMP" "$OUT"
