@@ -879,6 +879,15 @@ emit_up() {
   printf 'shellstack_process_up{role="%s",detail="%s"} %s\n' "$role" "$detail" "$val"
 }
 
+# set -u 时 Bash 4.2 等对空数组 "${_mextra[@]}" 会报错；用长度判断再展开
+_mysqladmin_x() {
+  if [[ ${#_mextra[@]} -gt 0 ]]; then
+    "$_madmin" "${_mextra[@]}" "$@"
+  else
+    "$_madmin" "$@"
+  fi
+}
+
 {
   echo "# HELP shellstack_exporter_textfile_info shellstack textfile 采集脚本心跳（1=本分钟已执行）"
   echo "# TYPE shellstack_exporter_textfile_info gauge"
@@ -1168,13 +1177,13 @@ emit_up() {
   for _s in ${SHELLSTACK_MYSQL_SOCKET:-} /tmp/mysql.sock /run/mysqld/mysqld.sock /var/run/mysqld/mysqld.sock /www/server/data/mysql.sock; do
     [[ -z "$_s" ]] && continue
     [[ -S "$_s" ]] || continue
-    if [[ -n "$_madmin" ]] && "$_madmin" "${_mextra[@]}" --socket="$_s" --connect-timeout=2 ping >/dev/null 2>&1; then
+    if [[ -n "$_madmin" ]] && _mysqladmin_x --socket="$_s" --connect-timeout=2 ping >/dev/null 2>&1; then
       _msock="$_s"
       break
     fi
   done
   if [[ -n "$_madmin" && -n "$_msock" ]]; then
-    _mst="$("$_madmin" "${_mextra[@]}" --socket="$_msock" --connect-timeout=2 extended-status 2>/dev/null || true)"
+    _mst="$(_mysqladmin_x --socket="$_msock" --connect-timeout=2 extended-status 2>/dev/null || true)"
     if [[ -n "$_mst" ]] && echo "$_mst" | grep -qE 'Variable_name|Threads_connected'; then
       echo "shellstack_mysql_extstatus_ok 1"
       _v="$(echo "$_mst" | awk -F'|' 'NF>=3 { gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); if ($2=="Threads_connected") { gsub(/^[[:space:]]+|[[:space:]]+$/,"",$3); print $3+0; exit } }')"
