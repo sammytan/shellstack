@@ -120,6 +120,39 @@ BT_OPENRESTY_VERSION="${BT_OPENRESTY_VERSION:-openresty127}"
 BT_OPENRESTY_FROM_CLI=0
 # 为 1 时表示用户还请求了 ModSecurity/宝塔 等主流程；与 ENABLE_EXPORTER 组合用于「仅 exporter」独立模式
 SHELLSTACK_MAIN_NON_EXPORTER_WORK=0
+# --force 先记入此变量，parse_args 结束后在 _shellstack_apply_cli_force_resolution 中判定：仅 exporter 时转为 SHELLSTACK_EXPORTER_FORCE
+SHELLSTACK_CLI_FORCE=0
+
+# 解析完参数后：--force 要么展开为 ModSecurity/宝塔全套，要么在「仅 exporter」场景下仅 export SHELLSTACK_EXPORTER_FORCE=1
+_shellstack_apply_cli_force_resolution() {
+  unset SHELLSTACK_EXPORTER_FORCE 2>/dev/null || true
+  if [[ "${SHELLSTACK_CLI_FORCE:-0}" != "1" ]]; then
+    return 0
+  fi
+  if [[ "$ENABLE_EXPORTER" == "1" ]] && [[ "${SHELLSTACK_MAIN_NON_EXPORTER_WORK:-0}" == "0" ]]; then
+    export SHELLSTACK_EXPORTER_FORCE=1
+    log "启用 --force（仅作用于 exporter）：将强制重跑主机名/textfile/防火墙/Consul 注册等 exporter 步骤；不启动 ModSecurity/宝塔主流程。"
+    log "提示: 若需要「重编宝塔 Nginx + ModSecurity 全套」式 --force，请同时指定主安装参数（如 --deploy-conf、--extend-btwaf-cache、--version 等），或不要带 --with-exporter 单独使用 --force。"
+    return 0
+  fi
+  if [[ "${BT_OPENRESTY_FROM_CLI:-0}" != "1" ]]; then
+    BT_OPENRESTY_VERSION="openresty"
+    BT_OPENRESTY_FROM_CLI=1
+    export BT_OPENRESTY_VERSION
+  fi
+  DEPLOY_MODSEC_CONF=1
+  EXTEND_BTWAF_CACHE=1
+  MODSECURITY_FORCE_BT_NGINX_REBUILD=1
+  SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK=1
+  SHELLSTACK_BTWAF_FORCE_PANEL_INSTALL=1
+  SHELLSTACK_INSTALL_REDIS=1
+  export MODSECURITY_FORCE_BT_NGINX_REBUILD
+  export SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK
+  export SHELLSTACK_BTWAF_FORCE_PANEL_INSTALL
+  export SHELLSTACK_INSTALL_REDIS
+  SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
+  log "启用 --force：将强制执行 nginx 重编译、nginx.conf http 块重注入、BTwaf 面板重装及 Redis 安装流程（OpenResty 版本优先使用显式 --bt-openresty）。"
+}
 
 # 解析命令行参数
 parse_args() {
@@ -221,25 +254,9 @@ parse_args() {
         shift
         ;;
       --force)
-        # 快捷强制模式：覆盖为宝塔 OpenResty + 下发配置 + 扩展 BTwaf
-        # 并启用强制重编译/重注入/重安装相关行为
-        if [[ "${BT_OPENRESTY_FROM_CLI:-0}" != "1" ]]; then
-          BT_OPENRESTY_VERSION="openresty"
-          BT_OPENRESTY_FROM_CLI=1
-          export BT_OPENRESTY_VERSION
-        fi
-        DEPLOY_MODSEC_CONF=1
-        EXTEND_BTWAF_CACHE=1
-        MODSECURITY_FORCE_BT_NGINX_REBUILD=1
-        SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK=1
-        SHELLSTACK_BTWAF_FORCE_PANEL_INSTALL=1
-        SHELLSTACK_INSTALL_REDIS=1
-        export MODSECURITY_FORCE_BT_NGINX_REBUILD
-        export SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK
-        export SHELLSTACK_BTWAF_FORCE_PANEL_INSTALL
-        export SHELLSTACK_INSTALL_REDIS
-        SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
-        log "启用 --force：将强制执行 nginx 重编译、nginx.conf http 块重注入、BTwaf 面板重装及 Redis 安装流程（OpenResty 版本优先使用显式 --bt-openresty）。"
+        # 具体语义在 parse_args 末尾 _shellstack_apply_cli_force_resolution：
+        # 若仅有 exporter 类参数则只设 SHELLSTACK_EXPORTER_FORCE；否则展开为宝塔/OpenResty/ModSecurity 全套强制
+        SHELLSTACK_CLI_FORCE=1
         shift
         ;;
       --deploy-conf)
@@ -334,6 +351,7 @@ parse_args() {
         ;;
     esac
   done
+  _shellstack_apply_cli_force_resolution
 }
 
 # 加载所有模块
@@ -514,7 +532,7 @@ main() {
   # 仅 --with-exporter / --with-consul-token（及可选 --disable-kernel-opt / --disable-terminal）时：不跑 ModSecurity 主安装，只执行 exporter + Consul
   if [[ "$ENABLE_EXPORTER" == "1" ]] && [[ "${SHELLSTACK_MAIN_NON_EXPORTER_WORK:-0}" == "0" ]]; then
     log "=========================================="
-    log "独立任务：仅部署 node_exporter + Consul 注册（与完整 ModSecurity 安装互斥；若需同时安装请再加如 --version=… 或 --deploy-conf 等参数）"
+    log "独立任务：仅部署 node_exporter + Consul 注册（可加 --force 仅强制重跑本流程；完整 ModSecurity/宝塔强制请另加 --deploy-conf 等主安装参数）"
     log "=========================================="
     source "$INCLUDES_DIR/exporter.sh"
     setup_exporter_and_register "${EXPORTER_CONSUL_ADDR:-}"
@@ -523,8 +541,8 @@ main() {
   fi
 
   if [[ "$ENABLE_EXPORTER" == "1" ]]; then
-    log "提示: 当前将执行「完整 ModSecurity/宝塔」主流程（因已出现主安装类参数，例如 --force、--deploy-conf、--bt-openresty、--version、--extend-btwaf-cache 等）。"
-    log "提示: 「仅 exporter + Consul」与内置 Consul 地址/Token 时，请只写 --with-exporter 与/或 --with-consul-token（可省略 = 值），且不要加 --force 等主流程开关。"
+    log "提示: 当前将执行「完整 ModSecurity/宝塔」主流程（因已出现主安装类参数，例如 --deploy-conf、--bt-openresty、--version、--extend-btwaf-cache，或与上述同时出现的 --force 全套展开）。"
+    log "提示: 「仅 exporter」时 --with-exporter/--with-consul-token 可省略 = 值；此场景下 --force 只强制重跑 exporter，不会触发本段主流程。"
   fi
 
   # 可选：先安装宝塔面板，再做宝塔相关环境检查

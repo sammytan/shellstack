@@ -41,6 +41,7 @@
 #   SHELLSTACK_EXPORTER_PUBLIC_IP=a.b.c.d   手工公网 IP（跳过出口 IP 探测）
 #   SHELLSTACK_EXPORTER_GEO_CODE=HK         手工区域码（二位大写字母；与 PUBLIC_IP 可只设其一，另一项走 API）
 #   SHELLSTACK_EXPORTER_GEO_HOSTNAME=NAME    完全指定主机名（跳过 Geo/IP 拼接）
+#   SHELLSTACK_EXPORTER_FORCE=1  由 main.sh 在「仅 exporter + --force」时设置：强制重跑 exporter 各步骤（不触发 ModSecurity 主流程）
 
 EXPORTER_LISTEN_PORT="${EXPORTER_LISTEN_PORT:-9100}"
 CONSUL_SERVICE_NAME="${CONSUL_SERVICE_NAME:-shellstack-node-exporter}"
@@ -171,7 +172,11 @@ _exporter_apply_geo_public_hostname() {
 
   cur="$(hostname 2>/dev/null || true)"
   if [[ "$cur" == "$name" ]]; then
-    log "主机名已是 ${name}，跳过写入"
+    if [[ "${SHELLSTACK_EXPORTER_FORCE:-}" == "1" ]]; then
+      log "主机名已是 ${name}（--force：跳过重写），继续 exporter 其它步骤"
+    else
+      log "主机名已是 ${name}，跳过写入"
+    fi
     return 0
   fi
 
@@ -1057,6 +1062,9 @@ EOF
 }
 
 setup_exporter_and_register() {
+  if [[ "${SHELLSTACK_EXPORTER_FORCE:-}" == "1" ]]; then
+    log "SHELLSTACK_EXPORTER_FORCE=1：强制重跑 exporter（textfile/cron/防火墙/Consul 等将覆盖/重注册）"
+  fi
   _exporter_apply_builtin_consul_defaults
 
   local consul_raw="${1:-${CONSUL_HTTP_ADDR:-}}"
