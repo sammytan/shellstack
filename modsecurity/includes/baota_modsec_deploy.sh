@@ -24,6 +24,9 @@ fi
 SHELLSTACK_DEPLOY_FASTCGI_CACHE="${SHELLSTACK_DEPLOY_FASTCGI_CACHE:-1}"
 # 为 1 时先删除 # shellstack-http-includes-begin … end 旧块再按当前环境重新注入（例如编译 modsecurity-nginx 后补全）
 SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK="${SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK:-0}"
+# nginx-module-vts：--deploy-conf 时写入 shellstack_vts.conf 并在 nginx.conf 中 include（需二进制已编入模块）
+SHELLSTACK_DEPLOY_NGINX_MODULE_VTS="${SHELLSTACK_DEPLOY_NGINX_MODULE_VTS:-1}"
+SHELLSTACK_VTS_LISTEN_PORT="${SHELLSTACK_VTS_LISTEN_PORT:-8898}"
 BT_WHITELIST_FILE="${BT_WHITELIST_FILE:-/www/server/whitelist.txt}"
 CRS_GIT_BRANCH="${CRS_GIT_BRANCH:-v3.3.5}"
 CRS_GIT_URL="${CRS_GIT_URL:-https://github.com/coreruleset/coreruleset.git}"
@@ -105,6 +108,71 @@ _baota_deploy_clone_crs() {
 _baota_nginx_has_modsecurity_module() {
   [[ -x "$BT_NGINX_BIN" ]] || return 1
   "$BT_NGINX_BIN" -V 2>&1 | grep -qi modsecurity
+}
+
+_baota_nginx_has_vts_module() {
+  [[ -x "$BT_NGINX_BIN" ]] || return 1
+  "$BT_NGINX_BIN" -V 2>&1 | grep -qiE 'vhost_traffic_status|ngx_http_vhost_traffic_status'
+}
+
+_baota_write_shellstack_vts_conf() {
+  local out="$BT_NGINX_CONF_DIR/shellstack_vts.conf"
+  local port="${SHELLSTACK_VTS_LISTEN_PORT:-8898}"
+  local ms_line=""
+  log "nginx-module-vts：正在生成独立片段文件（随后将 include 到 nginx.conf 的 http{}）"
+  log "  → 输出: $out；监听: 127.0.0.1:${port}；URI 前缀: /nginx-vts-status"
+  if _baota_nginx_has_modsecurity_module; then
+    ms_line="    modsecurity off;"
+    log "  → server 块内将写入 modsecurity off;（避免 WAF 拦截本机状态）"
+  fi
+  umask 022
+  {
+    echo "# shellstack: nginx-module-vts (https://github.com/vozlt/nginx-module-vts)"
+    echo "# 本机 Prometheus: curl -sS http://127.0.0.1:${port}/nginx-vts-status/format/prometheus"
+    echo "vhost_traffic_status_zone;"
+    echo ""
+    echo "server {"
+    echo "    listen 127.0.0.1:${port};"
+    echo "    server_name _;"
+    if [[ -n "$ms_line" ]]; then
+      echo "$ms_line"
+    fi
+    echo "    location /nginx-vts-status {"
+    echo "        vhost_traffic_status_bypass_stats on;"
+    echo "        vhost_traffic_status_bypass_limit on;"
+    echo "        vhost_traffic_status_display;"
+    echo "        vhost_traffic_status_display_format html;"
+    echo "    }"
+    echo "}"
+  } > "$out"
+  log "nginx-module-vts：片段文件已写入完成: $out"
+}
+
+_baota_ensure_nginx_conf_includes_vts() {
+  local ngx="$BT_NGINX_CONF_DIR/nginx.conf"
+  local line='        include /www/server/nginx/conf/shellstack_vts.conf;'
+  if [[ ! -f "$ngx" ]]; then
+    warn "nginx-module-vts：未找到主配置 $ngx，无法自动插入 include shellstack_vts.conf，请手工在 http{} 内加入: $line"
+    return 0
+  fi
+  log "nginx-module-vts：正在合并到主配置: $ngx"
+  if grep -qF 'shellstack_vts.conf' "$ngx" 2>/dev/null; then
+    log "nginx-module-vts：$ngx 已存在 shellstack_vts.conf 引用，跳过重复插入"
+    return 0
+  fi
+  local snip
+  snip="$(mktemp)"
+  printf '%s\n' "$line" > "$snip"
+  if grep -q 'include proxy.conf;' "$ngx"; then
+    sed -i '/include proxy.conf;/r '"$snip" "$ngx"
+    log "nginx-module-vts：已在 $ngx 的 include proxy.conf; 之后插入一行: $line"
+  elif grep -q 'default_type' "$ngx"; then
+    sed -i '/default_type[[:space:]]/r '"$snip" "$ngx"
+    log "nginx-module-vts：已在 $ngx 的 default_type 行之后插入一行: $line"
+  else
+    warn "nginx-module-vts：无法在 $ngx 中定位 include proxy.conf 或 default_type，请手工在 http{} 内加入: $line"
+  fi
+  rm -f "$snip"
 }
 
 # 在 http{} 内注入：real_ip 始终写入；modsecurity 仅当 nginx 已编进 modsecurity-nginx；fastcgi 共享区仅当开启 SHELLSTACK_DEPLOY_FASTCGI_CACHE 且尚未存在 keys_zone
@@ -359,6 +427,7 @@ baota_deploy_modsecurity_conf() {
     cat <<'RULES'
 SecRule REMOTE_ADDR "@geoLookup" "id:10001,phase:1,pass,log"
 SecRule REQUEST_URI "@beginsWith /vts_status" "id:10002,phase:1,nolog,pass,ctl:ruleEngine=Off"
+SecRule REQUEST_URI "@beginsWith /nginx-vts-status" "id:10006,phase:1,nolog,pass,ctl:ruleEngine=Off"
 SecRule REQUEST_URI "@beginsWith /e/e_DliR28KktG1dpud/" "id:10003,phase:1,nolog,pass,ctl:ruleEngine=Off"
 
 SecRule REMOTE_ADDR "@ipMatchFromFile /www/server/whitelist.txt" \
@@ -400,6 +469,23 @@ RULES
     _baota_inject_fastcgi_cache_into_enable_php_confs
   else
     log "SHELLSTACK_DEPLOY_FASTCGI_CACHE=0，跳过 enable-php 中的 FastCGI 缓存片段"
+  fi
+
+  if [[ "${SHELLSTACK_DEPLOY_NGINX_MODULE_VTS:-1}" == "1" ]]; then
+    log "=========================================="
+    log "--deploy-conf：nginx-module-vts（shellstack_vts.conf + nginx.conf include）"
+    log "=========================================="
+    if _baota_nginx_has_vts_module; then
+      log "检测: $BT_NGINX_BIN 已编入 vhost_traffic_status，继续写入片段并注入 nginx.conf"
+      _baota_write_shellstack_vts_conf
+      _baota_ensure_nginx_conf_includes_vts
+      log "nginx-module-vts：注入步骤结束；请执行: $BT_NGINX_BIN -t && /etc/init.d/nginx reload（或 systemctl reload nginx）"
+    else
+      log "检测: $BT_NGINX_BIN 的 nginx -V 未含 nginx-module-vts，跳过 shellstack_vts.conf 与 nginx.conf include"
+      log "（请重编 OpenResty；若故意不编 VTS 可 export SHELLSTACK_WITH_NGINX_MODULE_VTS=0）"
+    fi
+  else
+    log "SHELLSTACK_DEPLOY_NGINX_MODULE_VTS=0，跳过 nginx-module-vts 片段与 nginx.conf include"
   fi
 
   log "配置部署完成。请确认 GeoIP 数据库路径、执行 nginx -t 后重载 Nginx。"

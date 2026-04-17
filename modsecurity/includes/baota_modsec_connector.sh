@@ -3,6 +3,12 @@
 # 依赖: 已安装 libmodsecurity（pkg-config libmodsecurity）、/www/server/panel/install/nginx.sh
 
 MODSECURITY_NGX_CONNECTOR_DIR="${MODSECURITY_NGX_CONNECTOR_DIR:-/www/server/modsecurity-nginx}"
+# nginx-module-vts：https://github.com/vozlt/nginx-module-vts（与 ModSecurity 并列 --add-module 编译）
+NGINX_MODULE_VTS_DIR="${NGINX_MODULE_VTS_DIR:-/www/server/nginx-module-vts}"
+# 非空时 shallow clone 指定 tag/分支（例 v0.2.5）；空则默认远端默认分支
+NGINX_MODULE_VTS_GIT_TAG="${NGINX_MODULE_VTS_GIT_TAG:-}"
+# 默认随宝塔 OpenResty 重编一并编入 nginx-module-vts；设 0 关闭：SHELLSTACK_WITH_NGINX_MODULE_VTS=0
+SHELLSTACK_WITH_NGINX_MODULE_VTS="${SHELLSTACK_WITH_NGINX_MODULE_VTS:-1}"
 BT_PANEL_INSTALL_SOFT_SH="${BT_PANEL_INSTALL_SOFT_SH:-/www/server/panel/install/install_soft.sh}"
 BT_OPENRESTY_VERSION="${BT_OPENRESTY_VERSION:-openresty127}"
 # 设为 1 时强制执行宝塔 nginx.sh update（跳过「已就绪」检测）
@@ -219,6 +225,73 @@ _baota_register_modsecurity_with_panel() {
   log "已按宝塔扩展方式登记 ModSecurity: ${config_pl} + ${args_pl}"
 }
 
+_clone_nginx_module_vts() {
+  local dest="$1"
+  if [[ -d "$dest/.git" ]] || [[ -f "$dest/config" ]]; then
+    log "nginx-module-vts 源码已存在: $dest"
+    return 0
+  fi
+  mkdir -p "$(dirname "$dest")"
+  local tag="${NGINX_MODULE_VTS_GIT_TAG:-}"
+  local urls=(
+    "https://github.com/vozlt/nginx-module-vts.git"
+    "https://ghproxy.net/https://github.com/vozlt/nginx-module-vts.git"
+    "https://mirror.ghproxy.com/https://github.com/vozlt/nginx-module-vts.git"
+  )
+  local u
+  for u in "${urls[@]}"; do
+    log "尝试克隆 nginx-module-vts: $u"
+    rm -rf "$dest"
+    if [[ -n "$tag" ]]; then
+      if GIT_TERMINAL_PROMPT=0 git clone --depth 1 --branch "$tag" "$u" "$dest" >>"$LOG_FILE" 2>&1; then
+        [[ -f "$dest/config" ]] && return 0
+      fi
+      rm -rf "$dest"
+      log "按标签 ${tag} 克隆失败，尝试默认分支"
+    fi
+    if GIT_TERMINAL_PROMPT=0 git clone --depth 1 "$u" "$dest" >>"$LOG_FILE" 2>&1; then
+      [[ -f "$dest/config" ]] && return 0
+    fi
+  done
+  return 1
+}
+
+_baota_register_nginx_module_vts_with_panel() {
+  local vts_src="$1"
+  local nginx_install_dir="/www/server/panel/install/nginx"
+  local mod_dir="${nginx_install_dir}/nginx_module_vts"
+  local config_pl="${nginx_install_dir}/config.pl"
+  local args_pl="${mod_dir}/args.pl"
+  local ps_pl="${mod_dir}/ps.pl"
+
+  mkdir -p "$mod_dir"
+  [[ -f "$config_pl" ]] || touch "$config_pl"
+
+  if grep -qE '^[[:space:]]*nginx_module_vts[[:space:]]*$' "$config_pl" 2>/dev/null; then
+    awk '
+      {
+        line=$0
+        gsub(/\r/, "", line)
+        sub(/^[ \t]+/, "", line)
+        sub(/[ \t]+$/, "", line)
+        if (line=="nginx_module_vts") {
+          c++
+          if (c==1) print "nginx_module_vts"
+          next
+        }
+        print $0
+      }
+    ' "$config_pl" > "${config_pl}.tmp.shellstack-vts" && mv -f "${config_pl}.tmp.shellstack-vts" "$config_pl"
+  else
+    echo "nginx_module_vts" >> "$config_pl"
+  fi
+
+  echo "--add-module=${vts_src}" > "$args_pl"
+  [[ -f "$ps_pl" ]] || echo "nginx_module_vts" > "$ps_pl"
+
+  log "已按宝塔扩展方式登记 nginx-module-vts: ${config_pl} + ${args_pl}"
+}
+
 # 当前 Nginx 是否已是「目标 OpenResty 键 + 已编进 ModSecurity-nginx」，可跳过重复 nginx.sh update
 _baota_skip_openresty_rebuild_if_current() {
   [[ "${MODSECURITY_FORCE_BT_NGINX_REBUILD}" == "1" ]] && return 1
@@ -233,6 +306,11 @@ _baota_skip_openresty_rebuild_if_current() {
   [[ -x "$nginx_bin" ]] || return 1
   if ! "$nginx_bin" -V 2>&1 | grep -qi modsecurity; then
     return 1
+  fi
+  if [[ "${SHELLSTACK_WITH_NGINX_MODULE_VTS:-1}" != "0" ]]; then
+    if ! "$nginx_bin" -V 2>&1 | grep -qiE 'vhost_traffic_status|ngx_http_vhost_traffic_status'; then
+      return 1
+    fi
   fi
   [[ -f "$vchk" ]] || return 1
 
@@ -431,6 +509,9 @@ baota_install_openresty_with_modsecurity_connector() {
     setup_path="$(_baota_detect_nginx_setup_path 2>/dev/null || true)"
     cur_ver="$(head -1 "${setup_path}/version_check.pl" 2>/dev/null | tr -d '\n')"
     log "当前为 OpenResty（version_check.pl: ${cur_ver:-unknown}），nginx -V 已含 ModSecurity；按 --bt-openresty=${BT_OPENRESTY_VERSION} 视为满足（不校验具体 1.27/1.25 等号段），跳过重复 nginx.sh update。"
+    if [[ "${SHELLSTACK_WITH_NGINX_MODULE_VTS:-1}" != "0" ]] && [[ -n "$nginx_bin" ]] && "$nginx_bin" -V 2>&1 | grep -qiE 'vhost_traffic_status|ngx_http_vhost_traffic_status'; then
+      log "nginx -V 已含 nginx-module-vts（vhost_traffic_status），与默认一并编入一致，跳过重编。"
+    fi
     log "若需强制重新编译 Nginx，请设置: export MODSECURITY_FORCE_BT_NGINX_REBUILD=1 后重跑。"
     if [[ -n "$nginx_bin" ]] && "$nginx_bin" -V 2>&1 | grep -qi modsecurity; then
       log "验证: nginx -V 已包含 modsecurity"
@@ -450,6 +531,20 @@ baota_install_openresty_with_modsecurity_connector() {
 
   _baota_merge_nginx_prepare_modsec "$modsec_prefix"
   _baota_register_modsecurity_with_panel "$MODSECURITY_NGX_CONNECTOR_DIR"
+
+  if [[ "${SHELLSTACK_WITH_NGINX_MODULE_VTS:-1}" == "0" ]]; then
+    log "已跳过 nginx-module-vts（SHELLSTACK_WITH_NGINX_MODULE_VTS=0）"
+  else
+    log "------------------------------------------"
+    log "nginx-module-vts：随本次 OpenResty 重编一并静态编译（https://github.com/vozlt/nginx-module-vts）"
+    log "源码目录: ${NGINX_MODULE_VTS_DIR}；可选标签: ${NGINX_MODULE_VTS_GIT_TAG:-（默认分支）}"
+    log "宝塔登记: panel/install/nginx/config.pl 增加 nginx_module_vts + nginx_module_vts/args.pl"
+    log "------------------------------------------"
+    if ! _clone_nginx_module_vts "$NGINX_MODULE_VTS_DIR"; then
+      error "无法克隆 nginx-module-vts，请检查网络或设置 NGINX_MODULE_VTS_DIR 指向已有源码、NGINX_MODULE_VTS_GIT_TAG 是否正确。"
+    fi
+    _baota_register_nginx_module_vts_with_panel "$NGINX_MODULE_VTS_DIR"
+  fi
 
   log "=========================================="
   log "调用宝塔 Nginx 编译安装流程"
@@ -473,4 +568,7 @@ baota_install_openresty_with_modsecurity_connector() {
   _baota_cleanup_shellstack_temp_files
 
   log "宝塔 OpenResty 更新与 ModSecurity-nginx 集成步骤完成。请执行: nginx -t && /etc/init.d/nginx restart"
+  if [[ "${SHELLSTACK_WITH_NGINX_MODULE_VTS:-1}" != "0" ]]; then
+    log "验收 nginx-module-vts: /www/server/nginx/sbin/nginx -V 2>&1 | grep -i vhost_traffic"
+  fi
 }

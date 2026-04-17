@@ -204,7 +204,7 @@ ModSecurity 核心库安装脚本
   --with-exporter[=ADDR] 安装 node exporter 并注册 Consul。**ADDR 可省略**（用 exporter 内置 Consul）；**可指定**如 http://10.0.0.1:8500 或 10.0.0.1:8500。写法：--with-exporter=URL、--with-exporter URL、或单独 --with-exporter。若命令行仅有本参数与/或 --with-consul-token（及可选 --disable-kernel-opt / --disable-terminal），则**不执行** ModSecurity 主安装，仅 exporter 独立流程。
   --with-consul-token[=TOKEN]  Consul ACL（等价 CONSUL_HTTP_TOKEN）。**TOKEN 可省略**（用内置 Token）；**可指定**密钥。单独使用也会启用 exporter 独立流程。写法：--with-consul-token=SECRET、--with-consul-token SECRET、或单独 --with-consul-token。可与 --with-exporter 任意组合（只指定其一则另一项用内置）。
   --deploy-conf          宝塔环境：部署 ModSecurity / OWASP CRS / custom 规则、nginx.conf 引用，并在 nginx.conf 与 enable-php-*.conf 中开启 FastCGI 缓存（需宝塔 Nginx）
-  --bt-openresty=VER    宝塔 nginx.sh 的 OpenResty 版本键（默认 openresty127，可选 openresty 等）
+  --bt-openresty=VER    宝塔 nginx.sh 的 OpenResty 版本键（默认 openresty127，可选 openresty 等）；**重编时默认一并静态编译 nginx-module-vts**（https://github.com/vozlt/nginx-module-vts，登记 panel/install/nginx/nginx_module_vts）；不需要额外参数。关闭：SHELLSTACK_WITH_NGINX_MODULE_VTS=0；源码/标签：NGINX_MODULE_VTS_DIR、NGINX_MODULE_VTS_GIT_TAG；--deploy-conf 注入本机状态：SHELLSTACK_VTS_LISTEN_PORT、SHELLSTACK_DEPLOY_NGINX_MODULE_VTS
   说明: 使用 --deploy-conf 或 --bt-openresty 时须已安装宝塔面板与 BTwaf；--extend-btwaf-cache 仅需宝塔面板（将调用面板 WAF 安装脚本并下发扩展）。
   说明: --deploy-conf 写入 nginx.conf 时仅在 \`nginx -V\` 含 modsecurity 时注入 modsecurity 指令；SHELLSTACK_DEPLOY_FASTCGI_CACHE=0 可关闭 fastcgi 共享区与 enable-php 缓存；编译 ModSecurity-nginx 后可用 SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK=1 删除旧块并重注入。
   说明: --deploy-conf 从 ModSecurity 仓库复制 modsecurity.conf-recommended / unicode.mapping；若 git 失败会回退从 raw.githubusercontent.com/owasp-modsecurity/ModSecurity 下载（MODSECURITY_CONF_SAMPLES_TAG 默认 v3.0.10）。

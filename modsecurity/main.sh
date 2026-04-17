@@ -118,6 +118,8 @@ DEPLOY_MODSEC_CONF=0
 BT_OPENRESTY_VERSION="${BT_OPENRESTY_VERSION:-openresty127}"
 # 是否从命令行传入 --bt-openresty（用于与默认区分，触发宝塔环境预检）
 BT_OPENRESTY_FROM_CLI=0
+# nginx-module-vts 默认随 --bt-openresty / --deploy-conf 触发的重编一并编译；设 0 关闭：SHELLSTACK_WITH_NGINX_MODULE_VTS=0
+SHELLSTACK_WITH_NGINX_MODULE_VTS="${SHELLSTACK_WITH_NGINX_MODULE_VTS:-1}"
 # 为 1 时表示用户还请求了 ModSecurity/宝塔 等主流程；与 ENABLE_EXPORTER 组合用于「仅 exporter」独立模式
 SHELLSTACK_MAIN_NON_EXPORTER_WORK=0
 # --force 先记入此变量，parse_args 结束后在 _shellstack_apply_cli_force_resolution 中判定：仅 exporter 时转为 SHELLSTACK_EXPORTER_FORCE
