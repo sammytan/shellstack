@@ -405,6 +405,8 @@ show_help() {
   echo "  # 远程执行 modsecurity（宝塔 OpenResty + 配置 + BTwaf 缓存 + Consul 注册 exporter）"
   echo "  # 使用 bash -s：后面的参数会传给 shellstack.sh（首参必须是模块名 modsecurity）"
   echo "  curl -fsSL ${BASE_URL}/shellstack.sh | sudo bash -s modsecurity --bt-openresty=openresty127 --deploy-conf --extend-btwaf-cache --with-exporter=http://127.0.0.1:8500 --with-consul-token=YOUR_TOKEN"
+  echo "  # 强制覆盖全流程 + exporter/Consul（--force：等价重编宝塔 Nginx、重注 nginx.conf http、扩展 BTwaf、Redis 等；与 --with-exporter 可同时用）"
+  echo "  curl -fsSL ${BASE_URL}/shellstack.sh | sudo bash -s modsecurity --with-exporter=http://CONSUL_HOST:8500 --with-consul-token=YOUR_TOKEN --force"
   echo "  # 仅 exporter + Consul（ADDR/TOKEN 可省略=内置；可只指定一项，= 与空格两种写法均可）："
   echo "  curl -fsSL ${BASE_URL}/shellstack.sh | sudo bash -s modsecurity --with-exporter --with-consul-token"
   echo "  curl -fsSL ${BASE_URL}/shellstack.sh | sudo bash -s modsecurity --with-exporter=http://CONSUL:8500 --with-consul-token=SECRET"
