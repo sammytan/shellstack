@@ -44,7 +44,11 @@
 #   SHELLSTACK_EXPORTER_GEO_CODE=HK         手工区域码（二位大写字母；与 PUBLIC_IP 可只设其一，另一项走 API）
 #   SHELLSTACK_EXPORTER_GEO_HOSTNAME=NAME    完全指定主机名（跳过 Geo/IP 拼接）
 #   SHELLSTACK_EXPORTER_FORCE=1  由 main.sh 在「仅 exporter + --force」时设置：强制重跑 exporter 各步骤（不触发 ModSecurity 主流程）
-#   textfile 采集（cron）可选：SHELLSTACK_MYSQL_SOCKET=socket路径  SHELLSTACK_REDIS_SOCKET=  SHELLSTACK_REDIS_HOST / SHELLSTACK_REDIS_PORT
+#   textfile 采集（cron）可选：SHELLSTACK_MYSQL_SOCKET=socket路径；
+#     MySQL root 等需密码时（否则 mysqladmin 报 Access denied）：任选其一
+#     — SHELLSTACK_MYSQL_DEFAULTS_FILE=/root/.my.cnf（推荐，文件 chmod 600；[client] 含 user/password）
+#     — SHELLSTACK_MYSQL_USER= SHELLSTACK_MYSQL_PASSWORD=（部署 exporter 时若已 export，会写入 cron 行；密码亦可见于 /etc/cron.d，敏感环境请用 defaults-file）
+#   SHELLSTACK_REDIS_SOCKET=  SHELLSTACK_REDIS_HOST / SHELLSTACK_REDIS_PORT
 #   SHELLSTACK_TEXTFILE_SKIP_HOST_METRICS=1  不在 textfile 中写入 shellstack_host_*（仅用 node_exporter 的 node_*）
 #   日志：/var/log/shellstack-node-exporter-textfile.log = exporter 首次执行 textfile 时 tee 至此 + 部署标记行，之后 cron 每分钟追加；指标仍在 .prom。**prometheus-node-exporter** 用 journalctl（如 journalctl -u prometheus-node-exporter -e）。
 #   CentOS/RHEL 7：默认仓库无 node_exporter 时脚本会尝试启用 epel-release 并安装 golang-github-prometheus-node-exporter；仍失败则从 GitHub 下载官方二进制至 /usr/local/bin 并写入 systemd 单元（见下）。
@@ -1152,17 +1156,25 @@ emit_up() {
     [[ -x "$_cand" ]] && { _madmin="$_cand"; break; }
   done
   [[ -z "$_madmin" ]] && command -v mysqladmin >/dev/null 2>&1 && _madmin="$(command -v mysqladmin)"
+  _mextra=()
+  if [[ -n "${SHELLSTACK_MYSQL_DEFAULTS_FILE:-}" && -f "${SHELLSTACK_MYSQL_DEFAULTS_FILE}" ]]; then
+    _mextra=(--defaults-file="${SHELLSTACK_MYSQL_DEFAULTS_FILE}")
+  elif [[ -n "${SHELLSTACK_MYSQL_PASSWORD:-}" ]]; then
+    _mextra=(-u"${SHELLSTACK_MYSQL_USER:-root}" --password="${SHELLSTACK_MYSQL_PASSWORD}")
+  elif [[ -n "${SHELLSTACK_MYSQL_USER:-}" ]]; then
+    _mextra=(-u"${SHELLSTACK_MYSQL_USER}")
+  fi
   _msock=""
   for _s in ${SHELLSTACK_MYSQL_SOCKET:-} /tmp/mysql.sock /run/mysqld/mysqld.sock /var/run/mysqld/mysqld.sock /www/server/data/mysql.sock; do
     [[ -z "$_s" ]] && continue
     [[ -S "$_s" ]] || continue
-    if [[ -n "$_madmin" ]] && "$_madmin" --socket="$_s" --connect-timeout=2 ping >/dev/null 2>&1; then
+    if [[ -n "$_madmin" ]] && "$_madmin" "${_mextra[@]}" --socket="$_s" --connect-timeout=2 ping >/dev/null 2>&1; then
       _msock="$_s"
       break
     fi
   done
   if [[ -n "$_madmin" && -n "$_msock" ]]; then
-    _mst="$("$_madmin" --socket="$_msock" --connect-timeout=2 extended-status 2>/dev/null || true)"
+    _mst="$("$_madmin" "${_mextra[@]}" --socket="$_msock" --connect-timeout=2 extended-status 2>/dev/null || true)"
     if [[ -n "$_mst" ]] && echo "$_mst" | grep -qE 'Variable_name|Threads_connected'; then
       echo "shellstack_mysql_extstatus_ok 1"
       _v="$(echo "$_mst" | awk -F'|' 'NF>=3 { gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); if ($2=="Threads_connected") { gsub(/^[[:space:]]+|[[:space:]]+$/,"",$3); print $3+0; exit } }')"
@@ -1361,18 +1373,41 @@ EOSCRIPT
   touch "$tlog" 2>/dev/null || tlog="/tmp/shellstack-node-exporter-textfile.log"
   touch "$tlog" 2>/dev/null || true
   chmod 0644 "$tlog" 2>/dev/null || true
+  local _mysql_cron=""
+  if [[ -n "${SHELLSTACK_MYSQL_DEFAULTS_FILE:-}" ]]; then
+    _mysql_cron+=" SHELLSTACK_MYSQL_DEFAULTS_FILE=$(printf '%q' "${SHELLSTACK_MYSQL_DEFAULTS_FILE}")"
+  fi
+  if [[ -n "${SHELLSTACK_MYSQL_USER:-}" ]]; then
+    _mysql_cron+=" SHELLSTACK_MYSQL_USER=$(printf '%q' "${SHELLSTACK_MYSQL_USER}")"
+  fi
+  if [[ -n "${SHELLSTACK_MYSQL_PASSWORD:-}" ]]; then
+    _mysql_cron+=" SHELLSTACK_MYSQL_PASSWORD=$(printf '%q' "${SHELLSTACK_MYSQL_PASSWORD}")"
+  fi
+  if [[ -n "${SHELLSTACK_MYSQL_SOCKET:-}" ]]; then
+    _mysql_cron+=" SHELLSTACK_MYSQL_SOCKET=$(printf '%q' "${SHELLSTACK_MYSQL_SOCKET}")"
+  fi
   cat >"$cronf" <<EOF
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
-* * * * * root TEXTFILE_DIR=$dir SHELLSTACK_NGINX_STUB_URLS=$effective_urls $bin >>$tlog 2>&1
+* * * * * root TEXTFILE_DIR=$dir SHELLSTACK_NGINX_STUB_URLS=$effective_urls${_mysql_cron} $bin >>$tlog 2>&1
 EOF
   chmod 644 "$cronf" 2>/dev/null || true
 
   # 首次执行原只写入 LOG_FILE，用户查看 $tlog 会误以为未运行；同时 tee 到 $tlog（与 cron 同一文件）
   if [[ -n "${LOG_FILE:-}" ]]; then
-    TEXTFILE_DIR="$dir" SHELLSTACK_NGINX_STUB_URLS="$effective_urls" bash "$bin" 2>&1 | tee -a "$LOG_FILE" "$tlog"
+    TEXTFILE_DIR="$dir" SHELLSTACK_NGINX_STUB_URLS="$effective_urls" \
+      SHELLSTACK_MYSQL_DEFAULTS_FILE="${SHELLSTACK_MYSQL_DEFAULTS_FILE:-}" \
+      SHELLSTACK_MYSQL_USER="${SHELLSTACK_MYSQL_USER:-}" \
+      SHELLSTACK_MYSQL_PASSWORD="${SHELLSTACK_MYSQL_PASSWORD:-}" \
+      SHELLSTACK_MYSQL_SOCKET="${SHELLSTACK_MYSQL_SOCKET:-}" \
+      bash "$bin" 2>&1 | tee -a "$LOG_FILE" "$tlog"
   else
-    TEXTFILE_DIR="$dir" SHELLSTACK_NGINX_STUB_URLS="$effective_urls" bash "$bin" 2>&1 | tee -a "$tlog"
+    TEXTFILE_DIR="$dir" SHELLSTACK_NGINX_STUB_URLS="$effective_urls" \
+      SHELLSTACK_MYSQL_DEFAULTS_FILE="${SHELLSTACK_MYSQL_DEFAULTS_FILE:-}" \
+      SHELLSTACK_MYSQL_USER="${SHELLSTACK_MYSQL_USER:-}" \
+      SHELLSTACK_MYSQL_PASSWORD="${SHELLSTACK_MYSQL_PASSWORD:-}" \
+      SHELLSTACK_MYSQL_SOCKET="${SHELLSTACK_MYSQL_SOCKET:-}" \
+      bash "$bin" 2>&1 | tee -a "$tlog"
   fi
   [[ "${PIPESTATUS[0]:-0}" -ne 0 ]] && warn "首次执行 textfile 采集脚本失败（退出码 ${PIPESTATUS[0]}）"
   {
