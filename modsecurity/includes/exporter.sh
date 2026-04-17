@@ -394,14 +394,36 @@ _exporter_baota_nginx_conf_ensure_shellstack_include() {
   return 0
 }
 
+# 当前二进制是否静态/动态编入了 ModSecurity-nginx 连接器（无则不得写 modsecurity 指令）
+_exporter_nginx_has_modsecurity_connector() {
+  local ngx_bin="$1" v
+  [[ -x "$ngx_bin" ]] || return 1
+  v="$("$ngx_bin" -V 2>&1)" || return 1
+  case $v in
+    *ngx_http_modsecurity_module*) return 0 ;;
+  esac
+  if printf '%s' "$v" | grep -qiE '--add-(dynamic-)?module=[^ ]*[Mm]od[Ss]ecurity'; then
+    return 0
+  fi
+  if printf '%s' "$v" | grep -qiF 'modsecurity-nginx'; then
+    return 0
+  fi
+  return 1
+}
+
 # 写入 /www/server/nginx/conf/shellstack_status.conf：127.0.0.1 stub_status + 各 PHP-FPM pm.status_path（默认 URI /status）
 _exporter_write_baota_shellstack_status_conf() {
   local port="$1"
+  local ngx_bin="${2:-/www/server/nginx/sbin/nginx}"
   local out="/www/server/nginx/conf/shellstack_status.conf"
   local fcgi_line="fastcgi_params"
   local root_dir="/www/server/nginx/html"
+  local _has_ms=0
   [[ -d "$root_dir" ]] || root_dir="/tmp"
   [[ -f /www/server/nginx/conf/fastcgi.conf ]] && fcgi_line="/www/server/nginx/conf/fastcgi.conf"
+  if _exporter_nginx_has_modsecurity_connector "$ngx_bin"; then
+    _has_ms=1
+  fi
 
   {
     echo "# shellstack exporter 生成：127.0.0.1:${port}，仅供本机采集；重跑 --with-exporter 会覆盖"
@@ -410,12 +432,16 @@ _exporter_write_baota_shellstack_status_conf() {
     echo "server {"
     echo "    listen 127.0.0.1:${port};"
     echo "    server_name 127.0.0.1;"
+    if [[ "$_has_ms" -eq 1 ]]; then
+      echo "    # 已检测到 ModSecurity-nginx 模块：继承 http{} 的 modsecurity on 会拦 stub/status，本 server 关闭"
+      echo "    modsecurity off;"
+    fi
     echo "    root ${root_dir};"
     echo "    location /nginx_stub_status {"
     echo "        stub_status on;"
     echo "        access_log off;"
-    echo "        allow 127.0.0.1;"
-    echo "        deny all;"
+    echo "        # 仅监听 127.0.0.1 时已等效隔离；勿用 allow 127.0.0.1：http 级 real_ip 可能改写 \$remote_addr 致误拒"
+    echo "        allow all;"
     echo "    }"
   } >"$out"
 
@@ -425,8 +451,10 @@ _exporter_write_baota_shellstack_status_conf() {
     {
       echo "    location = /shellstack-fpm-status-${tag} {"
       echo "        access_log off;"
-      echo "        allow 127.0.0.1;"
-      echo "        deny all;"
+      if [[ "$_has_ms" -eq 1 ]]; then
+        echo "        modsecurity off;"
+      fi
+      echo "        allow all;"
       echo "        include ${fcgi_line};"
       echo "        fastcgi_pass unix:${sk};"
       echo "        fastcgi_param REQUEST_URI /status;"
@@ -467,7 +495,7 @@ _exporter_inject_baota_nginx_stub_status() {
     _fpm_hint+=" http://127.0.0.1:${port}/shellstack-fpm-status-${tag}"
   done < <(_exporter_baota_list_php_fpm_status_sockets)
 
-  _exporter_write_baota_shellstack_status_conf "$port"
+  _exporter_write_baota_shellstack_status_conf "$port" "$ngx_bin"
 
   if grep -qF 'shellstack_stub_status.conf' "$ngx_main" 2>/dev/null; then
     sed -i.bak-shellstack-mig 's|shellstack_stub_status\.conf|shellstack_status.conf|g' "$ngx_main" 2>>"$LOG_FILE" || true
