@@ -242,7 +242,11 @@ _btwaf_panel_btwaf_already_installed() {
 _btwaf_run_panel_btwaf_install() {
   local ins="$BTWAF_PLUGIN_DIR/install.sh"
   if [[ ! -f "$ins" ]]; then
-    error "未找到面板 BTwaf 安装脚本: $ins。请先在宝塔「软件商店」安装「宝塔网站防火墙」插件后再执行 --extend-btwaf-cache。"
+    error "未找到面板 BTwaf 安装脚本: $ins。
+
+请先在宝塔面板中打开「软件商店」，安装「宝塔网站防火墙」，并在面板中进入网站防火墙（WAF）侧完成安装后，再在本机执行：
+
+curl https://shellstack.910918920801.xyz/shellstack.sh | bash -s modsecurity --extend-btwaf-cache"
   fi
   if [[ "${SHELLSTACK_BTWAF_PANEL_INSTALL:-1}" != "1" ]]; then
     log "SHELLSTACK_BTWAF_PANEL_INSTALL=0，跳过面板 install.sh install"

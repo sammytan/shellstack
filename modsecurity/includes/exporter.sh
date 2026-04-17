@@ -49,6 +49,10 @@
 #     — SHELLSTACK_MYSQL_DEFAULTS_FILE=/root/.my.cnf（推荐，文件 chmod 600；[client] 含 user/password）
 #     — SHELLSTACK_MYSQL_USER= SHELLSTACK_MYSQL_PASSWORD=（部署 exporter 时若已 export，会写入 cron 行；密码亦可见于 /etc/cron.d，敏感环境请用 defaults-file）
 #   SHELLSTACK_REDIS_SOCKET=  SHELLSTACK_REDIS_HOST / SHELLSTACK_REDIS_PORT
+#   nginx-module-vts（与 baota_modsec_deploy 的 shellstack_vts.conf 一致）：textfile 每分钟抓取
+#     http://127.0.0.1:${SHELLSTACK_VTS_LISTEN_PORT:-8898}/nginx-vts-status/format/prometheus
+#     并原样写入同 .prom（指标名多为 nginx_vts_*）；SHELLSTACK_NGINX_VTS_PROM_URL 可覆盖完整 URL；
+#     SHELLSTACK_NGINX_VTS_PROM_DISABLE=1 关闭抓取（shellstack_nginx_vts_scrape_ok=0）
 #   SHELLSTACK_TEXTFILE_SKIP_HOST_METRICS=1  不在 textfile 中写入 shellstack_host_*（仅用 node_exporter 的 node_*）
 #   日志：/var/log/shellstack-node-exporter-textfile.log = exporter 首次执行 textfile 时 tee 至此 + 部署标记行，之后 cron 每分钟追加；指标仍在 .prom。**prometheus-node-exporter** 用 journalctl（如 journalctl -u prometheus-node-exporter -e）。
 #   CentOS/RHEL 7：默认仓库无 node_exporter 时脚本会尝试启用 epel-release 并安装 golang-github-prometheus-node-exporter；仍失败则从 GitHub 下载官方二进制至 /usr/local/bin 并写入 systemd 单元（见下）。
@@ -864,7 +868,7 @@ _exporter_install_baota_textfile_collector() {
   local bin="/usr/local/bin/shellstack-node-exporter-textfile.sh"
   cat >"$bin" <<'EOSCRIPT'
 #!/bin/bash
-# Prometheus textfile collector：宝塔栈 + nginx stub_status（由 exporter.sh 部署）
+# Prometheus textfile collector：宝塔栈 + nginx stub_status + nginx-module-vts Prometheus（由 exporter.sh 部署）
 # 不使用 set -e：systemctl/pgrep 未激活时返回非 0，避免整段采集被中断
 set -uo pipefail
 DIR="${TEXTFILE_DIR:-/var/lib/prometheus/node-exporter}"
@@ -914,6 +918,8 @@ _mysqladmin_x() {
   echo "# TYPE shellstack_nginx_stub_handled_total counter"
   echo "# HELP shellstack_nginx_stub_requests_total stub_status requests（累计）"
   echo "# TYPE shellstack_nginx_stub_requests_total counter"
+  echo "# HELP shellstack_nginx_vts_scrape_ok nginx-module-vts /format/prometheus 是否抓取成功（1/0）；模块指标见同文件 nginx_vts_*"
+  echo "# TYPE shellstack_nginx_vts_scrape_ok gauge"
   echo "# HELP shellstack_php_fpm_workers_total 各版本 PHP-FPM pool 进程数"
   echo "# TYPE shellstack_php_fpm_workers_total gauge"
   echo "# HELP shellstack_redis_ping_ok redis-cli PING 是否成功（1/0）"
@@ -1347,6 +1353,24 @@ _mysqladmin_x() {
     echo "shellstack_nginx_stub_handled_total 0"
     echo "shellstack_nginx_stub_requests_total 0"
   fi
+
+  # nginx-module-vts：/nginx-vts-status/format/prometheus（与 shellstack_vts.conf 默认端口 8898 一致）
+  if [[ "${SHELLSTACK_NGINX_VTS_PROM_DISABLE:-}" == "1" ]]; then
+    echo "shellstack_nginx_vts_scrape_ok 0"
+  else
+    _vts_url="${SHELLSTACK_NGINX_VTS_PROM_URL:-}"
+    if [[ -z "$_vts_url" ]]; then
+      _vts_url="http://127.0.0.1:${SHELLSTACK_VTS_LISTEN_PORT:-8898}/nginx-vts-status/format/prometheus"
+    fi
+    _vts_tmp="$(mktemp 2>/dev/null || echo "/tmp/shellstack-vts.$$.prom")"
+    if curl -fsS -m 3 "$_vts_url" -o "$_vts_tmp" 2>/dev/null && [[ -s "$_vts_tmp" ]]; then
+      echo "shellstack_nginx_vts_scrape_ok 1"
+      cat "$_vts_tmp"
+    else
+      echo "shellstack_nginx_vts_scrape_ok 0"
+    fi
+    rm -f "$_vts_tmp" 2>/dev/null || true
+  fi
 } >"$TMP"
 mv -f "$TMP" "$OUT"
 chmod 644 "$OUT" 2>/dev/null || true
@@ -1396,10 +1420,20 @@ EOSCRIPT
   if [[ -n "${SHELLSTACK_MYSQL_SOCKET:-}" ]]; then
     _mysql_cron+=" SHELLSTACK_MYSQL_SOCKET=$(printf '%q' "${SHELLSTACK_MYSQL_SOCKET}")"
   fi
+  local _vts_cron=""
+  if [[ -n "${SHELLSTACK_NGINX_VTS_PROM_URL:-}" ]]; then
+    _vts_cron+=" SHELLSTACK_NGINX_VTS_PROM_URL=$(printf '%q' "${SHELLSTACK_NGINX_VTS_PROM_URL}")"
+  fi
+  if [[ -n "${SHELLSTACK_VTS_LISTEN_PORT:-}" ]]; then
+    _vts_cron+=" SHELLSTACK_VTS_LISTEN_PORT=$(printf '%q' "${SHELLSTACK_VTS_LISTEN_PORT}")"
+  fi
+  if [[ "${SHELLSTACK_NGINX_VTS_PROM_DISABLE:-}" == "1" ]]; then
+    _vts_cron+=" SHELLSTACK_NGINX_VTS_PROM_DISABLE=1"
+  fi
   cat >"$cronf" <<EOF
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
-* * * * * root TEXTFILE_DIR=$dir SHELLSTACK_NGINX_STUB_URLS=$effective_urls${_mysql_cron} $bin >>$tlog 2>&1
+* * * * * root TEXTFILE_DIR=$dir SHELLSTACK_NGINX_STUB_URLS=$effective_urls${_mysql_cron}${_vts_cron} $bin >>$tlog 2>&1
 EOF
   chmod 644 "$cronf" 2>/dev/null || true
 
@@ -1410,6 +1444,9 @@ EOF
       SHELLSTACK_MYSQL_USER="${SHELLSTACK_MYSQL_USER:-}" \
       SHELLSTACK_MYSQL_PASSWORD="${SHELLSTACK_MYSQL_PASSWORD:-}" \
       SHELLSTACK_MYSQL_SOCKET="${SHELLSTACK_MYSQL_SOCKET:-}" \
+      SHELLSTACK_NGINX_VTS_PROM_URL="${SHELLSTACK_NGINX_VTS_PROM_URL:-}" \
+      SHELLSTACK_VTS_LISTEN_PORT="${SHELLSTACK_VTS_LISTEN_PORT:-}" \
+      SHELLSTACK_NGINX_VTS_PROM_DISABLE="${SHELLSTACK_NGINX_VTS_PROM_DISABLE:-}" \
       bash "$bin" 2>&1 | tee -a "$LOG_FILE" "$tlog"
   else
     TEXTFILE_DIR="$dir" SHELLSTACK_NGINX_STUB_URLS="$effective_urls" \
@@ -1417,6 +1454,9 @@ EOF
       SHELLSTACK_MYSQL_USER="${SHELLSTACK_MYSQL_USER:-}" \
       SHELLSTACK_MYSQL_PASSWORD="${SHELLSTACK_MYSQL_PASSWORD:-}" \
       SHELLSTACK_MYSQL_SOCKET="${SHELLSTACK_MYSQL_SOCKET:-}" \
+      SHELLSTACK_NGINX_VTS_PROM_URL="${SHELLSTACK_NGINX_VTS_PROM_URL:-}" \
+      SHELLSTACK_VTS_LISTEN_PORT="${SHELLSTACK_VTS_LISTEN_PORT:-}" \
+      SHELLSTACK_NGINX_VTS_PROM_DISABLE="${SHELLSTACK_NGINX_VTS_PROM_DISABLE:-}" \
       bash "$bin" 2>&1 | tee -a "$tlog"
   fi
   [[ "${PIPESTATUS[0]:-0}" -ne 0 ]] && warn "首次执行 textfile 采集脚本失败（退出码 ${PIPESTATUS[0]}）"
@@ -1425,6 +1465,7 @@ EOF
   } >>"$tlog" 2>/dev/null || true
   log "已部署宝塔/服务 textfile 采集: $bin → $dir/shellstack_baota.prom（cron: $cronf）"
   log "stub_status 探测 URL 列表（cron 已写入）: $effective_urls"
+  log "nginx-module-vts：textfile 每分钟附加同 URL 的 Prometheus 指标（默认 127.0.0.1:8898/nginx-vts-status/format/prometheus；SHELLSTACK_NGINX_VTS_PROM_URL / SHELLSTACK_VTS_LISTEN_PORT 可覆盖，部署时 export 可写入 cron）"
   log "textfile 本次运行的终端输出已写入 $tlog（与 cron 共用）；之后每分钟由 cron 追加一行（请确保已启用: systemctl enable --now cron）"
   if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^cron\.service'; then
     systemctl is-active --quiet cron 2>/dev/null || warn "cron 服务未运行，textfile 不会每分钟执行；请执行: systemctl enable --now cron（Debian/Ubuntu 包名通常为 cron）"
