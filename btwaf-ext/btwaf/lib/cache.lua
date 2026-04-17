@@ -60,9 +60,14 @@ local CACHE_KEY_PREFIX = "btwaf_cms_cache:"
 local PAGE_CACHE_TTL_SECONDS = 180
 local PAGE_CACHE_SIGN_COMPONENTS = { "site", "uri", "args" }
 -- 无扩展名 URL 在误标 application/octet-stream 时按「网页」做路径兜底（子串匹配 ngx.var.uri，plain find）。
--- 后台改目录后在此增删即可，无需改业务逻辑；设为空表 {} 则仅依赖 .php/.html 等内置规则。
+-- 注意：此表 **不会** 禁止 Redis 缓存；若要不缓存某目录，请用下方 PAGE_CACHE_URI_PREFIX_SKIP。
 -- 默认含 "/e/" 兼容常见帝国 CMS 伪静态；若站点不用可删掉或换成实际前缀（如 "/yourapp/extend/"）。
-local PAGE_CACHE_HTML_PATH_HINTS = { "/e/", "/tjcss/", "/tjjs/" }
+local PAGE_CACHE_HTML_PATH_HINTS = { "/e/" }
+-- 整页缓存 **跳过** 的 URI 前缀：ngx.var.uri 必须以该项开头（纯字符串，区分大小写）。access 不读 Redis、body 不写 Redis。
+-- 统计/静态目录常见：/tjcss/、/tjjs/；不需要则改为 {}。
+local PAGE_CACHE_URI_PREFIX_SKIP = { "/tjcss/", "/tjjs/" }
+-- 可选：按 URI 后缀跳过（如 ".json"）。默认空；填 { ".js" } 会跳过所有 .js（影响面大）。
+local PAGE_CACHE_URI_SUFFIX_SKIP = {}
 -- 是否与 Nginx 变量 $skip_cache 联动。宝塔里 $skip_cache 主要给 **FastCGI 缓存**（fastcgi_no_cache / fastcgi_cache_bypass）用。
 -- 默认 **false**：Redis 整页缓存与 FastCGI 缓存**解耦**，二者可同时开；POST/带 Cookie 等仍可按你站点规则绕过 FastCGI，不影响 ShellStack 读写 Redis。
 -- 若希望 Redis 与 FastCGI **共用同一套绕过条件**，改为 true。
@@ -959,6 +964,29 @@ local function page_cache_shellstack_skip_reason()
     return nil
 end
 
+local function page_cache_uri_skip_reason()
+    local uri = ngx.var.uri or ""
+    if uri == "" then
+        return nil
+    end
+    for _, pref in ipairs(PAGE_CACHE_URI_PREFIX_SKIP) do
+        if type(pref) == "string" and pref ~= "" then
+            if string.sub(uri, 1, #pref) == pref then
+                return "uri_prefix_skip"
+            end
+        end
+    end
+    for _, suf in ipairs(PAGE_CACHE_URI_SUFFIX_SKIP) do
+        if type(suf) == "string" and suf ~= "" then
+            local n = #suf
+            if #uri >= n and string.sub(uri, -n) == suf then
+                return "uri_suffix_skip"
+            end
+        end
+    end
+    return nil
+end
+
 -- 供 body_filter 在拼装完整响应体后异步写入 Redis（GET 200、非白名单）
 -- access 阶段：与 schedule_body_page_cache 使用同一 Redis 键；命中则 ngx.exit(200)，未命中返回（继续 WAF）
 local function try_access_cache_hit()
@@ -967,6 +995,11 @@ local function try_access_cache_hit()
     end
     if ngx.req.get_method() ~= "GET" then
         stash_shellstack_cache_state("SKIP", "method_not_get", nil)
+        return
+    end
+    local skip_uri = page_cache_uri_skip_reason()
+    if skip_uri then
+        stash_shellstack_cache_state("SKIP", skip_uri, nil)
         return
     end
     local skip_rs = page_cache_shellstack_skip_reason()
@@ -1030,6 +1063,7 @@ local function schedule_body_page_cache(ttl, whole)
     if ngx.req.get_method() ~= "GET" then return end
     if ngx.status ~= 200 then return end
     if ngx.ctx.white_rule then return end
+    if page_cache_uri_skip_reason() then return end
     if page_cache_shellstack_skip_reason() then return end
     local headers = {}
     for k, v in pairs(ngx.header) do

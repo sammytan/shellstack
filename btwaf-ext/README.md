@@ -21,6 +21,7 @@ BTwaf 在 `init.lua` 中通过 `cache = require "cache"` 加载 **`btwaf/lib/cac
 - **键名规则**：整页缓存在 **Redis STRING**，键名 **`btwaf_cms_cache:`** + **md5(签名串)**；签名由 `PAGE_CACHE_SIGN_COMPONENTS` 决定（默认含 `site` / `uri` / `args` / `ua`）。可增删项：`referer`；`headers` 或 `headers:all` / `headers:*`（全部请求头，名小写、按名字排序）；`headers:cookie,accept-language`（仅列出头，缺省按空值参与签名）。与官方 `waf.lua` 一致：无 UA 时为 `btwaf_null`。
 - **存取格式**：缓存值为 **JSON**，经 `cjson` 编码后写入 Redis；读取时再解码为 Lua 表。
 - **默认过期时间**：`PAGE_CACHE_TTL_SECONDS`（默认 180 秒）；写入用 **SETEX**，过期由 Redis TTL 管理。
+- **按路径禁用缓存**：`PAGE_CACHE_URI_PREFIX_SKIP`（URI 前缀匹配，access 不读、body 不写 Redis）。勿与 `PAGE_CACHE_HTML_PATH_HINTS` 混淆——后者只影响 Content-Type 修正，**不会**禁止缓存。
 - **对外接口**（模块 `return` 表）：
   - `try_access_cache_hit()`：access 阶段调用，命中则直接响应并 `ngx.exit(200)`，未命中则返回。
   - `schedule_body_page_cache(ttl, whole)`：body_filter 在整页响应后异步 **SETEX** 写入 Redis。
