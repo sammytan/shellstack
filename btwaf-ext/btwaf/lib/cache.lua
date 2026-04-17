@@ -62,7 +62,7 @@ local PAGE_CACHE_SIGN_COMPONENTS = { "site", "uri", "args" }
 -- 无扩展名 URL 在误标 application/octet-stream 时按「网页」做路径兜底（子串匹配 ngx.var.uri，plain find）。
 -- 后台改目录后在此增删即可，无需改业务逻辑；设为空表 {} 则仅依赖 .php/.html 等内置规则。
 -- 默认含 "/e/" 兼容常见帝国 CMS 伪静态；若站点不用可删掉或换成实际前缀（如 "/yourapp/extend/"）。
-local PAGE_CACHE_HTML_PATH_HINTS = { "/e/" }
+local PAGE_CACHE_HTML_PATH_HINTS = { "/e/", "/tjcss/", "/tjjs/" }
 -- 是否与 Nginx 变量 $skip_cache 联动。宝塔里 $skip_cache 主要给 **FastCGI 缓存**（fastcgi_no_cache / fastcgi_cache_bypass）用。
 -- 默认 **false**：Redis 整页缓存与 FastCGI 缓存**解耦**，二者可同时开；POST/带 Cookie 等仍可按你站点规则绕过 FastCGI，不影响 ShellStack 读写 Redis。
 -- 若希望 Redis 与 FastCGI **共用同一套绕过条件**，改为 true。
