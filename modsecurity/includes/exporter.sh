@@ -313,9 +313,94 @@ _exporter_baota_nginx_installed() {
   [[ -x /www/server/nginx/sbin/nginx ]] && [[ -f /www/server/nginx/conf/nginx.conf ]]
 }
 
-# 列出本机宝塔 PHP-FPM status 用 socket：stdout 每行 location标签\\t绝对路径（标签为版本目录名，点改为下划线）
+# 从 ps 行解析该版本 PHP-FPM 主配置文件（宝塔：master process (/www/server/php/XX/etc/php-fpm.conf)）
+_exporter_baota_php_fpm_master_conf_for_ver() {
+  local ver="$1" line conf
+  while read -r line; do
+    [[ "$line" == *"/www/server/php/${ver}/"* ]] || continue
+    [[ "$line" == *"master process"* ]] || continue
+    conf="$(printf '%s' "$line" | sed -n 's/.*master process (\(\/www\/server\/php\/[^)]*php-fpm\.conf\)).*/\1/p')"
+    [[ -f "$conf" ]] && { printf '%s\n' "$conf"; return 0; }
+  done < <(pgrep -af 'php-fpm: master process' 2>/dev/null || true)
+  conf="/www/server/php/${ver}/etc/php-fpm.conf"
+  [[ -f "$conf" ]] && printf '%s\n' "$conf"
+}
+
+# 收集主配置中的 include 及主文件本身（供解析 pool 的 listen / pm.status_path）
+_exporter_baota_collect_php_fpm_pool_files() {
+  local master="$1" d line pat f
+  [[ -f "$master" ]] || return 1
+  d="$(dirname "$master")"
+  shopt -s nullglob
+  while IFS= read -r line; do
+    [[ "$line" =~ ^[[:space:]]*include[[:space:]]*= ]] || continue
+    pat="${line#*=}"
+    pat="${pat%%;*}"
+    pat="$(echo "$pat" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [[ -z "$pat" ]] && continue
+    [[ "$pat" != /* ]] && pat="${d}/${pat}"
+    for f in $pat; do
+      [[ -f "$f" ]] && printf '%s\n' "$f"
+    done
+  done < <(grep -E '^[[:space:]]*include[[:space:]]*=' "$master" 2>/dev/null || true)
+  shopt -u nullglob
+  printf '%s\n' "$master"
+}
+
+# 在 pool 配置中查找 listen 与 sock 一致的段，输出 pm.status_path（缺省则 /status）
+_exporter_baota_pm_status_path_for_listen() {
+  local sock="$1" ver="$2" master
+  local -a files=()
+  master="$(_exporter_baota_php_fpm_master_conf_for_ver "$ver")"
+  [[ -z "$master" || ! -f "$master" ]] && { echo "/status"; return 0; }
+  mapfile -t files < <(_exporter_baota_collect_php_fpm_pool_files "$master" | sort -u)
+  [[ ${#files[@]} -eq 0 ]] && { echo "/status"; return 0; }
+  awk -v tsock="$sock" '
+  function norm(s) {
+    gsub(/\r/,"",s)
+    gsub(/^[ \t]+|[ \t]+$/,"",s)
+    gsub(/^["\x27]+|["\x27]+$/,"",s)
+    gsub(/^unix:/,"",s)
+    return s
+  }
+  BEGIN { done=0; have_l=0; have_s=0; lv=""; sv="" }
+  function flush() {
+    if (done || !have_l) return
+    if (norm(lv) != norm(tsock)) return
+    if (have_s && sv != "") {
+      p = norm(sv)
+      if (p !~ /^\//) p = "/" p
+      print p
+    } else print "/status"
+    done = 1
+  }
+  /^[ \t]*;/ { next }
+  /^[ \t]*\[/ {
+    flush()
+    have_l = 0; have_s = 0; lv = ""; sv = ""
+  }
+  /^listen[ \t]*=[ \t]*/ {
+    sub(/^listen[ \t]*=[ \t]*/, "")
+    sub(/[ \t;#].*$/,"")
+    lv = $0
+    have_l = 1
+  }
+  /^pm\.status_path[ \t]*=[ \t]*/ {
+    sub(/^pm\.status_path[ \t]*=[ \t]*/, "")
+    sub(/[ \t;#].*$/,"")
+    sv = $0
+    have_s = 1
+  }
+  END {
+    flush()
+    if (!done) print "/status"
+  }
+  ' "${files[@]}" 2>/dev/null
+}
+
+# 列出本机宝塔 PHP-FPM status：每行 location标签\\tsocket\\tpm.status_path（path 来自 pool 与 listen 匹配）
 _exporter_baota_list_php_fpm_status_sockets() {
-  local line ver sock s base
+  local line ver sock s base st
   declare -A seen=()
   shopt -s nullglob
   while read -r line; do
@@ -330,7 +415,9 @@ _exporter_baota_list_php_fpm_status_sockets() {
     [[ -z "$sock" ]] && continue
     [[ -n "${seen[$ver]:-}" ]] && continue
     seen[$ver]=1
-    printf '%s\t%s\n' "${ver//./_}" "$sock"
+    st="$(_exporter_baota_pm_status_path_for_listen "$sock" "$ver" | tail -n 1)"
+    [[ -z "$st" ]] && st="/status"
+    printf '%s\t%s\t%s\n' "${ver//./_}" "$sock" "$st"
   done < <(pgrep -af 'php-fpm: master process' 2>/dev/null | sort -u)
   for s in /tmp/php-cgi-*.sock; do
     [[ -S "$s" ]] || continue
@@ -338,7 +425,9 @@ _exporter_baota_list_php_fpm_status_sockets() {
     base="${base%.sock}"
     [[ -n "${seen[$base]:-}" ]] && continue
     seen[$base]=1
-    printf '%s\t%s\n' "${base//./_}" "$s"
+    st="$(_exporter_baota_pm_status_path_for_listen "$s" "$base" | tail -n 1)"
+    [[ -z "$st" ]] && st="/status"
+    printf '%s\t%s\t%s\n' "${base//./_}" "$s" "$st"
   done
   shopt -u nullglob
 }
@@ -432,7 +521,8 @@ _exporter_write_baota_shellstack_status_conf() {
   {
     echo "# shellstack exporter 生成：127.0.0.1:${port}，仅供本机采集；重跑 --with-exporter 会覆盖"
     echo "# Nginx: GET /nginx_stub_status"
-    echo "# PHP-FPM: GET /shellstack-fpm-status-<ver>；pool 须 pm.status_path = /status；占位文件 ${_fpmstub}"
+    echo "# PHP-FPM: GET /shellstack-fpm-status-<tag>；SCRIPT_NAME/REQUEST_URI 与 pool 中 pm.status_path 一致（由 ps→php-fpm.conf→include 解析）；占位文件 ${_fpmstub}"
+    echo "# FPM 经 unix socket 时 REMOTE_ADDR 常为空，各 location 内强制 REMOTE_ADDR=127.0.0.1"
     echo "server {"
     echo "    listen 127.0.0.1:${port};"
     echo "    server_name 127.0.0.1;"
@@ -449,10 +539,12 @@ _exporter_write_baota_shellstack_status_conf() {
     echo "    }"
   } >"$out"
 
-  local tag sk
-  while IFS=$'\t' read -r tag sk; do
+  local tag sk stpath
+  while IFS=$'\t' read -r tag sk stpath; do
     [[ -n "$tag" && -n "$sk" ]] || continue
+    [[ -n "$stpath" ]] || stpath="/status"
     {
+      echo "    # pm.status_path=${stpath} listen=${sk}"
       echo "    location = /shellstack-fpm-status-${tag} {"
       echo "        access_log off;"
       if [[ "$_has_ms" -eq 1 ]]; then
@@ -462,10 +554,16 @@ _exporter_write_baota_shellstack_status_conf() {
       echo "        include ${fcgi_line};"
       echo "        fastcgi_pass unix:${sk};"
       echo "        fastcgi_param SCRIPT_FILENAME ${_fpmstub};"
-      echo "        fastcgi_param SCRIPT_NAME /status;"
-      echo "        fastcgi_param REQUEST_URI /status;"
+      echo "        fastcgi_param SCRIPT_NAME ${stpath};"
+      echo "        fastcgi_param REQUEST_URI ${stpath};"
       echo "        fastcgi_param REQUEST_METHOD GET;"
       echo "        fastcgi_param QUERY_STRING \"\";"
+      echo "        fastcgi_param PATH_INFO \"\";"
+      echo "        fastcgi_param REMOTE_ADDR 127.0.0.1;"
+      echo "        fastcgi_param REMOTE_PORT 0;"
+      echo "        fastcgi_param SERVER_ADDR 127.0.0.1;"
+      echo "        fastcgi_param SERVER_NAME 127.0.0.1;"
+      echo "        fastcgi_param SERVER_PORT ${port};"
       echo "    }"
     } >>"$out"
   done < <(_exporter_baota_list_php_fpm_status_sockets)
@@ -480,7 +578,7 @@ _exporter_inject_baota_nginx_stub_status() {
   local ngx_bin="/www/server/nginx/sbin/nginx"
   local ngx_main="/www/server/nginx/conf/nginx.conf"
   local snip="/www/server/nginx/conf/shellstack_status.conf"
-  local _nfpm=0 _fpm_hint="" tag sk
+  local _nfpm=0 _fpm_hint="" tag sk _st
 
   if ! _exporter_baota_nginx_installed; then
     warn "未检测到宝塔 Nginx（需要可执行文件 ${ngx_bin} 与主配置 ${ngx_main}），跳过 stub / status 注入"
@@ -496,7 +594,7 @@ _exporter_inject_baota_nginx_stub_status() {
     fi
   fi
 
-  while IFS=$'\t' read -r tag sk; do
+  while IFS=$'\t' read -r tag sk _st; do
     [[ -n "$tag" ]] || continue
     _nfpm=$((_nfpm + 1))
     _fpm_hint+=" http://127.0.0.1:${port}/shellstack-fpm-status-${tag}"
