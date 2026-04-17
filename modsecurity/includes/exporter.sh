@@ -25,7 +25,7 @@
 #   SHELLSTACK_EXPORTER_SKIP_PERSIST_ENV=1  不写入 /etc/profile.d/shellstack-consul-env.sh
 #   SHELLSTACK_EXPORTER_DEFAULT_CONSUL_ADDR / SHELLSTACK_EXPORTER_DEFAULT_CONSUL_TOKEN 覆盖内置默认
 #   SHELLSTACK_NGINX_STUB_URLS   逗号分隔的 stub_status URL；未设置且探测失败时会尝试自动注入见下
-#   SHELLSTACK_NGINX_STUB_INJECT  默认 1：stub 全失败且存在 /www/server/nginx 时注入独立 127.0.0.1 端口 stub；设 0 关闭
+#   SHELLSTACK_NGINX_STUB_INJECT  默认 1：stub 全失败且**宝塔 Nginx 已安装**（/www/server/nginx/sbin/nginx + conf/nginx.conf）时注入 127.0.0.1 stub；仅有面板未装 Nginx 则跳过；设 0 关闭
 #   SHELLSTACK_NGINX_STUB_LISTEN_PORT  注入时监听端口，默认 8899（仅 127.0.0.1）
 #   CONSUL_SERVICE_ID       覆盖自动生成的服务 ID（默认 {hostname}-{CONSUL_SERVICE_NAME}-{port}，hostname 见下方函数）
 #   CONSUL_SERVICE_NAME     默认 shellstack-node-exporter
@@ -304,14 +304,21 @@ _exporter_nginx_stub_urls_probe_ok() {
   return 1
 }
 
+# 宝塔环境 Nginx 是否已安装（存在官方二进制与主配置，才允许改 nginx.conf）
+_exporter_baota_nginx_installed() {
+  [[ -x /www/server/nginx/sbin/nginx ]] && [[ -f /www/server/nginx/conf/nginx.conf ]]
+}
+
 # 在宝塔 nginx.conf 的 http{} 内 include 独立 stub（仅 127.0.0.1），供本机 textfile 采集
 _exporter_inject_baota_nginx_stub_status() {
   local port="${1:-8899}"
   local ngx_bin="/www/server/nginx/sbin/nginx"
   local ngx_main="/www/server/nginx/conf/nginx.conf"
   local snip="/www/server/nginx/conf/shellstack_stub_status.conf"
-  [[ -x "$ngx_bin" ]] || return 1
-  [[ -f "$ngx_main" ]] || return 1
+  if ! _exporter_baota_nginx_installed; then
+    warn "未检测到宝塔 Nginx（需要可执行文件 ${ngx_bin} 与主配置 ${ngx_main}），跳过 stub_status 注入"
+    return 1
+  fi
 
   if ss -lnt 2>/dev/null | grep -qE ":${port}[[:space:]]"; then
     warn "端口 ${port} 已被占用，跳过注入 stub_status（可设 SHELLSTACK_NGINX_STUB_LISTEN_PORT 为其他端口）"
@@ -718,12 +725,16 @@ EOSCRIPT
   effective_urls="${SHELLSTACK_NGINX_STUB_URLS:-$default_urls}"
 
   if ! _exporter_nginx_stub_urls_probe_ok "$effective_urls"; then
-    if [[ -x /www/server/nginx/sbin/nginx ]] && [[ "${SHELLSTACK_NGINX_STUB_INJECT:-1}" != "0" ]]; then
-      log "未探测到可用 stub_status，尝试向宝塔 nginx.conf 注入 127.0.0.1:${stub_port} 专用 stub..."
-      if _exporter_inject_baota_nginx_stub_status "$stub_port"; then
-        effective_urls="${inject_url},${effective_urls}"
-      else
-        warn "stub 自动注入未成功，shellstack_nginx_stub_* 可能为 0（可手动配置 stub 或设 SHELLSTACK_NGINX_STUB_URLS）"
+    if [[ "${SHELLSTACK_NGINX_STUB_INJECT:-1}" != "0" ]]; then
+      if _exporter_baota_nginx_installed; then
+        log "未探测到可用 stub_status，尝试向宝塔 nginx.conf 注入 127.0.0.1:${stub_port} 专用 stub..."
+        if _exporter_inject_baota_nginx_stub_status "$stub_port"; then
+          effective_urls="${inject_url},${effective_urls}"
+        else
+          warn "stub 自动注入未成功，shellstack_nginx_stub_* 可能为 0（可手动配置 stub 或设 SHELLSTACK_NGINX_STUB_URLS）"
+        fi
+      elif [[ -d /www/server/panel ]]; then
+        log "已检测到宝塔面板目录，但尚未安装或未就绪 Nginx（无 /www/server/nginx/sbin/nginx 与 conf/nginx.conf），跳过 stub 注入"
       fi
     fi
   fi
