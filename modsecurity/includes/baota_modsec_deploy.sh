@@ -112,7 +112,8 @@ _baota_nginx_has_modsecurity_module() {
 
 _baota_nginx_has_vts_module() {
   [[ -x "$BT_NGINX_BIN" ]] || return 1
-  "$BT_NGINX_BIN" -V 2>&1 | grep -qiE 'vhost_traffic_status|ngx_http_vhost_traffic_status'
+  # --add-module=…/nginx-module-vts 等路径未必带 vhost 字样，故一并匹配 module-vts / ngx_http_vts
+  "$BT_NGINX_BIN" -V 2>&1 | grep -qiE 'vhost_traffic_status|ngx_http_vhost_traffic_status|nginx-module-vts|nginx_module_vts|ngx_http_vts|module[_/]vts'
 }
 
 _baota_write_shellstack_vts_conf() {
@@ -485,16 +486,18 @@ RULES
 
   if [[ "${SHELLSTACK_DEPLOY_NGINX_MODULE_VTS:-1}" == "1" ]]; then
     log "=========================================="
-    log "--deploy-conf：nginx-module-vts（shellstack_vts.conf + nginx.conf include）"
+    log "--deploy-conf：nginx-module-vts（仅当 nginx -V 已含模块时，才写入 shellstack_vts.conf 并在 nginx.conf 内 include；否则不改动主配置，避免未知指令导致 nginx -t 失败）"
     log "=========================================="
     if _baota_nginx_has_vts_module; then
-      log "检测: $BT_NGINX_BIN 已编入 vhost_traffic_status，继续写入片段并注入 nginx.conf"
+      log "检测: $BT_NGINX_BIN 已编入 vhost_traffic_status / nginx-module-vts，继续写入片段并注入 nginx.conf"
       _baota_write_shellstack_vts_conf
       _baota_ensure_nginx_conf_includes_vts
       log "nginx-module-vts：注入步骤结束；请执行: $BT_NGINX_BIN -t && /etc/init.d/nginx reload（或 systemctl reload nginx）"
     else
-      log "检测: $BT_NGINX_BIN 的 nginx -V 未含 nginx-module-vts，跳过 shellstack_vts.conf 与 nginx.conf include"
-      log "（请重编 OpenResty；若故意不编 VTS 可 export SHELLSTACK_WITH_NGINX_MODULE_VTS=0）"
+      log "检测: $BT_NGINX_BIN 的 nginx -V 未见 nginx-module-vts（vhost_traffic_status）相关编译项"
+      log "因此未创建/更新 shellstack_vts.conf，也未向 nginx.conf 插入 include shellstack_vts.conf（与上方说明中的「include」仅为步骤说明，不是已注入）"
+      log "请先完成带 VTS 的 Nginx/OpenResty 重编（如 connector 流程且勿设 SHELLSTACK_WITH_NGINX_MODULE_VTS=0），再执行 --deploy-conf；不需要本功能可设 SHELLSTACK_DEPLOY_NGINX_MODULE_VTS=0 跳过本段日志"
+      log "自检: 执行 $BT_NGINX_BIN -V ，在输出中查找 vts、vhost_traffic、module-vts 等关键字（无则当前二进制未编入该模块）"
     fi
   else
     log "SHELLSTACK_DEPLOY_NGINX_MODULE_VTS=0，跳过 nginx-module-vts 片段与 nginx.conf include"
