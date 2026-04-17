@@ -46,6 +46,7 @@
 #   SHELLSTACK_EXPORTER_FORCE=1  由 main.sh 在「仅 exporter + --force」时设置：强制重跑 exporter 各步骤（不触发 ModSecurity 主流程）
 #   textfile 采集（cron）可选：SHELLSTACK_MYSQL_SOCKET=socket路径  SHELLSTACK_REDIS_SOCKET=  SHELLSTACK_REDIS_HOST / SHELLSTACK_REDIS_PORT
 #   SHELLSTACK_TEXTFILE_SKIP_HOST_METRICS=1  不在 textfile 中写入 shellstack_host_*（仅用 node_exporter 的 node_*）
+#   日志：/var/log/shellstack-node-exporter-textfile.log 仅记录 **cron 跑 textfile 脚本** 的 stdout/stderr；指标在 .prom 内，故旧版脚本成功时该文件常为空；新版每分钟写一行 OK。**prometheus-node-exporter** 守护进程日志用 journalctl（如 journalctl -u prometheus-node-exporter -e），不是此文件。
 
 EXPORTER_LISTEN_PORT="${EXPORTER_LISTEN_PORT:-9100}"
 CONSUL_SERVICE_NAME="${CONSUL_SERVICE_NAME:-shellstack-node-exporter}"
@@ -921,6 +922,10 @@ emit_up() {
 } >"$TMP"
 mv -f "$TMP" "$OUT"
 chmod 644 "$OUT" 2>/dev/null || true
+# 指标写入 .prom，成功时原先不写 stdout；cron 重定向到 /var/log/shellstack-node-exporter-textfile.log 会为空。打一行心跳便于确认定时任务在执行。
+_ts="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date)"
+_sz="$(wc -c <"$OUT" 2>/dev/null | tr -d '[:space:]')"
+echo "${_ts} shellstack-node-exporter-textfile: OK wrote ${OUT} (${_sz:-0} bytes)"
 EOSCRIPT
   chmod 755 "$bin"
 
