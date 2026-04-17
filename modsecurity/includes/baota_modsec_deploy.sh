@@ -155,24 +155,36 @@ _baota_ensure_nginx_conf_includes_vts() {
     warn "nginx-module-vts：未找到主配置 $ngx，无法自动插入 include shellstack_vts.conf，请手工在 http{} 内加入: $line"
     return 0
   fi
-  log "nginx-module-vts：正在合并到主配置: $ngx"
+  log "nginx-module-vts：正在合并到主配置: $ngx（BT_NGINX_CONF_DIR=${BT_NGINX_CONF_DIR}）"
   if grep -qF 'shellstack_vts.conf' "$ngx" 2>/dev/null; then
     log "nginx-module-vts：$ngx 已存在 shellstack_vts.conf 引用，跳过重复插入"
     return 0
   fi
-  local snip
+  local snip inserted=0
   snip="$(mktemp)"
   printf '%s\n' "$line" > "$snip"
-  if grep -q 'include proxy.conf;' "$ngx"; then
-    sed -i '/include proxy.conf;/r '"$snip" "$ngx"
-    log "nginx-module-vts：已在 $ngx 的 include proxy.conf; 之后插入一行: $line"
-  elif grep -q 'default_type' "$ngx"; then
+  # 多锚点：与当前宝塔模板一致时，优先插在 shellstack http 块结束之后（避免仅依赖 proxy.conf 时 sed 未命中）
+  if grep -qF '# shellstack-http-includes-end' "$ngx" 2>/dev/null; then
+    sed -i '/# shellstack-http-includes-end/r '"$snip" "$ngx"
+    log "nginx-module-vts：已在 # shellstack-http-includes-end 之后插入: $line"
+    inserted=1
+  elif grep -qE '^[[:space:]]*include[[:space:]]+proxy\.conf[[:space:]]*;' "$ngx" 2>/dev/null; then
+    sed -i -E '/^[[:space:]]*include[[:space:]]+proxy\.conf[[:space:]]*;/r '"$snip" "$ngx"
+    log "nginx-module-vts：已在 include proxy.conf 行之后插入: $line"
+    inserted=1
+  elif grep -qF 'shellstack_status.conf' "$ngx" 2>/dev/null; then
+    sed -i '/shellstack_status\.conf/r '"$snip" "$ngx"
+    log "nginx-module-vts：已在 shellstack_status.conf 行之后插入: $line"
+    inserted=1
+  elif grep -q 'default_type' "$ngx" 2>/dev/null; then
     sed -i '/default_type[[:space:]]/r '"$snip" "$ngx"
-    log "nginx-module-vts：已在 $ngx 的 default_type 行之后插入一行: $line"
-  else
-    warn "nginx-module-vts：无法在 $ngx 中定位 include proxy.conf 或 default_type，请手工在 http{} 内加入: $line"
+    log "nginx-module-vts：已在 default_type 行之后插入: $line"
+    inserted=1
   fi
   rm -f "$snip"
+  if [[ "$inserted" -eq 0 ]]; then
+    warn "nginx-module-vts：无法在 $ngx 中匹配锚点（# shellstack-http-includes-end / include proxy.conf / shellstack_status.conf / default_type），请手工在 http{} 内加入: $line"
+  fi
 }
 
 # 在 http{} 内注入：real_ip 始终写入；modsecurity 仅当 nginx 已编进 modsecurity-nginx；fastcgi 共享区仅当开启 SHELLSTACK_DEPLOY_FASTCGI_CACHE 且尚未存在 keys_zone
