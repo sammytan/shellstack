@@ -5,6 +5,7 @@
 # 指标覆盖：
 #   - 常规系统：CPU/内存/负载/磁盘空间/磁盘 IO/网络流量 等由 node_exporter 默认 collectors 提供
 #     （node_cpu_*、node_memory_*、node_load*、node_filesystem_*、node_disk_*、node_network_* 等）
+#   - 同一 /metrics 下 textfile 另写 shellstack_host_* 摘要（负载/内存占比/CPU&iowait 短采样/根分区/整盘扇区与网卡字节速率），便于与 shellstack_ 业务指标同面板；细粒度仍以 node_* 为准
 #   - 宝塔 / Nginx / PHP-FPM / MySQL / Redis：本脚本安装 textfile 采集脚本 + cron，输出 shellstack_* 指标
 #   - Nginx 连接负载：若本机可访问 stub_status（见下方 URL），输出 shellstack_nginx_* 指标
 #
@@ -31,6 +32,7 @@
 #   CONSUL_SERVICE_NAME     默认 shellstack-node-exporter
 #   CONSUL_SERVICE_TAGS     额外标签，逗号分隔，追加到默认 tags
 #   CONSUL_SERVICE_META     额外 Meta，逗号分隔 key=value（勿与脚本内置键重复以免 JSON 冲突）；与脚本自动写入的 Meta 合并
+#   Consul Service Meta 仅在每次「注册/重新注册」时写入（含 svc_*_up 等快照），不会随 textfile 每分钟刷新；实时状态与负载请用 Prometheus 查询 shellstack_*
 #   EXPORTER_METRICS_ALLOW_FROM / SHELLSTACK_EXPORTER_METRICS_ALLOW_FROM  逗号分隔 IPv4 或 CIDR；若设置则仅放行这些源访问 metrics 端口，不再从 Consul 地址推导
 #   SHELLSTACK_EXPORTER_SKIP_FIREWALL=1  不尝试配置本机防火墙（9100 等须自行放行）
 #   防火墙自动匹配（root）：firewalld → ufw → iptables/iptables-nft/iptables-legacy → nft（inet filter input 或 ip filter INPUT）
@@ -43,6 +45,7 @@
 #   SHELLSTACK_EXPORTER_GEO_HOSTNAME=NAME    完全指定主机名（跳过 Geo/IP 拼接）
 #   SHELLSTACK_EXPORTER_FORCE=1  由 main.sh 在「仅 exporter + --force」时设置：强制重跑 exporter 各步骤（不触发 ModSecurity 主流程）
 #   textfile 采集（cron）可选：SHELLSTACK_MYSQL_SOCKET=socket路径  SHELLSTACK_REDIS_SOCKET=  SHELLSTACK_REDIS_HOST / SHELLSTACK_REDIS_PORT
+#   SHELLSTACK_TEXTFILE_SKIP_HOST_METRICS=1  不在 textfile 中写入 shellstack_host_*（仅用 node_exporter 的 node_*）
 
 EXPORTER_LISTEN_PORT="${EXPORTER_LISTEN_PORT:-9100}"
 CONSUL_SERVICE_NAME="${CONSUL_SERVICE_NAME:-shellstack-node-exporter}"
@@ -500,6 +503,36 @@ emit_up() {
   echo "# TYPE shellstack_mysql_queries_total counter"
   echo "# HELP shellstack_mysql_uptime_seconds 全局 Uptime（秒）"
   echo "# TYPE shellstack_mysql_uptime_seconds gauge"
+  echo "# HELP shellstack_host_load1 1 分钟负载（与 node_load1 同源类数据；摘要）"
+  echo "# TYPE shellstack_host_load1 gauge"
+  echo "# HELP shellstack_host_load5 5 分钟负载"
+  echo "# TYPE shellstack_host_load5 gauge"
+  echo "# HELP shellstack_host_load15 15 分钟负载"
+  echo "# TYPE shellstack_host_load15 gauge"
+  echo "# HELP shellstack_host_memory_total_bytes /proc/meminfo MemTotal"
+  echo "# TYPE shellstack_host_memory_total_bytes gauge"
+  echo "# HELP shellstack_host_memory_avail_bytes MemAvailable 或回退 MemFree"
+  echo "# TYPE shellstack_host_memory_avail_bytes gauge"
+  echo "# HELP shellstack_host_memory_used_ratio 估算 (total-avail)/total，0~1"
+  echo "# TYPE shellstack_host_memory_used_ratio gauge"
+  echo "# HELP shellstack_host_cpu_usage_ratio 约 0.25s 采样 CPU 非 idle 占比，0~1（细粒度见 node_cpu_seconds_total）"
+  echo "# TYPE shellstack_host_cpu_usage_ratio gauge"
+  echo "# HELP shellstack_host_cpu_iowait_ratio 同上采样 iowait 占比，0~1"
+  echo "# TYPE shellstack_host_cpu_iowait_ratio gauge"
+  echo "# HELP shellstack_host_root_filesystem_total_bytes 根挂载总空间（df -B1 /）"
+  echo "# TYPE shellstack_host_root_filesystem_total_bytes gauge"
+  echo "# HELP shellstack_host_root_filesystem_avail_bytes 根挂载可用"
+  echo "# TYPE shellstack_host_root_filesystem_avail_bytes gauge"
+  echo "# HELP shellstack_host_root_filesystem_used_ratio 已用/总，0~1"
+  echo "# TYPE shellstack_host_root_filesystem_used_ratio gauge"
+  echo "# HELP shellstack_host_disk_read_bytes_per_second 整盘扇区读字节/秒（较 node_disk_* 粗；排除 loop/ram，按整块设备名聚合）"
+  echo "# TYPE shellstack_host_disk_read_bytes_per_second gauge"
+  echo "# HELP shellstack_host_disk_write_bytes_per_second 整盘扇区写字节/秒"
+  echo "# TYPE shellstack_host_disk_write_bytes_per_second gauge"
+  echo "# HELP shellstack_host_network_receive_bytes_per_second /proc/net/dev 非 lo 收字节/秒（含多网卡合计）"
+  echo "# TYPE shellstack_host_network_receive_bytes_per_second gauge"
+  echo "# HELP shellstack_host_network_transmit_bytes_per_second 非 lo 发字节/秒"
+  echo "# TYPE shellstack_host_network_transmit_bytes_per_second gauge"
 
   if [[ -d /www/server/panel ]]; then
     echo "shellstack_baota_paths_detected 1"
@@ -507,6 +540,142 @@ emit_up() {
     echo "shellstack_baota_paths_detected 0"
   fi
   echo "shellstack_exporter_textfile_info 1"
+
+  # 主机层摘要（与 node_exporter 的 node_* 互补；设 SHELLSTACK_TEXTFILE_SKIP_HOST_METRICS=1 可关闭）
+  if [[ "${SHELLSTACK_TEXTFILE_SKIP_HOST_METRICS:-}" != "1" ]]; then
+    if [[ -r /proc/loadavg ]]; then
+      read -r _hl1 _hl5 _hl15 _rest < /proc/loadavg
+      echo "shellstack_host_load1 ${_hl1:-0}"
+      echo "shellstack_host_load5 ${_hl5:-0}"
+      echo "shellstack_host_load15 ${_hl15:-0}"
+    else
+      echo "shellstack_host_load1 0"
+      echo "shellstack_host_load5 0"
+      echo "shellstack_host_load15 0"
+    fi
+    _mt=0
+    _ma=0
+    if [[ -r /proc/meminfo ]]; then
+      _mt="$(awk '/^MemTotal:/ {gsub(/kB/,"",$2); print $2*1024; exit}' /proc/meminfo)"
+      _ma="$(awk '/^MemAvailable:/ {gsub(/kB/,"",$2); print $2*1024; exit}' /proc/meminfo)"
+      if [[ -z "$_ma" || "$_ma" == "0" ]]; then
+        _ma="$(awk '/^MemFree:/{gsub(/kB/,"",$2);f=$2} /^Buffers:/{gsub(/kB/,"",$2);b=$2} /^Cached:/{gsub(/kB/,"",$2);c=$2} END{print (f+0+b+0+c+0)*1024}' /proc/meminfo)"
+      fi
+    fi
+    [[ "$_mt" =~ ^[0-9]+$ ]] || _mt=0
+    [[ "$_ma" =~ ^[0-9]+$ ]] || _ma=0
+    echo "shellstack_host_memory_total_bytes ${_mt}"
+    echo "shellstack_host_memory_avail_bytes ${_ma}"
+    if [[ "$_mt" -gt 0 ]]; then
+      awk -v t="$_mt" -v a="$_ma" 'BEGIN { printf "shellstack_host_memory_used_ratio %.6f\n", (t-a)/t }'
+    else
+      echo "shellstack_host_memory_used_ratio 0"
+    fi
+    if [[ -r /proc/stat ]]; then
+      read -r _id1 _io1 _tt1 <<<"$(awk '/^cpu / { t=0; for(i=2;i<=8;i++) t+=$i; print $5, $6, t; exit}' /proc/stat)"
+      sleep 0.25
+      read -r _id2 _io2 _tt2 <<<"$(awk '/^cpu / { t=0; for(i=2;i<=8;i++) t+=$i; print $5, $6, t; exit}' /proc/stat)"
+    else
+      _id1=0
+      _io1=0
+      _tt1=0
+      _id2=0
+      _io2=0
+      _tt2=0
+    fi
+    if [[ "${_tt2:-0}" -gt "${_tt1:-0}" ]]; then
+      _dtt=$((_tt2 - _tt1))
+      _did=$((_id2 - _id1))
+      _dio=$((_io2 - _io1))
+      awk -v dtt="$_dtt" -v did="$_did" -v dio="$_dio" 'BEGIN {
+        if (dtt <= 0) { print "shellstack_host_cpu_usage_ratio 0"; print "shellstack_host_cpu_iowait_ratio 0"; exit }
+        printf "shellstack_host_cpu_usage_ratio %.6f\n", (dtt - did - dio) / dtt
+        printf "shellstack_host_cpu_iowait_ratio %.6f\n", dio / dtt
+      }'
+    else
+      echo "shellstack_host_cpu_usage_ratio 0"
+      echo "shellstack_host_cpu_iowait_ratio 0"
+    fi
+    _fsz=0
+    _fav=0
+    _fus=0
+    if _dfout="$(df -B1 / 2>/dev/null | awk 'END {print $2, $3, $4}')"; then
+      read -r _fsz _fus _fav <<<"$_dfout"
+    fi
+    [[ "$_fsz" =~ ^[0-9]+$ ]] || _fsz=0
+    [[ "$_fav" =~ ^[0-9]+$ ]] || _fav=0
+    [[ "$_fus" =~ ^[0-9]+$ ]] || _fus=0
+    echo "shellstack_host_root_filesystem_total_bytes ${_fsz}"
+    echo "shellstack_host_root_filesystem_avail_bytes ${_fav}"
+    if [[ "$_fsz" -gt 0 ]]; then
+      awk -v u="$_fus" -v t="$_fsz" 'BEGIN { printf "shellstack_host_root_filesystem_used_ratio %.6f\n", u/t }'
+    else
+      echo "shellstack_host_root_filesystem_used_ratio 0"
+    fi
+    _host_whole_disk() {
+      [[ "$1" =~ ^sd[a-z]$ ]] && return 0
+      [[ "$1" =~ ^vd[a-z]$ ]] && return 0
+      [[ "$1" =~ ^xvd[a-z]$ ]] && return 0
+      [[ "$1" =~ ^nvme[0-9]+n[0-9]+$ ]] && return 0
+      [[ "$1" =~ ^mmcblk[0-9]+$ ]] && return 0
+      return 1
+    }
+    _dsr=0
+    _dsw=0
+    if [[ -r /proc/diskstats ]]; then
+      while read -r _maj _min _dname _r1 _r2 _rsect _ru _w1 _w2 _wsect _wu _; do
+        [[ "$_dname" =~ ^(loop|ram) ]] && continue
+        _host_whole_disk "$_dname" || continue
+        [[ "$_rsect" =~ ^[0-9]+$ ]] && _dsr=$((_dsr + _rsect))
+        [[ "$_wsect" =~ ^[0-9]+$ ]] && _dsw=$((_dsw + _wsect))
+      done < /proc/diskstats
+    fi
+    read -r _nrx _ntx <<<"$(awk 'NR>2 { sub(/:/,"",$1); if ($1=="lo") next; rx+=$2+0; tx+=$10+0 } END { print rx+0, tx+0 }' /proc/net/dev 2>/dev/null)"
+    [[ "$_nrx" =~ ^[0-9]+$ ]] || _nrx=0
+    [[ "$_ntx" =~ ^[0-9]+$ ]] || _ntx=0
+    _hnow="$(date +%s)"
+    _hstate="$DIR/.shellstack_host_prev_netdisk"
+    _drbps=0
+    _dwbps=0
+    _nrbps=0
+    _ntbps=0
+    if [[ -f "$_hstate" ]]; then
+      read -r _hts _hnrx _hntx _hdsr _hdsw < "$_hstate"
+      if [[ "$_hts" =~ ^[0-9]+$ ]]; then
+        _hdt=$((_hnow - _hts))
+        [[ "$_hdt" -lt 1 ]] && _hdt=1
+        if [[ "$_nrx" -ge "${_hnrx:-0}" && "$_ntx" -ge "${_hntx:-0}" ]]; then
+          _nrbps="$(awk -v d=$((_nrx - _hnrx)) -v t="$_hdt" 'BEGIN { if (t>0) printf "%.3f", d/t; else print "0" }')"
+          _ntbps="$(awk -v d=$((_ntx - _hntx)) -v t="$_hdt" 'BEGIN { if (t>0) printf "%.3f", d/t; else print "0" }')"
+        fi
+        if [[ "$_dsr" -ge "${_hdsr:-0}" && "$_dsw" -ge "${_hdsw:-0}" ]]; then
+          _drbps="$(awk -v d=$(( (_dsr - _hdsr) * 512 )) -v t="$_hdt" 'BEGIN { if (t>0) printf "%.3f", d/t; else print "0" }')"
+          _dwbps="$(awk -v d=$(( (_dsw - _hdsw) * 512 )) -v t="$_hdt" 'BEGIN { if (t>0) printf "%.3f", d/t; else print "0" }')"
+        fi
+      fi
+    fi
+    printf '%s %s %s %s %s\n' "$_hnow" "$_nrx" "$_ntx" "$_dsr" "$_dsw" > "${_hstate}.new" 2>/dev/null && mv -f "${_hstate}.new" "$_hstate" 2>/dev/null || true
+    echo "shellstack_host_disk_read_bytes_per_second ${_drbps:-0}"
+    echo "shellstack_host_disk_write_bytes_per_second ${_dwbps:-0}"
+    echo "shellstack_host_network_receive_bytes_per_second ${_nrbps:-0}"
+    echo "shellstack_host_network_transmit_bytes_per_second ${_ntbps:-0}"
+  else
+    echo "shellstack_host_load1 0"
+    echo "shellstack_host_load5 0"
+    echo "shellstack_host_load15 0"
+    echo "shellstack_host_memory_total_bytes 0"
+    echo "shellstack_host_memory_avail_bytes 0"
+    echo "shellstack_host_memory_used_ratio 0"
+    echo "shellstack_host_cpu_usage_ratio 0"
+    echo "shellstack_host_cpu_iowait_ratio 0"
+    echo "shellstack_host_root_filesystem_total_bytes 0"
+    echo "shellstack_host_root_filesystem_avail_bytes 0"
+    echo "shellstack_host_root_filesystem_used_ratio 0"
+    echo "shellstack_host_disk_read_bytes_per_second 0"
+    echo "shellstack_host_disk_write_bytes_per_second 0"
+    echo "shellstack_host_network_receive_bytes_per_second 0"
+    echo "shellstack_host_network_transmit_bytes_per_second 0"
+  fi
 
   # Nginx（宝塔路径优先）
   if [[ -x /www/server/nginx/sbin/nginx ]]; then
@@ -1060,6 +1229,63 @@ _exporter_meta_kv() {
   _EXPORTER_META_JSEP=","
 }
 
+# 注册 Consul 时探测栈服务，写入 Meta（**仅注册瞬间快照**；实时指标见 Prometheus shellstack_*）
+_exporter_stack_service_meta_probes() {
+  local n m r b phpstub phplist _pd _pv
+  n=0
+  if [[ -x /www/server/nginx/sbin/nginx ]]; then
+    if pgrep -x nginx >/dev/null 2>&1 || pgrep -f '/www/server/nginx/sbin/nginx' >/dev/null 2>&1; then
+      n=1
+    fi
+  elif systemctl is-active --quiet nginx 2>/dev/null; then
+    n=1
+  else
+    pgrep -x nginx >/dev/null 2>&1 && n=1
+  fi
+  m=0
+  if systemctl is-active --quiet mysqld 2>/dev/null || systemctl is-active --quiet mysql 2>/dev/null || systemctl is-active --quiet mariadb 2>/dev/null; then
+    m=1
+  elif pgrep -x mysqld >/dev/null 2>&1 || pgrep -x mariadbd >/dev/null 2>&1; then
+    m=1
+  fi
+  r=0
+  if systemctl is-active --quiet redis 2>/dev/null || systemctl is-active --quiet redis-server 2>/dev/null; then
+    r=1
+  elif pgrep -x redis-server >/dev/null 2>&1; then
+    r=1
+  fi
+  b=0
+  if pgrep -f 'BT-Panel' >/dev/null 2>&1 || pgrep -f '/www/server/panel/BT-Panel' >/dev/null 2>&1; then
+    b=1
+  fi
+  phplist=""
+  if [[ -d /www/server/php ]]; then
+    for _pd in /www/server/php/*/; do
+      [[ -d "$_pd" ]] || continue
+      _pv="$(basename "$_pd")"
+      if pgrep -af 'php-fpm: master process' 2>/dev/null | grep -qF "/www/server/php/${_pv}/"; then
+        phplist+="${_pv}+"
+      fi
+    done
+    phplist="${phplist%+}"
+  fi
+  [[ ${#phplist} -gt 100 ]] && phplist="${phplist:0:97}..."
+  phpstub=0
+  local _su
+  for _su in http://127.0.0.1:8899/nginx_stub_status http://127.0.0.1/nginx_status http://127.0.0.1/stub_status; do
+    if curl -fsS -m 1 "$_su" 2>/dev/null | grep -q 'Active connections'; then
+      phpstub=1
+      break
+    fi
+  done
+  _exporter_meta_kv svc_nginx_up "$n"
+  _exporter_meta_kv svc_mysql_up "$m"
+  _exporter_meta_kv svc_redis_up "$r"
+  _exporter_meta_kv svc_baota_panel_up "$b"
+  _exporter_meta_kv svc_php_fpm_masters_up "$phplist"
+  _exporter_meta_kv svc_nginx_stub_reachable "$phpstub"
+}
+
 _exporter_consul_service_meta_json() {
   local bind_addr="$1" port="$2" tdir="${3:-}"
   local hn geo pip os_pretty bt tsize texist seen pair k v
@@ -1104,6 +1330,9 @@ _exporter_consul_service_meta_json() {
   _exporter_meta_kv geo_from_hostname "$geo"
   _exporter_meta_kv public_ip_from_hostname "$pip"
   _exporter_meta_kv shellstack_metrics_prefix "shellstack_"
+  _exporter_meta_kv meta_snapshot_note "register-time; live=Prometheus shellstack_*"
+
+  _exporter_stack_service_meta_probes
 
   if [[ -n "${CONSUL_SERVICE_META:-}" ]]; then
     IFS=',' read -ra _umeta <<< "${CONSUL_SERVICE_META}"
