@@ -343,6 +343,57 @@ _exporter_baota_list_php_fpm_status_sockets() {
   shopt -u nullglob
 }
 
+# 在 nginx.conf 的 http {} 内插入 include shellstack_status.conf（适配宝塔：http 与 { 常分两行）
+_exporter_baota_nginx_conf_ensure_shellstack_include() {
+  local ngx_main="$1"
+  local line='        include /www/server/nginx/conf/shellstack_status.conf;'
+  local bak="${ngx_main}.bak-shellstack"
+  local inserted=0
+
+  grep -qF 'shellstack_status.conf' "$ngx_main" 2>/dev/null && return 0
+
+  cp -a "$ngx_main" "$bak" 2>>"${LOG_FILE:-/dev/null}" || {
+    warn "无法备份 ${ngx_main}，跳过插入 include"
+    return 1
+  }
+
+  if command -v perl >/dev/null 2>&1; then
+    SHELLSTACK_INC_LINE="$line" perl -0777 -i -pe 's/(^http[ \t]*\r?\n[ \t]*\{)/$1\n$ENV{SHELLSTACK_INC_LINE}/m' "$ngx_main" 2>>"$LOG_FILE" || true
+    grep -qF 'shellstack_status.conf' "$ngx_main" 2>/dev/null && inserted=1
+  fi
+
+  if [[ "$inserted" -eq 0 ]]; then
+    cp -a "$bak" "$ngx_main" 2>/dev/null || true
+    _incf="$(mktemp)" || true
+    if [[ -n "$_incf" ]]; then
+      printf '%s\n' "$line" >"$_incf"
+      sed -i '/^[[:space:]]*http[[:space:]]*{/r '"$_incf" "$ngx_main" 2>>"$LOG_FILE" || true
+      rm -f "$_incf"
+      grep -qF 'shellstack_status.conf' "$ngx_main" 2>/dev/null && inserted=1
+    fi
+  fi
+
+  if [[ "$inserted" -eq 0 ]]; then
+    cp -a "$bak" "$ngx_main" 2>/dev/null || true
+    _incf="$(mktemp)" || true
+    if [[ -n "$_incf" ]]; then
+      printf '%s\n' "$line" >"$_incf"
+      sed -i '/^[[:space:]]*include[[:space:]]\+proxy\.conf;/r '"$_incf" "$ngx_main" 2>>"$LOG_FILE" || true
+      rm -f "$_incf"
+      grep -qF 'shellstack_status.conf' "$ngx_main" 2>/dev/null && inserted=1
+    fi
+  fi
+
+  if [[ "$inserted" -eq 0 ]]; then
+    cp -a "$bak" "$ngx_main" 2>/dev/null || true
+    rm -f "$bak" 2>/dev/null || true
+    warn "无法在 nginx.conf 自动插入 shellstack_status.conf（未匹配 http{ 同行、http 换行 {、或 include proxy.conf）。请手工在 http {} 内加入: $line"
+    return 1
+  fi
+  log "已向 nginx.conf 插入 include shellstack_status.conf（已适配宝塔「http」与「{」分两行）"
+  return 0
+}
+
 # 写入 /www/server/nginx/conf/shellstack_status.conf：127.0.0.1 stub_status + 各 PHP-FPM pm.status_path（默认 URI /status）
 _exporter_write_baota_shellstack_status_conf() {
   local port="$1"
@@ -426,31 +477,34 @@ _exporter_inject_baota_nginx_stub_status() {
 
   if grep -qF 'include /www/server/nginx/conf/shellstack_status.conf' "$ngx_main" 2>/dev/null; then
     log "nginx.conf 已包含 shellstack_status.conf，已刷新片段（stub + ${_nfpm} 个 PHP-FPM status location）"
-  else
-    if ! sed -i.bak-shellstack '/^[[:space:]]*http[[:space:]]*{/a\    include /www/server/nginx/conf/shellstack_status.conf;' "$ngx_main" 2>>"$LOG_FILE"; then
-      warn "向 nginx.conf 插入 include shellstack_status.conf 失败"
-      return 1
-    fi
+  elif ! _exporter_baota_nginx_conf_ensure_shellstack_include "$ngx_main"; then
+    return 1
   fi
 
   if ! "$ngx_bin" -t >>"$LOG_FILE" 2>&1; then
-    warn "nginx -t 未通过，回滚 nginx.conf（恢复 sed 备份）"
     if [[ -f "${ngx_main}.bak-shellstack" ]]; then
-      mv -f "${ngx_main}.bak-shellstack" "$ngx_main" 2>/dev/null || cp -a "${ngx_main}.bak-shellstack" "$ngx_main" 2>/dev/null || true
+      cp -a "${ngx_main}.bak-shellstack" "$ngx_main" 2>>"$LOG_FILE" && warn "nginx -t 未通过，已从 ${ngx_main}.bak-shellstack 恢复 nginx.conf"
+    else
+      warn "nginx -t 未通过，请检查 ${snip} 与 nginx.conf 语法"
     fi
     return 1
   fi
   rm -f "${ngx_main}.bak-shellstack" 2>/dev/null || true
 
+  # 宝塔环境优先 /etc/init.d/nginx reload，再回退 systemctl / nginx -s reload
+  if [[ -x /etc/init.d/nginx ]] && /etc/init.d/nginx reload >>"$LOG_FILE" 2>&1; then
+    log "已写入 ${snip} 并已执行 /etc/init.d/nginx reload：stub http://127.0.0.1:${port}/nginx_stub_status${_fpm_hint}（FPM 需 pool 启用 pm.status_path=/status）"
+    return 0
+  fi
+  if systemctl reload nginx >>"$LOG_FILE" 2>&1; then
+    log "已写入 ${snip} 并已 systemctl reload nginx：stub 与上同${_fpm_hint}"
+    return 0
+  fi
   if "$ngx_bin" -s reload >>"$LOG_FILE" 2>&1; then
-    log "已写入 ${snip} 并重载 Nginx：stub http://127.0.0.1:${port}/nginx_stub_status${_fpm_hint}（FPM 需 pool 启用 pm.status_path=/status）"
+    log "已写入 ${snip} 并已 ${ngx_bin} -s reload：stub 与上同${_fpm_hint}"
     return 0
   fi
-  if systemctl reload nginx >>"$LOG_FILE" 2>&1 || /etc/init.d/nginx reload >>"$LOG_FILE" 2>&1; then
-    log "已写入 ${snip} 并重载 Nginx（systemctl/init）：stub 与上同${_fpm_hint}"
-    return 0
-  fi
-  warn "配置已写入 ${snip} 但重载失败，请手动: nginx -t && nginx -s reload"
+  warn "配置已写入 ${snip} 但重载失败，请手动: nginx -t && /etc/init.d/nginx reload"
   return 1
 }
 
