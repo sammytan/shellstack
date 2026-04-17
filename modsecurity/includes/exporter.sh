@@ -33,6 +33,13 @@
 #   EXPORTER_METRICS_ALLOW_FROM / SHELLSTACK_EXPORTER_METRICS_ALLOW_FROM  逗号分隔 IPv4 或 CIDR；若设置则仅放行这些源访问 metrics 端口，不再从 Consul 地址推导
 #   SHELLSTACK_EXPORTER_SKIP_FIREWALL=1  不尝试配置本机防火墙（9100 等须自行放行）
 #   防火墙自动匹配（root）：firewalld → ufw → iptables/iptables-nft/iptables-legacy → nft（inet filter input 或 ip filter INPUT）
+#   部署 exporter 前（root）：将静态主机名设为「ISO 国家/地区二位码-公网IPv4」，如 HK-156.239.6.130
+#     公网 IP：依次尝试 ipify / ipinfo.io/ip / ifconfig.me / icanhazip / ident.me / AWS checkip 等多个出口探测 URL
+#     地区码：ip-api.com（HTTP）与 ipinfo.io/json（HTTPS）互为补充
+#   SHELLSTACK_EXPORTER_SKIP_HOSTNAME=1     不修改主机名
+#   SHELLSTACK_EXPORTER_PUBLIC_IP=a.b.c.d   手工公网 IP（跳过出口 IP 探测）
+#   SHELLSTACK_EXPORTER_GEO_CODE=HK         手工区域码（二位大写字母；与 PUBLIC_IP 可只设其一，另一项走 API）
+#   SHELLSTACK_EXPORTER_GEO_HOSTNAME=NAME    完全指定主机名（跳过 Geo/IP 拼接）
 
 EXPORTER_LISTEN_PORT="${EXPORTER_LISTEN_PORT:-9100}"
 CONSUL_SERVICE_NAME="${CONSUL_SERVICE_NAME:-shellstack-node-exporter}"
@@ -50,6 +57,145 @@ _exporter_local_ip() {
   fi
   ip="$(ip route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
   [[ -n "$ip" ]] && echo "$ip"
+}
+
+# 多个公开「出口 IPv4」探测接口（任一连通即可）；优先 ipv4.* 专用端点减少拿到 IPv6 文本的情况
+_exporter_fetch_public_ip_only() {
+  local ip url
+  local -a urls=(
+    'https://ipv4.icanhazip.com'
+    'https://api.ipify.org'
+    'https://ipinfo.io/ip'
+    'https://ifconfig.me/ip'
+    'https://icanhazip.com'
+    'https://ident.me'
+    'https://checkip.amazonaws.com'
+    'https://ipecho.net/plain'
+    'https://wtfismyip.com/text'
+  )
+  for url in "${urls[@]}"; do
+    ip="$(curl -fsS -m 7 -H 'Accept: text/plain' "$url" 2>/dev/null | tr -d '[:space:]')"
+    [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && { printf '%s' "$ip"; return 0; }
+  done
+  return 1
+}
+
+# 从 ipinfo.io JSON 解析 ip、country（二位码）；stdout 两行：第一行 IP 或空，第二行 country 或空
+_exporter_ipinfo_parse_ip_country() {
+  local json="$1"
+  local ip cc
+  [[ -z "$json" ]] && return 1
+  ip="$(printf '%s' "$json" | sed -n 's/.*"ip"[[:space:]]*:[[:space:]]*"\([0-9][0-9.]*\)".*/\1/p')"
+  cc="$(printf '%s' "$json" | sed -n 's/.*"country"[[:space:]]*:[[:space:]]*"\([A-Za-z][A-Za-z]*\)".*/\1/p')"
+  printf '%s\n%s\n' "${ip:-}" "${cc:-}"
+}
+
+_exporter_apply_geo_public_hostname() {
+  local name ip cc json cur
+
+  if [[ "${SHELLSTACK_EXPORTER_SKIP_HOSTNAME:-}" == "1" ]]; then
+    log "已跳过主机名设置（SHELLSTACK_EXPORTER_SKIP_HOSTNAME=1）"
+    return 0
+  fi
+  if [[ "$(id -u)" -ne 0 ]]; then
+    warn "非 root，跳过按「区域码-公网IP」设置主机名（请使用 sudo/root 执行 exporter 流程）"
+    return 0
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    warn "无 curl，无法查询公网 IP/Geo，跳过主机名设置"
+    return 0
+  fi
+
+  if [[ -n "${SHELLSTACK_EXPORTER_GEO_HOSTNAME:-}" ]]; then
+    name="${SHELLSTACK_EXPORTER_GEO_HOSTNAME}"
+  else
+    ip="${SHELLSTACK_EXPORTER_PUBLIC_IP:-}"
+    cc="${SHELLSTACK_EXPORTER_GEO_CODE:-}"
+    if [[ -z "$ip" || -z "$cc" ]]; then
+      json="$(curl -fsS -m 14 -H 'User-Agent: shellstack-exporter-setup' \
+        'http://ip-api.com/json/?fields=status,message,countryCode,query' 2>/dev/null)" || json=""
+      if [[ -n "$json" && "$json" == *'"status":"success"'* ]]; then
+        [[ -z "$ip" ]] && ip="$(printf '%s' "$json" | sed -n 's/.*"query":"\([0-9][0-9.]*\)".*/\1/p')"
+        [[ -z "$cc" ]] && cc="$(printf '%s' "$json" | sed -n 's/.*"countryCode":"\([A-Za-z][A-Za-z]*\)".*/\1/p')"
+      fi
+    fi
+    if [[ -z "$ip" || -z "$cc" ]]; then
+      json="$(curl -fsS -m 14 -H 'Accept: application/json' -H 'User-Agent: shellstack-exporter-setup' \
+        'https://ipinfo.io/json' 2>/dev/null)" || json=""
+      if [[ -n "$json" ]]; then
+        local _ipinfo_blob _ii _icc
+        _ipinfo_blob="$(_exporter_ipinfo_parse_ip_country "$json")"
+        _ii="$(printf '%s' "$_ipinfo_blob" | sed -n '1p')"
+        _icc="$(printf '%s' "$_ipinfo_blob" | sed -n '2p')"
+        [[ -z "$ip" && -n "$_ii" ]] && ip="$_ii"
+        [[ -z "$cc" && -n "$_icc" ]] && cc="$_icc"
+      fi
+    fi
+    if [[ -z "$ip" ]] || ! [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+      ip="$(_exporter_fetch_public_ip_only)" || ip=""
+    fi
+    if [[ -z "$ip" ]] || ! [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+      warn "无法获得公网 IPv4，跳过主机名设置（可设 SHELLSTACK_EXPORTER_PUBLIC_IP 或 SHELLSTACK_EXPORTER_GEO_HOSTNAME）"
+      return 0
+    fi
+    if [[ -z "$cc" ]]; then
+      json="$(curl -fsS -m 14 -H 'Accept: application/json' \
+        "https://ipinfo.io/${ip}/json" 2>/dev/null)" || json=""
+      if [[ -n "$json" ]]; then
+        cc="$(printf '%s' "$json" | sed -n 's/.*"country"[[:space:]]*:[[:space:]]*"\([A-Za-z][A-Za-z]*\)".*/\1/p')"
+      fi
+    fi
+    if [[ -z "$cc" ]]; then
+      json="$(curl -fsS -m 14 "http://ip-api.com/json/${ip}?fields=status,message,countryCode" 2>/dev/null)" || json=""
+      if [[ -n "$json" && "$json" == *'"status":"success"'* ]]; then
+        cc="$(printf '%s' "$json" | sed -n 's/.*"countryCode":"\([A-Za-z][A-Za-z]*\)".*/\1/p')"
+      fi
+    fi
+    cc="$(printf '%s' "$cc" | tr '[:lower:]' '[:upper:]' | tr -cd 'A-Z')"
+    if [[ ${#cc} -ne 2 ]]; then
+      cc="XX"
+      warn "未得到二位国家/地区码，使用 XX（可设 SHELLSTACK_EXPORTER_GEO_CODE=HK 等）"
+    fi
+    name="${cc}-${ip}"
+  fi
+
+  if ! [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]; then
+    warn "目标主机名不符合常见 hostname 规则，跳过: $name"
+    return 0
+  fi
+  if [[ ${#name} -gt 200 ]]; then
+    warn "目标主机名过长，跳过"
+    return 0
+  fi
+
+  cur="$(hostname 2>/dev/null || true)"
+  if [[ "$cur" == "$name" ]]; then
+    log "主机名已是 ${name}，跳过写入"
+    return 0
+  fi
+
+  if command -v hostnamectl >/dev/null 2>&1; then
+    if hostnamectl set-hostname --static "$name" >>"$LOG_FILE" 2>&1; then
+      log "已设置静态主机名为 ${name}（hostnamectl，供 Consul 注册等使用）"
+    else
+      warn "hostnamectl set-hostname 失败，尝试 /etc/hostname"
+      printf '%s\n' "$name" >/etc/hostname 2>>"$LOG_FILE" || { warn "写入 /etc/hostname 失败"; return 0; }
+      hostname "$name" 2>>"$LOG_FILE" || true
+      log "已写入 /etc/hostname 并尝试 hostname ${name}"
+    fi
+  elif [[ -w /etc/hostname ]] || [[ -w / ]]; then
+    printf '%s\n' "$name" >/etc/hostname 2>>"$LOG_FILE" || { warn "写入 /etc/hostname 失败"; return 0; }
+    command -v hostname >/dev/null 2>&1 && hostname "$name" 2>>"$LOG_FILE" || true
+    log "已写入 /etc/hostname 并尝试 hostname ${name}"
+  else
+    warn "无 hostnamectl 且无法写 /etc/hostname，跳过主机名 ${name}"
+    return 0
+  fi
+
+  if [[ -f /etc/hosts ]] && grep -qE '^127\.0\.1\.1[[:space:]]' /etc/hosts 2>/dev/null; then
+    sed -i.bak-shellstack-host "s/^127\.0\.1\.1[[:space:]].*/127.0.1.1\t${name}/" /etc/hosts 2>>"$LOG_FILE" && \
+      log "已同步 /etc/hosts 中 127.0.1.1 为 ${name}（备份: /etc/hosts.bak-shellstack-host）"
+  fi
 }
 
 _exporter_install_node_exporter() {
@@ -801,6 +947,8 @@ setup_exporter_and_register() {
   [[ "${SHELLSTACK_EXPORTER_NO_BUILTIN_TOKEN:-}" == "1" ]] && _tok_persist=""
   _exporter_persist_consul_env_for_shells "$consul_raw" "$_tok_persist"
 
+  _exporter_apply_geo_public_hostname
+
   log "=========================================="
   log "exporter：安装 node_exporter 并注册到 Consul（Prometheus 经 consul_sd 发现）"
   log "=========================================="
@@ -852,7 +1000,8 @@ _exporter_cli_usage() {
 
 与 main.sh 相同的环境变量仍可用：CONSUL_HTTP_ADDR、CONSUL_HTTP_TOKEN、EXPORTER_LISTEN_PORT、
 CONSUL_SERVICE_NAME、CONSUL_SERVICE_ID、CONSUL_SERVICE_TAGS、SHELLSTACK_NGINX_STUB_URLS、
-EXPORTER_METRICS_ALLOW_FROM、SHELLSTACK_EXPORTER_SKIP_FIREWALL 等。
+EXPORTER_METRICS_ALLOW_FROM、SHELLSTACK_EXPORTER_SKIP_FIREWALL、
+SHELLSTACK_EXPORTER_SKIP_HOSTNAME、SHELLSTACK_EXPORTER_PUBLIC_IP、SHELLSTACK_EXPORTER_GEO_CODE、SHELLSTACK_EXPORTER_GEO_HOSTNAME 等。
 
 选项:
   -h, --help                  显示本帮助
