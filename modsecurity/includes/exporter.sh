@@ -36,7 +36,7 @@
 #   EXPORTER_METRICS_ALLOW_FROM / SHELLSTACK_EXPORTER_METRICS_ALLOW_FROM  逗号分隔 IPv4 或 CIDR；若设置则仅放行这些源访问 metrics 端口，不再从 Consul 地址推导
 #   SHELLSTACK_EXPORTER_SKIP_FIREWALL=1  不尝试配置本机防火墙（9100 等须自行放行）
 #   防火墙自动匹配（root）：firewalld → ufw → iptables/iptables-nft/iptables-legacy → nft（inet filter input 或 ip filter INPUT）
-#   部署 exporter 前（root）：将静态主机名设为「ISO 国家/地区二位码-公网IPv4」，如 HK-156.239.6.130
+#   部署 exporter 前（root）：将静态主机名设为「二位地区码-公网IPv4」（IPv4 中 . 改为 -，单标签），如 HK-156-239-6-130（避免 HK-156.239.x.x 被 SSH/hostname -s 截成 HK-156）
 #     公网 IP：依次尝试 ipify / ipinfo.io/ip / ifconfig.me / icanhazip / ident.me / AWS checkip 等多个出口探测 URL
 #     地区码：ip-api.com（HTTP）与 ipinfo.io/json（HTTPS）互为补充
 #   SHELLSTACK_EXPORTER_SKIP_HOSTNAME=1     不修改主机名
@@ -170,7 +170,8 @@ _exporter_apply_geo_public_hostname() {
       cc="XX"
       warn "未得到二位国家/地区码，使用 XX（可设 SHELLSTACK_EXPORTER_GEO_CODE=HK 等）"
     fi
-    name="${cc}-${ip}"
+    # 单标签主机名：把 IPv4 的 . 换成 -，否则含点主机名在多标签语义下会被 SSH \\h、hostname -s 显示成首段（如 HK-156.239.4.2 → HK-156）
+    name="${cc}-${ip//./-}"
   fi
 
   if ! [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]; then
@@ -1802,9 +1803,13 @@ _exporter_consul_service_meta_json() {
   hn="$(hostname 2>/dev/null || echo unknown)"
   geo=""
   pip=""
-  if [[ "$hn" =~ ^([A-Z][A-Z])-([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+  _hnu="$(printf '%s' "$hn" | tr '[:lower:]' '[:upper:]')"
+  if [[ "$_hnu" =~ ^([A-Z]{2})-([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})$ ]]; then
     geo="${BASH_REMATCH[1]}"
     pip="${BASH_REMATCH[2]}"
+  elif [[ "$_hnu" =~ ^([A-Z]{2})-([0-9]{1,3})-([0-9]{1,3})-([0-9]{1,3})-([0-9]{1,3})$ ]]; then
+    geo="${BASH_REMATCH[1]}"
+    pip="${BASH_REMATCH[2]}.${BASH_REMATCH[3]}.${BASH_REMATCH[4]}.${BASH_REMATCH[5]}"
   fi
   os_pretty="unknown"
   if [[ -f /etc/os-release ]]; then
