@@ -26,8 +26,8 @@
 #   SHELLSTACK_EXPORTER_SKIP_PERSIST_ENV=1  不写入 /etc/profile.d/shellstack-consul-env.sh
 #   SHELLSTACK_EXPORTER_DEFAULT_CONSUL_ADDR / SHELLSTACK_EXPORTER_DEFAULT_CONSUL_TOKEN 覆盖内置默认
 #   SHELLSTACK_NGINX_STUB_URLS   逗号分隔的 stub_status URL；未设置且探测失败时会尝试自动注入见下
-#   SHELLSTACK_NGINX_STUB_INJECT  默认 1：stub 全失败且**宝塔 Nginx 已安装**（/www/server/nginx/sbin/nginx + conf/nginx.conf）时注入 127.0.0.1 stub；仅有面板未装 Nginx 则跳过；设 0 关闭
-#   SHELLSTACK_NGINX_STUB_LISTEN_PORT  注入时监听端口，默认 8899（仅 127.0.0.1）
+#   SHELLSTACK_NGINX_STUB_INJECT  默认 1：stub 全失败且**宝塔 Nginx 已安装**（/www/server/nginx/sbin/nginx + conf/nginx.conf）时注入 127.0.0.1 专用 server；仅有面板未装 Nginx 则跳过；设 0 关闭
+#   SHELLSTACK_NGINX_STUB_LISTEN_PORT  注入时监听端口，默认 8899（仅 127.0.0.1）；片段文件为 /www/server/nginx/conf/shellstack_status.conf（含 stub_status + 探测到的 PHP-FPM status location，pool 需启用 pm.status_path=/status）
 #   CONSUL_SERVICE_ID       覆盖自动生成的服务 ID（默认 {hostname}-{CONSUL_SERVICE_NAME}-{port}，hostname 见下方函数）
 #   CONSUL_SERVICE_NAME     默认 shellstack-node-exporter
 #   CONSUL_SERVICE_TAGS     额外标签，逗号分隔，追加到默认 tags
@@ -313,42 +313,122 @@ _exporter_baota_nginx_installed() {
   [[ -x /www/server/nginx/sbin/nginx ]] && [[ -f /www/server/nginx/conf/nginx.conf ]]
 }
 
-# 在宝塔 nginx.conf 的 http{} 内 include 独立 stub（仅 127.0.0.1），供本机 textfile 采集
+# 列出本机宝塔 PHP-FPM status 用 socket：stdout 每行 location标签\\t绝对路径（标签为版本目录名，点改为下划线）
+_exporter_baota_list_php_fpm_status_sockets() {
+  local line ver sock s base
+  declare -A seen=()
+  shopt -s nullglob
+  while read -r line; do
+    [[ "$line" =~ /www/server/php/([^/]+)/ ]] || continue
+    ver="${BASH_REMATCH[1]}"
+    sock=""
+    if [[ -S "/tmp/php-cgi-${ver}.sock" ]]; then
+      sock="/tmp/php-cgi-${ver}.sock"
+    elif [[ -S "/www/server/php/${ver}/var/run/php-fpm.sock" ]]; then
+      sock="/www/server/php/${ver}/var/run/php-fpm.sock"
+    fi
+    [[ -z "$sock" ]] && continue
+    [[ -n "${seen[$ver]:-}" ]] && continue
+    seen[$ver]=1
+    printf '%s\t%s\n' "${ver//./_}" "$sock"
+  done < <(pgrep -af 'php-fpm: master process' 2>/dev/null | sort -u)
+  for s in /tmp/php-cgi-*.sock; do
+    [[ -S "$s" ]] || continue
+    base="${s#/tmp/php-cgi-}"
+    base="${base%.sock}"
+    [[ -n "${seen[$base]:-}" ]] && continue
+    seen[$base]=1
+    printf '%s\t%s\n' "${base//./_}" "$s"
+  done
+  shopt -u nullglob
+}
+
+# 写入 /www/server/nginx/conf/shellstack_status.conf：127.0.0.1 stub_status + 各 PHP-FPM pm.status_path（默认 URI /status）
+_exporter_write_baota_shellstack_status_conf() {
+  local port="$1"
+  local out="/www/server/nginx/conf/shellstack_status.conf"
+  local fcgi_line="fastcgi_params"
+  local root_dir="/www/server/nginx/html"
+  [[ -d "$root_dir" ]] || root_dir="/tmp"
+  [[ -f /www/server/nginx/conf/fastcgi.conf ]] && fcgi_line="/www/server/nginx/conf/fastcgi.conf"
+
+  {
+    echo "# shellstack exporter 生成：127.0.0.1:${port}，仅供本机采集；重跑 --with-exporter 会覆盖"
+    echo "# Nginx: GET /nginx_stub_status"
+    echo "# PHP-FPM: GET /shellstack-fpm-status-<ver> → 需在对应 www.conf 等 pool 中启用 pm.status_path = /status（与 fastcgi 参数一致）"
+    echo "server {"
+    echo "    listen 127.0.0.1:${port};"
+    echo "    server_name 127.0.0.1;"
+    echo "    root ${root_dir};"
+    echo "    location /nginx_stub_status {"
+    echo "        stub_status on;"
+    echo "        access_log off;"
+    echo "        allow 127.0.0.1;"
+    echo "        deny all;"
+    echo "    }"
+  } >"$out"
+
+  local tag sk
+  while IFS=$'\t' read -r tag sk; do
+    [[ -n "$tag" && -n "$sk" ]] || continue
+    {
+      echo "    location = /shellstack-fpm-status-${tag} {"
+      echo "        access_log off;"
+      echo "        allow 127.0.0.1;"
+      echo "        deny all;"
+      echo "        include ${fcgi_line};"
+      echo "        fastcgi_pass unix:${sk};"
+      echo "        fastcgi_param REQUEST_URI /status;"
+      echo "        fastcgi_param SCRIPT_NAME /status;"
+      echo "    }"
+    } >>"$out"
+  done < <(_exporter_baota_list_php_fpm_status_sockets)
+
+  echo "}" >>"$out"
+  chmod 644 "$out" 2>/dev/null || true
+}
+
+# 在宝塔 nginx.conf 的 http{} 内 include shellstack_status.conf（仅 127.0.0.1：stub + PHP-FPM status）
 _exporter_inject_baota_nginx_stub_status() {
   local port="${1:-8899}"
   local ngx_bin="/www/server/nginx/sbin/nginx"
   local ngx_main="/www/server/nginx/conf/nginx.conf"
-  local snip="/www/server/nginx/conf/shellstack_stub_status.conf"
+  local snip="/www/server/nginx/conf/shellstack_status.conf"
+  local _nfpm=0 _fpm_hint="" tag sk
+
   if ! _exporter_baota_nginx_installed; then
-    warn "未检测到宝塔 Nginx（需要可执行文件 ${ngx_bin} 与主配置 ${ngx_main}），跳过 stub_status 注入"
+    warn "未检测到宝塔 Nginx（需要可执行文件 ${ngx_bin} 与主配置 ${ngx_main}），跳过 stub / status 注入"
     return 1
   fi
 
   if ss -lnt 2>/dev/null | grep -qE ":${port}[[:space:]]"; then
-    warn "端口 ${port} 已被占用，跳过注入 stub_status（可设 SHELLSTACK_NGINX_STUB_LISTEN_PORT 为其他端口）"
-    return 1
+    if ss -lnt 2>/dev/null | grep -qE "127\.0\.0\.1:${port}"; then
+      log "检测到 127.0.0.1:${port} 已在监听，将仅刷新 ${snip} 内容"
+    else
+      warn "端口 ${port} 已被占用且非 127.0.0.1:${port}，跳过注入（可设 SHELLSTACK_NGINX_STUB_LISTEN_PORT）"
+      return 1
+    fi
   fi
 
-  cat >"$snip" <<EOF
-# shellstack exporter 生成：仅 127.0.0.1:${port}，供 Prometheus textfile 读取 stub_status
-server {
-    listen 127.0.0.1:${port};
-    server_name 127.0.0.1;
-    location /nginx_stub_status {
-        stub_status on;
-        access_log off;
-        allow 127.0.0.1;
-        deny all;
-    }
-}
-EOF
-  chmod 644 "$snip" 2>/dev/null || true
+  while IFS=$'\t' read -r tag sk; do
+    [[ -n "$tag" ]] || continue
+    _nfpm=$((_nfpm + 1))
+    _fpm_hint+=" http://127.0.0.1:${port}/shellstack-fpm-status-${tag}"
+  done < <(_exporter_baota_list_php_fpm_status_sockets)
 
-  if grep -qF 'include /www/server/nginx/conf/shellstack_stub_status.conf' "$ngx_main" 2>/dev/null; then
-    log "nginx.conf 已包含 shellstack_stub_status.conf，仅刷新片段文件"
+  _exporter_write_baota_shellstack_status_conf "$port"
+
+  if grep -qF 'shellstack_stub_status.conf' "$ngx_main" 2>/dev/null; then
+    sed -i.bak-shellstack-mig 's|shellstack_stub_status\.conf|shellstack_status.conf|g' "$ngx_main" 2>>"$LOG_FILE" || true
+    rm -f /www/server/nginx/conf/shellstack_stub_status.conf 2>/dev/null || true
+    log "已将 nginx.conf 中 shellstack_stub_status.conf 引用迁移为 shellstack_status.conf"
+  fi
+
+  if grep -qF 'include /www/server/nginx/conf/shellstack_status.conf' "$ngx_main" 2>/dev/null; then
+    log "nginx.conf 已包含 shellstack_status.conf，已刷新片段（stub + ${_nfpm} 个 PHP-FPM status location）"
   else
-    if ! sed -i.bak-shellstack '/^[[:space:]]*http[[:space:]]*{/a\    include /www/server/nginx/conf/shellstack_stub_status.conf;' "$ngx_main" 2>>"$LOG_FILE"; then
-      warn "向 nginx.conf 插入 include 失败"
+    if ! sed -i.bak-shellstack '/^[[:space:]]*http[[:space:]]*{/a\    include /www/server/nginx/conf/shellstack_status.conf;' "$ngx_main" 2>>"$LOG_FILE"; then
+      warn "向 nginx.conf 插入 include shellstack_status.conf 失败"
       return 1
     fi
   fi
@@ -363,14 +443,14 @@ EOF
   rm -f "${ngx_main}.bak-shellstack" 2>/dev/null || true
 
   if "$ngx_bin" -s reload >>"$LOG_FILE" 2>&1; then
-    log "已注入 stub_status：http://127.0.0.1:${port}/nginx_stub_status 并重载 Nginx"
+    log "已写入 ${snip} 并重载 Nginx：stub http://127.0.0.1:${port}/nginx_stub_status${_fpm_hint}（FPM 需 pool 启用 pm.status_path=/status）"
     return 0
   fi
   if systemctl reload nginx >>"$LOG_FILE" 2>&1 || /etc/init.d/nginx reload >>"$LOG_FILE" 2>&1; then
-    log "已注入 stub_status：http://127.0.0.1:${port}/nginx_stub_status 并重载 Nginx（systemctl/init）"
+    log "已写入 ${snip} 并重载 Nginx（systemctl/init）：stub 与上同${_fpm_hint}"
     return 0
   fi
-  warn "stub 配置已写入但重载失败，请手动: nginx -s reload"
+  warn "配置已写入 ${snip} 但重载失败，请手动: nginx -t && nginx -s reload"
   return 1
 }
 
@@ -938,7 +1018,7 @@ EOSCRIPT
   if ! _exporter_nginx_stub_urls_probe_ok "$effective_urls"; then
     if [[ "${SHELLSTACK_NGINX_STUB_INJECT:-1}" != "0" ]]; then
       if _exporter_baota_nginx_installed; then
-        log "未探测到可用 stub_status，尝试向宝塔 nginx.conf 注入 127.0.0.1:${stub_port} 专用 stub..."
+        log "未探测到可用 stub_status，尝试写入 shellstack_status.conf 并在 nginx.conf 中 include（127.0.0.1:${stub_port}）..."
         if _exporter_inject_baota_nginx_stub_status "$stub_port"; then
           effective_urls="${inject_url},${effective_urls}"
         else
@@ -1330,7 +1410,8 @@ _exporter_stack_service_meta_probes() {
   [[ ${#phplist} -gt 100 ]] && phplist="${phplist:0:97}..."
   phpstub=0
   local _su
-  for _su in http://127.0.0.1:8899/nginx_stub_status http://127.0.0.1/nginx_status http://127.0.0.1/stub_status; do
+  local _stubp="${SHELLSTACK_NGINX_STUB_LISTEN_PORT:-8899}"
+  for _su in "http://127.0.0.1:${_stubp}/nginx_stub_status" http://127.0.0.1/nginx_status http://127.0.0.1/stub_status; do
     if curl -fsS -m 1 "$_su" 2>/dev/null | grep -q 'Active connections'; then
       phpstub=1
       break
