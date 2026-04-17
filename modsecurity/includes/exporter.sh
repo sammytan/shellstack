@@ -27,9 +27,12 @@
 #   SHELLSTACK_NGINX_STUB_URLS   逗号分隔的 stub_status URL；未设置且探测失败时会尝试自动注入见下
 #   SHELLSTACK_NGINX_STUB_INJECT  默认 1：stub 全失败且存在 /www/server/nginx 时注入独立 127.0.0.1 端口 stub；设 0 关闭
 #   SHELLSTACK_NGINX_STUB_LISTEN_PORT  注入时监听端口，默认 8899（仅 127.0.0.1）
-#   CONSUL_SERVICE_ID       覆盖自动生成的服务 ID
+#   CONSUL_SERVICE_ID       覆盖自动生成的服务 ID（默认 {hostname}-{CONSUL_SERVICE_NAME}-{port}，hostname 见下方函数）
 #   CONSUL_SERVICE_NAME     默认 shellstack-node-exporter
 #   CONSUL_SERVICE_TAGS     额外标签，逗号分隔，追加到默认 tags
+#   EXPORTER_METRICS_ALLOW_FROM / SHELLSTACK_EXPORTER_METRICS_ALLOW_FROM  逗号分隔 IPv4 或 CIDR；若设置则仅放行这些源访问 metrics 端口，不再从 Consul 地址推导
+#   SHELLSTACK_EXPORTER_SKIP_FIREWALL=1  不尝试配置本机防火墙（9100 等须自行放行）
+#   防火墙自动匹配（root）：firewalld → ufw → iptables/iptables-nft/iptables-legacy → nft（inet filter input 或 ip filter INPUT）
 
 EXPORTER_LISTEN_PORT="${EXPORTER_LISTEN_PORT:-9100}"
 CONSUL_SERVICE_NAME="${CONSUL_SERVICE_NAME:-shellstack-node-exporter}"
@@ -422,12 +425,296 @@ _exporter_normalize_consul_base() {
   fi
 }
 
+# 从 Consul 基址 URL 取出 authority 中的主机部分（不含端口；支持 [IPv6] 形式）
+_exporter_host_from_consul_base() {
+  local raw="$1" rest authority
+  raw="${raw%/}"
+  if [[ "$raw" =~ ^https?:// ]]; then
+    rest="${raw#*://}"
+    authority="${rest%%/*}"
+  else
+    authority="${raw%%/*}"
+  fi
+  if [[ "$authority" == \[* ]]; then
+    printf '%s' "${authority#\[}" | cut -d']' -f1
+  else
+    printf '%s' "${authority%%:*}"
+  fi
+}
+
+_exporter_metrics_allow_sources_list() {
+  local consul_base="$1"
+  local manual="${EXPORTER_METRICS_ALLOW_FROM:-${SHELLSTACK_EXPORTER_METRICS_ALLOW_FROM:-}}"
+  local host ip
+  if [[ -n "$manual" ]]; then
+    echo "$manual" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$'
+    return 0
+  fi
+  host="$(_exporter_host_from_consul_base "$consul_base")"
+  if [[ -z "$host" ]]; then
+    return 1
+  fi
+  if [[ "$host" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+    echo "$host"
+    return 0
+  fi
+  ip="$(getent ahostsv4 "$host" 2>/dev/null | awk '/STREAM/ {print $1; exit}')"
+  if [[ -n "$ip" ]]; then
+    echo "$ip"
+    return 0
+  fi
+  ip="$(getent hosts "$host" 2>/dev/null | awk '{print $1; exit}')"
+  if [[ -n "$ip" && "$ip" =~ ^[0-9.]+$ ]]; then
+    echo "$ip"
+    return 0
+  fi
+  return 1
+}
+
+_exporter_firewall_rule_exists_firewalld() {
+  local src="$1" port="$2"
+  firewall-cmd --permanent --list-rich-rules 2>/dev/null | grep -qF "source address=\"${src}\"" && \
+    firewall-cmd --permanent --list-rich-rules 2>/dev/null | grep -qF "port=\"${port}\""
+}
+
+_exporter_firewall_firewalld_active() {
+  command -v firewall-cmd >/dev/null 2>&1 || return 1
+  if firewall-cmd --state >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+_exporter_firewall_ufw_active() {
+  command -v ufw >/dev/null 2>&1 || return 1
+  # 勿仅用 systemctl：Ubuntu 上 ufw.service 常为 oneshot，is-active 不等于「防火墙已启用」
+  ufw status 2>/dev/null | grep -qi 'Status: active'
+}
+
+_exporter_firewall_allow_via_firewalld() {
+  local port="$1"
+  shift
+  local srcs=("$@")
+  local src any=0
+  _exporter_firewall_firewalld_active || return 1
+  for src in "${srcs[@]}"; do
+    [[ -n "$src" ]] || continue
+    if _exporter_firewall_rule_exists_firewalld "$src" "$port"; then
+      log "firewalld 已存在放行规则: ${src} -> tcp/${port}"
+      continue
+    fi
+    if firewall-cmd --permanent --add-rich-rule="rule family=\"ipv4\" source address=\"${src}\" port port=\"${port}\" protocol=tcp accept" >>"$LOG_FILE" 2>&1; then
+      any=1
+      log "firewalld 已添加: 允许 ${src} 访问 tcp/${port}"
+    else
+      warn "firewalld 添加规则失败: ${src} -> ${port}"
+    fi
+  done
+  [[ "$any" -eq 1 ]] && firewall-cmd --reload >>"$LOG_FILE" 2>&1 || true
+  return 0
+}
+
+_exporter_firewall_allow_via_ufw() {
+  local port="$1"
+  shift
+  local srcs=("$@")
+  local src
+  _exporter_firewall_ufw_active || return 1
+  for src in "${srcs[@]}"; do
+    [[ -n "$src" ]] || continue
+    if ufw status numbered 2>/dev/null | grep -qE "ALLOW.*${src}.*${port}"; then
+      log "ufw 已存在类似放行: ${src} ${port}"
+      continue
+    fi
+    if ufw allow from "$src" to any port "$port" proto tcp >>"$LOG_FILE" 2>&1; then
+      log "ufw 已添加: 允许 ${src} 访问 ${port}/tcp"
+    else
+      warn "ufw 添加规则失败: ${src} -> ${port}"
+    fi
+  done
+  return 0
+}
+
+_exporter_iptables_check_rule() {
+  local ipt="$1" src="$2" port="$3"
+  if "$ipt" -C INPUT -s "$src" -p tcp --dport "$port" -m comment --comment "shellstack-exporter" -j ACCEPT >/dev/null 2>&1; then
+    return 0
+  fi
+  "$ipt" -C INPUT -s "$src" -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1
+}
+
+_exporter_iptables_insert_accept() {
+  local ipt="$1" src="$2" port="$3"
+  if _exporter_iptables_check_rule "$ipt" "$src" "$port"; then
+    return 0
+  fi
+  if "$ipt" -I INPUT 1 -s "$src" -p tcp --dport "$port" -m comment --comment "shellstack-exporter" -j ACCEPT >>"$LOG_FILE" 2>&1; then
+    return 0
+  fi
+  "$ipt" -I INPUT 1 -s "$src" -p tcp --dport "$port" -j ACCEPT >>"$LOG_FILE" 2>&1
+}
+
+_exporter_firewall_allow_via_iptables() {
+  local port="$1"
+  shift
+  local srcs=("$@")
+  local ipt src
+  local ipt_bins=(iptables iptables-nft iptables-legacy)
+  local chosen=""
+  for ipt in "${ipt_bins[@]}"; do
+    command -v "$ipt" >/dev/null 2>&1 || continue
+    if "$ipt" -L INPUT -n >/dev/null 2>&1; then
+      chosen="$ipt"
+      break
+    fi
+  done
+  [[ -n "$chosen" ]] || return 1
+  log "使用 ${chosen}（iptables 后端）放行 tcp/${port}"
+  for src in "${srcs[@]}"; do
+    [[ -n "$src" ]] || continue
+    if _exporter_iptables_check_rule "$chosen" "$src" "$port"; then
+      log "${chosen} 已存在放行: ${src} -> ${port}"
+      continue
+    fi
+    if _exporter_iptables_insert_accept "$chosen" "$src" "$port"; then
+      log "${chosen} 已插入: 允许 ${src} 访问 tcp/${port}"
+    else
+      warn "${chosen} 插入规则失败（链名非 INPUT 或无权限）: ${src} -> ${port}"
+    fi
+  done
+  return 0
+}
+
+_exporter_nft_metrics_comment() {
+  local src="$1" port="$2"
+  printf 'shellstack-exporter-%s-%s' "${src//\//-}" "$port"
+}
+
+_exporter_firewall_nft_input_chain() {
+  if nft list chain inet filter input >/dev/null 2>&1; then
+    printf '%s %s %s' inet filter input
+    return 0
+  fi
+  if nft list chain ip filter INPUT >/dev/null 2>&1; then
+    printf '%s %s %s' ip filter INPUT
+    return 0
+  fi
+  return 1
+}
+
+_exporter_firewall_allow_via_nft() {
+  local port="$1"
+  shift
+  local srcs=("$@")
+  local src fam tbl ch cmt
+  command -v nft >/dev/null 2>&1 || return 1
+  read -r fam tbl ch < <(_exporter_firewall_nft_input_chain) || return 1
+  for src in "${srcs[@]}"; do
+    [[ -n "$src" ]] || continue
+    cmt="$(_exporter_nft_metrics_comment "$src" "$port")"
+    if nft list ruleset 2>/dev/null | grep -qF "$cmt"; then
+      log "nft 已存在（comment ${cmt}）: ${src} -> tcp/${port}"
+      continue
+    fi
+    if nft add rule "$fam" "$tbl" "$ch" tcp dport "$port" ip saddr "$src" accept comment "\"$cmt\"" >>"$LOG_FILE" 2>&1; then
+      log "nft 已添加: $fam $tbl $ch 允许 ${src} -> tcp/${port}"
+    else
+      warn "nft 添加失败（链或族不匹配时可改用手工规则）: ${src} -> ${port}"
+    fi
+  done
+  return 0
+}
+
+_exporter_firewall_allow_metrics_sources() {
+  local port="$1"
+  shift
+  local srcs=("$@")
+
+  if [[ ${#srcs[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  log "防火墙：按本机环境依次尝试 firewalld → ufw → iptables → nft"
+
+  if _exporter_firewall_firewalld_active; then
+    _exporter_firewall_allow_via_firewalld "$port" "${srcs[@]}"
+    return 0
+  fi
+  if _exporter_firewall_ufw_active; then
+    _exporter_firewall_allow_via_ufw "$port" "${srcs[@]}"
+    return 0
+  fi
+  if _exporter_firewall_allow_via_iptables "$port" "${srcs[@]}"; then
+    return 0
+  fi
+  if _exporter_firewall_allow_via_nft "$port" "${srcs[@]}"; then
+    return 0
+  fi
+
+  warn "未匹配到可用防火墙（firewalld/ufw/iptables/nft 均不可用或 INPUT/链不可写），跳过 ${port}/tcp 放行"
+}
+
+_exporter_apply_firewall_for_exporter_metrics() {
+  local consul_base="$1"
+  local port="${2:-$EXPORTER_LISTEN_PORT}"
+  local line srcs=()
+
+  if [[ "${SHELLSTACK_EXPORTER_SKIP_FIREWALL:-}" == "1" ]]; then
+    log "已跳过防火墙配置（SHELLSTACK_EXPORTER_SKIP_FIREWALL=1）"
+    return 0
+  fi
+  if [[ "$(id -u)" -ne 0 ]]; then
+    warn "非 root，跳过防火墙：请 root 执行或手工放行 ${port}/tcp（源：Consul 服务器或 EXPORTER_METRICS_ALLOW_FROM）"
+    return 0
+  fi
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && srcs+=("$line")
+  done < <(_exporter_metrics_allow_sources_list "$consul_base" || true)
+
+  if [[ ${#srcs[@]} -eq 0 ]]; then
+    warn "无法得到放行源地址（检查 Consul 主机名解析或设置 EXPORTER_METRICS_ALLOW_FROM=IP）"
+    return 0
+  fi
+
+  log "node_exporter 端口 ${port}：仅允许以下源访问（与 CONSUL_HTTP_ADDR 或 EXPORTER_METRICS_ALLOW_FROM 一致）：${srcs[*]}"
+  _exporter_firewall_allow_metrics_sources "$port" "${srcs[@]}"
+}
+
 _exporter_json_escape() {
   # 最小 JSON 字符串转义（反斜杠与双引号）
   local s="$1"
   s="${s//\\/\\\\}"
   s="${s//\"/\\\"}"
   printf '%s' "$s"
+}
+
+# Consul Service ID 前缀：用当前主机名（完整优先），避免仅用 hostname -s 在部分环境得到过短片段（如 "10"）
+_exporter_consul_host_prefix_for_service_id() {
+  local h=""
+  if [[ -r /etc/hostname ]]; then
+    h="$(head -1 /etc/hostname 2>/dev/null | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  fi
+  if [[ -z "$h" ]]; then
+    h="$(hostname -f 2>/dev/null)"
+  fi
+  if [[ -z "$h" || "$h" == "(none)" ]]; then
+    h="$(hostname 2>/dev/null)"
+  fi
+  if [[ -z "$h" ]]; then
+    h="host"
+  fi
+  h="$(echo -n "$h" | tr '[:upper:]' '[:lower:]')"
+  h="${h//./-}"
+  h="$(echo -n "$h" | tr -cd '[:alnum:]-')"
+  [[ -z "$h" ]] && h="host"
+  if [[ ${#h} -gt 56 ]]; then
+    h="${h:0:56}"
+  fi
+  printf '%s' "$h"
 }
 
 _exporter_consul_register() {
@@ -440,10 +727,9 @@ _exporter_consul_register() {
     return 1
   fi
 
-  local safe_host sid tags_json extra_tag
-  safe_host="$(hostname -s 2>/dev/null | tr -cd '[:alnum:]-' | head -c 48)"
-  [[ -z "$safe_host" ]] && safe_host="host"
-  sid="${CONSUL_SERVICE_ID:-${CONSUL_SERVICE_NAME}-${safe_host}-${port}}"
+  local host_prefix sid tags_json extra_tag
+  host_prefix="$(_exporter_consul_host_prefix_for_service_id)"
+  sid="${CONSUL_SERVICE_ID:-${host_prefix}-${CONSUL_SERVICE_NAME}-${port}}"
 
   tags_json='"shellstack","modsecurity","node-exporter"'
   if [[ -n "${CONSUL_SERVICE_TAGS:-}" ]]; then
@@ -528,6 +814,7 @@ setup_exporter_and_register() {
 
   _exporter_install_node_exporter
   _exporter_ensure_service_running
+  _exporter_apply_firewall_for_exporter_metrics "$consul_base" "${EXPORTER_LISTEN_PORT}"
   _exporter_install_baota_textfile_collector
 
   local ip
@@ -564,7 +851,8 @@ _exporter_cli_usage() {
 未设置 CONSUL_HTTP_TOKEN 且未指定 SHELLSTACK_EXPORTER_NO_BUILTIN_TOKEN=1 时使用内置 Token。
 
 与 main.sh 相同的环境变量仍可用：CONSUL_HTTP_ADDR、CONSUL_HTTP_TOKEN、EXPORTER_LISTEN_PORT、
-CONSUL_SERVICE_NAME、CONSUL_SERVICE_ID、CONSUL_SERVICE_TAGS、SHELLSTACK_NGINX_STUB_URLS 等。
+CONSUL_SERVICE_NAME、CONSUL_SERVICE_ID、CONSUL_SERVICE_TAGS、SHELLSTACK_NGINX_STUB_URLS、
+EXPORTER_METRICS_ALLOW_FROM、SHELLSTACK_EXPORTER_SKIP_FIREWALL 等。
 
 选项:
   -h, --help                  显示本帮助
