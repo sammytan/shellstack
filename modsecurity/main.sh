@@ -118,6 +118,8 @@ DEPLOY_MODSEC_CONF=0
 BT_OPENRESTY_VERSION="${BT_OPENRESTY_VERSION:-openresty127}"
 # 是否从命令行传入 --bt-openresty（用于与默认区分，触发宝塔环境预检）
 BT_OPENRESTY_FROM_CLI=0
+# 为 1 时表示用户还请求了 ModSecurity/宝塔 等主流程；与 ENABLE_EXPORTER 组合用于「仅 exporter」独立模式
+SHELLSTACK_MAIN_NON_EXPORTER_WORK=0
 
 # 解析命令行参数
 parse_args() {
@@ -125,56 +127,69 @@ parse_args() {
     case "$1" in
       --prefix=*)
         MODSECURITY_PREFIX="${1#*=}"
+        SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         shift
         ;;
       --prefix)
         MODSECURITY_PREFIX="$2"
+        SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         shift 2
         ;;
       --version=*)
         MODSECURITY_VERSION="${1#*=}"
+        SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         shift
         ;;
       --version)
         MODSECURITY_VERSION="$2"
+        SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         shift 2
         ;;
       --enable-geoip)
         ENABLE_GEOIP=1
+        SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         shift
         ;;
       --geoip-provider=*)
         GEOIP_PROVIDER="${1#*=}"
+        SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         shift
         ;;
       --geoip-provider)
         GEOIP_PROVIDER="$2"
+        SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         shift 2
         ;;
       --maxmind)
         GEOIP_PROVIDER="maxmind"
         ENABLE_GEOIP=1
+        SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         shift
         ;;
       --dbip)
         GEOIP_PROVIDER="dbip"
         ENABLE_GEOIP=1
+        SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         shift
         ;;
       --enable-security)
         ENABLE_SECURITY=1
+        SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         shift
         ;;
       --enable-openresty)
         ENABLE_OPENRESTY=1
+        SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         shift
         ;;
       --enable-kernel-opt)
         ENABLE_KERNEL_OPT=1
+        SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         shift
         ;;
       --enable-terminal)
         ENABLE_TERMINAL=1
+        SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         shift
         ;;
       --disable-kernel-opt)
@@ -187,18 +202,22 @@ parse_args() {
         ;;
       --jobs=*)
         MAKE_JOBS="${1#*=}"
+        SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         shift
         ;;
       --jobs)
         MAKE_JOBS="$2"
+        SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         shift 2
         ;;
       --extend-btwaf-cache)
         EXTEND_BTWAF_CACHE=1
+        SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         shift
         ;;
       --install-bt)
         INSTALL_BAOTA_PANEL=1
+        SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         shift
         ;;
       --force)
@@ -219,23 +238,26 @@ parse_args() {
         export SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK
         export SHELLSTACK_BTWAF_FORCE_PANEL_INSTALL
         export SHELLSTACK_INSTALL_REDIS
+        SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         log "启用 --force：将强制执行 nginx 重编译、nginx.conf http 块重注入、BTwaf 面板重装及 Redis 安装流程（OpenResty 版本优先使用显式 --bt-openresty）。"
         shift
         ;;
       --deploy-conf)
         DEPLOY_MODSEC_CONF=1
+        SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         shift
         ;;
       --with-exporter=*)
         ENABLE_EXPORTER=1
         EXPORTER_CONSUL_ADDR="${1#*=}"
+        EXPORTER_CONSUL_ADDR="$(echo -n "$EXPORTER_CONSUL_ADDR" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
         export EXPORTER_CONSUL_ADDR
         shift
         ;;
       --with-exporter)
         ENABLE_EXPORTER=1
         if [[ -n "${2:-}" ]] && [[ "${2:-}" != -* ]]; then
-          EXPORTER_CONSUL_ADDR="$2"
+          EXPORTER_CONSUL_ADDR="$(echo -n "$2" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
           shift 2
         else
           EXPORTER_CONSUL_ADDR=""
@@ -244,24 +266,34 @@ parse_args() {
         export EXPORTER_CONSUL_ADDR
         ;;
       --with-consul-token=*)
+        ENABLE_EXPORTER=1
         CONSUL_HTTP_TOKEN="${1#*=}"
+        CONSUL_HTTP_TOKEN="$(echo -n "$CONSUL_HTTP_TOKEN" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
         export CONSUL_HTTP_TOKEN
         shift
         ;;
       --with-consul-token)
-        CONSUL_HTTP_TOKEN="$2"
+        ENABLE_EXPORTER=1
+        if [[ -n "${2:-}" ]] && [[ "${2:-}" != -* ]]; then
+          CONSUL_HTTP_TOKEN="$(echo -n "$2" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          shift 2
+        else
+          CONSUL_HTTP_TOKEN=""
+          shift
+        fi
         export CONSUL_HTTP_TOKEN
-        shift 2
         ;;
       --bt-openresty=*)
         BT_OPENRESTY_VERSION="${1#*=}"
         BT_OPENRESTY_FROM_CLI=1
+        SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         export BT_OPENRESTY_VERSION
         shift
         ;;
       --bt-openresty)
         BT_OPENRESTY_VERSION="$2"
         BT_OPENRESTY_FROM_CLI=1
+        SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         export BT_OPENRESTY_VERSION
         shift 2
         ;;
@@ -478,6 +510,17 @@ main_install() {
 main() {
   # 解析命令行参数
   parse_args "$@"
+
+  # 仅 --with-exporter / --with-consul-token（及可选 --disable-kernel-opt / --disable-terminal）时：不跑 ModSecurity 主安装，只执行 exporter + Consul
+  if [[ "$ENABLE_EXPORTER" == "1" ]] && [[ "${SHELLSTACK_MAIN_NON_EXPORTER_WORK:-0}" == "0" ]]; then
+    log "=========================================="
+    log "独立任务：仅部署 node_exporter + Consul 注册（与完整 ModSecurity 安装互斥；若需同时安装请再加如 --version=… 或 --deploy-conf 等参数）"
+    log "=========================================="
+    source "$INCLUDES_DIR/exporter.sh"
+    setup_exporter_and_register "${EXPORTER_CONSUL_ADDR:-}"
+    log "exporter 独立流程结束。"
+    exit 0
+  fi
 
   # 可选：先安装宝塔面板，再做宝塔相关环境检查
   if [[ "${INSTALL_BAOTA_PANEL:-0}" == "1" ]]; then
