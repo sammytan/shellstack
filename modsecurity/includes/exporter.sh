@@ -46,7 +46,7 @@
 #   SHELLSTACK_EXPORTER_FORCE=1  由 main.sh 在「仅 exporter + --force」时设置：强制重跑 exporter 各步骤（不触发 ModSecurity 主流程）
 #   textfile 采集（cron）可选：SHELLSTACK_MYSQL_SOCKET=socket路径  SHELLSTACK_REDIS_SOCKET=  SHELLSTACK_REDIS_HOST / SHELLSTACK_REDIS_PORT
 #   SHELLSTACK_TEXTFILE_SKIP_HOST_METRICS=1  不在 textfile 中写入 shellstack_host_*（仅用 node_exporter 的 node_*）
-#   日志：/var/log/shellstack-node-exporter-textfile.log 仅记录 **cron 跑 textfile 脚本** 的 stdout/stderr；指标在 .prom 内，故旧版脚本成功时该文件常为空；新版每分钟写一行 OK。**prometheus-node-exporter** 守护进程日志用 journalctl（如 journalctl -u prometheus-node-exporter -e），不是此文件。
+#   日志：/var/log/shellstack-node-exporter-textfile.log = exporter 首次执行 textfile 时 tee 至此 + 部署标记行，之后 cron 每分钟追加；指标仍在 .prom。**prometheus-node-exporter** 用 journalctl（如 journalctl -u prometheus-node-exporter -e）。
 
 EXPORTER_LISTEN_PORT="${EXPORTER_LISTEN_PORT:-9100}"
 CONSUL_SERVICE_NAME="${CONSUL_SERVICE_NAME:-shellstack-node-exporter}"
@@ -962,9 +962,22 @@ PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 EOF
   chmod 644 "$cronf" 2>/dev/null || true
 
-  TEXTFILE_DIR="$dir" SHELLSTACK_NGINX_STUB_URLS="$effective_urls" bash "$bin" >>"$LOG_FILE" 2>&1 || warn "首次执行 textfile 采集脚本失败"
+  # 首次执行原只写入 LOG_FILE，用户查看 $tlog 会误以为未运行；同时 tee 到 $tlog（与 cron 同一文件）
+  if [[ -n "${LOG_FILE:-}" ]]; then
+    TEXTFILE_DIR="$dir" SHELLSTACK_NGINX_STUB_URLS="$effective_urls" bash "$bin" 2>&1 | tee -a "$LOG_FILE" "$tlog"
+  else
+    TEXTFILE_DIR="$dir" SHELLSTACK_NGINX_STUB_URLS="$effective_urls" bash "$bin" 2>&1 | tee -a "$tlog"
+  fi
+  [[ "${PIPESTATUS[0]:-0}" -ne 0 ]] && warn "首次执行 textfile 采集脚本失败（退出码 ${PIPESTATUS[0]}）"
+  {
+    echo "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date) shellstack-exporter: textfile 首次执行结束（上方若有采集脚本输出亦已记入本文件）；此后依赖 cron 每分钟写入"
+  } >>"$tlog" 2>/dev/null || true
   log "已部署宝塔/服务 textfile 采集: $bin → $dir/shellstack_baota.prom（cron: $cronf）"
   log "stub_status 探测 URL 列表（cron 已写入）: $effective_urls"
+  log "textfile 本次运行的终端输出已写入 $tlog（与 cron 共用）；之后每分钟由 cron 追加一行（请确保已启用: systemctl enable --now cron）"
+  if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^cron\.service'; then
+    systemctl is-active --quiet cron 2>/dev/null || warn "cron 服务未运行，textfile 不会每分钟执行；请执行: systemctl enable --now cron（Debian/Ubuntu 包名通常为 cron）"
+  fi
   if [[ "${SHELLSTACK_EXPORTER_FORCE:-}" == "1" ]]; then
     log "--force：已覆盖 $bin 与 $cronf；node_exporter 已在写入 textfile 目录配置后重启（见「已重启 prometheus-node-exporter」日志）"
   fi
