@@ -47,6 +47,9 @@
 #   textfile 采集（cron）可选：SHELLSTACK_MYSQL_SOCKET=socket路径  SHELLSTACK_REDIS_SOCKET=  SHELLSTACK_REDIS_HOST / SHELLSTACK_REDIS_PORT
 #   SHELLSTACK_TEXTFILE_SKIP_HOST_METRICS=1  不在 textfile 中写入 shellstack_host_*（仅用 node_exporter 的 node_*）
 #   日志：/var/log/shellstack-node-exporter-textfile.log = exporter 首次执行 textfile 时 tee 至此 + 部署标记行，之后 cron 每分钟追加；指标仍在 .prom。**prometheus-node-exporter** 用 journalctl（如 journalctl -u prometheus-node-exporter -e）。
+#   CentOS/RHEL 7：默认仓库无 node_exporter 时脚本会尝试启用 epel-release 并安装 golang-github-prometheus-node-exporter；仍失败则从 GitHub 下载官方二进制至 /usr/local/bin 并写入 systemd 单元（见下）。
+#   SHELLSTACK_NODE_EXPORTER_VERSION  二进制回退时的发行版号，默认 1.7.0（兼容 glibc 2.17 等老系统）
+#   SHELLSTACK_EXPORTER_SKIP_NODE_EXPORTER_BINARY_FALLBACK=1  禁止 GitHub 二进制回退（仅包管理器安装）
 
 EXPORTER_LISTEN_PORT="${EXPORTER_LISTEN_PORT:-9100}"
 CONSUL_SERVICE_NAME="${CONSUL_SERVICE_NAME:-shellstack-node-exporter}"
@@ -209,9 +212,109 @@ _exporter_apply_geo_public_hostname() {
   fi
 }
 
+_exporter_yum_ensure_epel_release() {
+  command -v yum >/dev/null 2>&1 || return 0
+  [[ -f /etc/redhat-release ]] || return 0
+  if yum repolist enabled 2>/dev/null | grep -qiE '(^|[[:space:]])epel(/|[[:space:]])'; then
+    return 0
+  fi
+  if rpm -q epel-release >/dev/null 2>&1; then
+    return 0
+  fi
+  log "尝试安装 epel-release（便于 CentOS/RHEL 7 等从 EPEL 安装 node_exporter）"
+  yum install -y epel-release >>"$LOG_FILE" 2>&1 || true
+}
+
+_exporter_node_exporter_go_arch() {
+  case "$(uname -m)" in
+    x86_64) echo amd64 ;;
+    aarch64 | arm64) echo arm64 ;;
+    armv7l) echo armv7 ;;
+    ppc64le) echo ppc64le ;;
+    s390x) echo s390x ;;
+    *) echo "" ;;
+  esac
+}
+
+# 无发行版包或包名不匹配时：官方 release 二进制 + systemd（RHEL 系常见 /etc/sysconfig/node_exporter）
+_exporter_install_node_exporter_binary_fallback() {
+  [[ "${SHELLSTACK_EXPORTER_SKIP_NODE_EXPORTER_BINARY_FALLBACK:-}" == "1" ]] && {
+    warn "已设置 SHELLSTACK_EXPORTER_SKIP_NODE_EXPORTER_BINARY_FALLBACK=1，跳过官方二进制回退"
+    return 1
+  }
+  local ver arch url tmpdir tgz ex binpath
+  ver="${SHELLSTACK_NODE_EXPORTER_VERSION:-1.7.0}"
+  arch="$(_exporter_node_exporter_go_arch)"
+  if [[ -z "$arch" ]]; then
+    warn "无法根据 uname -m 选择 node_exporter 架构，跳过二进制回退"
+    return 1
+  fi
+  binpath="/usr/local/bin/node_exporter"
+  url="https://github.com/prometheus/node_exporter/releases/download/v${ver}/node_exporter-${ver}.linux-${arch}.tar.gz"
+  tmpdir="$(mktemp -d)" || return 1
+  tgz="${tmpdir}/node_exporter.tgz"
+  if ! curl -fsSL "$url" -o "$tgz" >>"$LOG_FILE" 2>&1; then
+    rm -rf "$tmpdir"
+    warn "下载 node_exporter 失败（请检查网络或版本号）: $url"
+    return 1
+  fi
+  if ! tar -xzf "$tgz" -C "$tmpdir" >>"$LOG_FILE" 2>&1; then
+    rm -rf "$tmpdir"
+    warn "解压 node_exporter 归档失败"
+    return 1
+  fi
+  ex="$(find "$tmpdir" -maxdepth 3 -type f -name node_exporter 2>/dev/null | head -1)"
+  if [[ -z "$ex" || ! -f "$ex" ]]; then
+    rm -rf "$tmpdir"
+    warn "解压后未找到 node_exporter 可执行文件"
+    return 1
+  fi
+  if ! install -m 0755 "$ex" "$binpath" >>"$LOG_FILE" 2>&1; then
+    if ! cp -f "$ex" "$binpath" >>"$LOG_FILE" 2>&1 || ! chmod 0755 "$binpath" >>"$LOG_FILE" 2>&1; then
+      rm -rf "$tmpdir"
+      warn "无法写入 $binpath"
+      return 1
+    fi
+  fi
+  rm -rf "$tmpdir"
+
+  if ! systemctl list-unit-files 2>/dev/null | grep -qE '^node_exporter\.service|^prometheus-node-exporter\.service'; then
+    umask 022
+    mkdir -p /etc/sysconfig 2>/dev/null || true
+    if [[ ! -f /etc/sysconfig/node_exporter ]]; then
+      {
+        echo "# 由 shellstack exporter 二进制回退生成；textfile 等参数由脚本合并至此"
+        echo "NODE_EXPORTER_OPTS=\"--web.listen-address=:${EXPORTER_LISTEN_PORT}\""
+      } >"/etc/sysconfig/node_exporter"
+    fi
+    cat >/etc/systemd/system/node_exporter.service <<EOF
+[Unit]
+Description=Prometheus Node Exporter (shellstack binary fallback)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nobody
+Group=nobody
+EnvironmentFile=-/etc/sysconfig/node_exporter
+ExecStart=${binpath} \$NODE_EXPORTER_OPTS
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload >>"$LOG_FILE" 2>&1 || true
+    log "已写入 systemd 单元 /etc/systemd/system/node_exporter.service 与 /etc/sysconfig/node_exporter（二进制回退）"
+  fi
+  log "已通过 GitHub 官方二进制安装 node_exporter 至 ${binpath}（v${ver}，${arch}）"
+  return 0
+}
+
 _exporter_install_node_exporter() {
-  if command -v node_exporter >/dev/null 2>&1; then
-    log "检测到 node_exporter 已安装，跳过安装"
+  if command -v node_exporter >/dev/null 2>&1 || command -v prometheus-node-exporter >/dev/null 2>&1; then
+    log "检测到 node_exporter / prometheus-node-exporter 已存在，跳过仓库/二进制安装"
     return 0
   fi
 
@@ -221,11 +324,40 @@ _exporter_install_node_exporter() {
       apt-get install -y node-exporter >>"$LOG_FILE" 2>&1 || \
       warn "APT 安装 node exporter 失败，请检查源或手动安装"
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y node_exporter >>"$LOG_FILE" 2>&1 || warn "DNF 安装 node exporter 失败"
+    local dnf_ok=0
+    for pkg in node_exporter golang-github-prometheus-node-exporter prometheus-node-exporter; do
+      if dnf install -y "$pkg" >>"$LOG_FILE" 2>&1; then
+        dnf_ok=1
+        break
+      fi
+    done
+    if [[ "$dnf_ok" -eq 0 ]]; then
+      warn "DNF 未能安装 node_exporter（已依次尝试 node_exporter / golang-github-prometheus-node-exporter / prometheus-node-exporter）"
+      _exporter_install_node_exporter_binary_fallback || true
+    fi
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y node_exporter >>"$LOG_FILE" 2>&1 || warn "YUM 安装 node exporter 失败"
+    _exporter_yum_ensure_epel_release
+    local yum_ok=0
+    for pkg in golang-github-prometheus-node-exporter prometheus-node-exporter node_exporter; do
+      if yum install -y "$pkg" >>"$LOG_FILE" 2>&1; then
+        yum_ok=1
+        log "已通过 YUM 安装包: $pkg"
+        break
+      fi
+    done
+    if [[ "$yum_ok" -eq 0 ]]; then
+      warn "YUM 未能从已启用仓库安装 node_exporter（CentOS 7 等需 epel-release；已尝试 golang-github-prometheus-node-exporter / prometheus-node-exporter / node_exporter）"
+      _exporter_install_node_exporter_binary_fallback || warn "二进制回退失败，请手动安装 node_exporter 并确保监听 ${EXPORTER_LISTEN_PORT}"
+    fi
   else
-    warn "未识别的包管理器，无法自动安装 node exporter"
+    warn "未识别的包管理器，尝试官方二进制回退"
+    _exporter_install_node_exporter_binary_fallback || warn "无法自动安装 node_exporter"
+  fi
+
+  if ! command -v node_exporter >/dev/null 2>&1 && command -v prometheus-node-exporter >/dev/null 2>&1; then
+    if [[ ! -x /usr/local/bin/node_exporter ]]; then
+      ln -sf "$(command -v prometheus-node-exporter)" /usr/local/bin/node_exporter 2>>"$LOG_FILE" || true
+    fi
   fi
 }
 
@@ -641,6 +773,25 @@ _exporter_inject_baota_nginx_stub_status() {
   return 1
 }
 
+# 向 ARGS / NODE_EXPORTER_OPTS / OPTIONS 等「VAR=\"…\"」行合并 --collector.textfile.directory（Debian default 与 RHEL sysconfig）
+_exporter_merge_textfile_into_env_file() {
+  local f="$1" var="$2" dir="$3"
+  [[ -f "$f" ]] || return 1
+  if [[ "${SHELLSTACK_EXPORTER_FORCE:-}" == "1" ]] && grep -qE "^${var}=" "$f" 2>/dev/null; then
+    sed -i.bak-shellstack-force "s/[[:space:]]\{1,\}--collector\.textfile\.directory=[^\"[:space:]]*//g" "$f" 2>/dev/null || true
+    if ! grep -qF 'collector.textfile.directory' "$f" 2>/dev/null; then
+      sed -i.bak-shellstack "s|^${var}=\"\\(.*\\)\"|${var}=\"\\1 --collector.textfile.directory=${dir}\"|" "$f" 2>/dev/null || true
+    fi
+  elif grep -qF 'collector.textfile.directory' "$f" 2>/dev/null; then
+    :
+  elif grep -qE "^${var}=" "$f" 2>/dev/null; then
+    sed -i.bak-shellstack "s|^${var}=\"\\(.*\\)\"|${var}=\"\\1 --collector.textfile.directory=${dir}\"|" "$f" 2>/dev/null || true
+  else
+    echo "${var}=\"--collector.textfile.directory=${dir}\"" >>"$f"
+  fi
+  return 0
+}
+
 _exporter_patch_node_exporter_textfile_arg() {
   local dir="$1"
   local svc="" f
@@ -652,22 +803,13 @@ _exporter_patch_node_exporter_textfile_arg() {
   [[ -n "$svc" ]] || return 0
 
   if [[ -f /etc/default/prometheus-node-exporter ]]; then
-    f="/etc/default/prometheus-node-exporter"
-    # --force：去掉旧 textfile 路径并写回当前 dir，避免「已有参数但路径过期」时不更新
-    if [[ "${SHELLSTACK_EXPORTER_FORCE:-}" == "1" ]] && grep -qE '^ARGS=' "$f" 2>/dev/null; then
-      sed -i.bak-shellstack-force "s/[[:space:]]\{1,\}--collector\.textfile\.directory=[^\"[:space:]]*//g" "$f" 2>/dev/null || true
-      if ! grep -qF 'collector.textfile.directory' "$f" 2>/dev/null; then
-        sed -i.bak-shellstack "s|^ARGS=\"\\(.*\\)\"|ARGS=\"\\1 --collector.textfile.directory=${dir}\"|" "$f" 2>/dev/null || true
-      fi
-    elif grep -qF 'collector.textfile.directory' "$f" 2>/dev/null; then
-      :
-    elif grep -qE '^ARGS=' "$f" 2>/dev/null; then
-      sed -i.bak-shellstack "s|^ARGS=\"\\(.*\\)\"|ARGS=\"\\1 --collector.textfile.directory=${dir}\"|" "$f" 2>/dev/null || true
-    else
-      echo "ARGS=\"--collector.textfile.directory=${dir}\"" >>"$f"
-    fi
+    _exporter_merge_textfile_into_env_file "/etc/default/prometheus-node-exporter" ARGS "$dir"
+  elif [[ -f /etc/sysconfig/node_exporter ]]; then
+    _exporter_merge_textfile_into_env_file "/etc/sysconfig/node_exporter" NODE_EXPORTER_OPTS "$dir"
+  elif [[ -f /etc/default/node_exporter ]]; then
+    # prometheus-rpm / 部分 RPM：OPTIONS= 与 /usr/bin/node_exporter
+    _exporter_merge_textfile_into_env_file "/etc/default/node_exporter" OPTIONS "$dir"
   elif [[ "$svc" == "prometheus-node-exporter" ]]; then
-    # Debian/Ubuntu：单元用 $ARGS；无 /etc/default 文件时新建（勿用 EXTRA_FLAGS，多数包不读）
     f="/etc/default/prometheus-node-exporter"
     if [[ ! -f "$f" ]]; then
       mkdir -p /etc/default 2>/dev/null || true
@@ -677,9 +819,6 @@ _exporter_patch_node_exporter_textfile_arg() {
         echo "ARGS=\"--collector.textfile.directory=${dir}\""
       } >"$f" 2>>"$LOG_FILE" || true
     fi
-  elif [[ -f /etc/sysconfig/node_exporter ]]; then
-    f="/etc/sysconfig/node_exporter"
-    grep -qF 'collector.textfile.directory' "$f" 2>/dev/null || echo "NODE_EXPORTER_OPTS=\"--collector.textfile.directory=${dir}\"" >>"$f"
   else
     local drop="/etc/systemd/system/${svc}.service.d"
     mkdir -p "$drop" 2>/dev/null || true
@@ -699,7 +838,7 @@ EOF
   fi
   systemctl daemon-reload >>"$LOG_FILE" 2>&1 || true
   if systemctl restart "$svc" >>"$LOG_FILE" 2>&1; then
-    log "已重启 $svc（使 /etc/default 或 systemd drop-in 中的 textfile 等参数生效）"
+    log "已重启 $svc（使 /etc/default、/etc/sysconfig 或 systemd drop-in 中的 textfile 等参数生效）"
   else
     warn "重启 $svc 以应用 textfile 目录失败，请手动检查: systemctl status $svc"
   fi
@@ -1246,7 +1385,7 @@ EOF
     systemctl is-active --quiet cron 2>/dev/null || warn "cron 服务未运行，textfile 不会每分钟执行；请执行: systemctl enable --now cron（Debian/Ubuntu 包名通常为 cron）"
   fi
   if [[ "${SHELLSTACK_EXPORTER_FORCE:-}" == "1" ]]; then
-    log "--force：已覆盖 $bin 与 $cronf；node_exporter 已在写入 textfile 目录配置后重启（见「已重启 prometheus-node-exporter」日志）"
+    log "--force：已覆盖 $bin 与 $cronf；若本机已安装 node_exporter 服务，上方应有「已重启 … 使 textfile 生效」类日志"
   fi
 }
 
@@ -1819,7 +1958,7 @@ setup_exporter_and_register() {
   local ip _tdir
   _tdir="$(_exporter_node_exporter_textfile_dir)"
   if ! _exporter_node_exporter_textfile_arg_in_ps; then
-    warn "进程参数中未检测到 --collector.textfile.directory，shellstack_* 可能不会出现在 /metrics；请检查 $(command -v systemctl >/dev/null 2>&1 && echo "/etc/default/prometheus-node-exporter 或 systemctl cat prometheus-node-exporter")"
+    warn "进程参数中未检测到 --collector.textfile.directory，shellstack_* 可能不会出现在 /metrics；请检查 Debian/Ubuntu: /etc/default/prometheus-node-exporter；RHEL/CentOS: /etc/sysconfig/node_exporter 或 /etc/default/node_exporter；并 systemctl cat prometheus-node-exporter / node_exporter"
   else
     log "node_exporter 已启用 textfile 采集目录（与 ${_tdir} 对齐后应出现 shellstack_* 指标）"
   fi
