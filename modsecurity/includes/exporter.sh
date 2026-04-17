@@ -529,9 +529,13 @@ emit_up() {
   echo "# TYPE shellstack_host_disk_read_bytes_per_second gauge"
   echo "# HELP shellstack_host_disk_write_bytes_per_second 整盘扇区写字节/秒"
   echo "# TYPE shellstack_host_disk_write_bytes_per_second gauge"
-  echo "# HELP shellstack_host_network_receive_bytes_per_second /proc/net/dev 非 lo 收字节/秒（含多网卡合计）"
+  echo "# HELP shellstack_host_network_receive_bytes_total 网卡累计收字节（下载）；与 node_network_receive_bytes_total 同语义，便于 textfile 内直接 rate()"
+  echo "# TYPE shellstack_host_network_receive_bytes_total counter"
+  echo "# HELP shellstack_host_network_transmit_bytes_total 网卡累计发字节（上传）"
+  echo "# TYPE shellstack_host_network_transmit_bytes_total counter"
+  echo "# HELP shellstack_host_network_receive_bytes_per_second 非 lo 收字节/秒（多网卡合计，由两次采集差分）"
   echo "# TYPE shellstack_host_network_receive_bytes_per_second gauge"
-  echo "# HELP shellstack_host_network_transmit_bytes_per_second 非 lo 发字节/秒"
+  echo "# HELP shellstack_host_network_transmit_bytes_per_second 非 lo 发字节/秒（合计）"
   echo "# TYPE shellstack_host_network_transmit_bytes_per_second gauge"
 
   if [[ -d /www/server/panel ]]; then
@@ -630,7 +634,30 @@ emit_up() {
         [[ "$_wsect" =~ ^[0-9]+$ ]] && _dsw=$((_dsw + _wsect))
       done < /proc/diskstats
     fi
-    read -r _nrx _ntx <<<"$(awk 'NR>2 { sub(/:/,"",$1); if ($1=="lo") next; rx+=$2+0; tx+=$10+0 } END { print rx+0, tx+0 }' /proc/net/dev 2>/dev/null)"
+    _nrx=0
+    _ntx=0
+    _host_net_label_esc() {
+      local s="$1"
+      s="${s//\\/\\\\}"
+      s="${s//\"/\\\"}"
+      printf '%s' "$s"
+    }
+    if [[ -r /proc/net/dev ]]; then
+      while IFS= read -r _nl; do
+        [[ "$_nl" =~ ^[[:space:]]*([^[:space:]:]+):[[:space:]]*(.*)$ ]] || continue
+        _ndev="${BASH_REMATCH[1]}"
+        _nrest="${BASH_REMATCH[2]}"
+        [[ "$_ndev" == "lo" ]] && continue
+        read -r _nbrx _np1 _np2 _np3 _np4 _np5 _np6 _np7 _nbtx _ <<< "$_nrest"
+        [[ "$_nbrx" =~ ^[0-9]+$ ]] || continue
+        [[ "$_nbtx" =~ ^[0-9]+$ ]] || continue
+        _nrx=$((_nrx + _nbrx))
+        _ntx=$((_ntx + _nbtx))
+        _nde="$(_host_net_label_esc "$_ndev")"
+        printf 'shellstack_host_network_receive_bytes_total{device="%s"} %s\n' "$_nde" "$_nbrx"
+        printf 'shellstack_host_network_transmit_bytes_total{device="%s"} %s\n' "$_nde" "$_nbtx"
+      done < /proc/net/dev
+    fi
     [[ "$_nrx" =~ ^[0-9]+$ ]] || _nrx=0
     [[ "$_ntx" =~ ^[0-9]+$ ]] || _ntx=0
     _hnow="$(date +%s)"
