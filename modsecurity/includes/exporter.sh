@@ -385,7 +385,13 @@ _exporter_patch_node_exporter_textfile_arg() {
 
   if [[ -f /etc/default/prometheus-node-exporter ]]; then
     f="/etc/default/prometheus-node-exporter"
-    if grep -qF 'collector.textfile.directory' "$f" 2>/dev/null; then
+    # --force：去掉旧 textfile 路径并写回当前 dir，避免「已有参数但路径过期」时不更新
+    if [[ "${SHELLSTACK_EXPORTER_FORCE:-}" == "1" ]] && grep -qE '^ARGS=' "$f" 2>/dev/null; then
+      sed -i.bak-shellstack-force "s/[[:space:]]\{1,\}--collector\.textfile\.directory=[^\"[:space:]]*//g" "$f" 2>/dev/null || true
+      if ! grep -qF 'collector.textfile.directory' "$f" 2>/dev/null; then
+        sed -i.bak-shellstack "s|^ARGS=\"\\(.*\\)\"|ARGS=\"\\1 --collector.textfile.directory=${dir}\"|" "$f" 2>/dev/null || true
+      fi
+    elif grep -qF 'collector.textfile.directory' "$f" 2>/dev/null; then
       :
     elif grep -qE '^ARGS=' "$f" 2>/dev/null; then
       sed -i.bak-shellstack "s|^ARGS=\"\\(.*\\)\"|ARGS=\"\\1 --collector.textfile.directory=${dir}\"|" "$f" 2>/dev/null || true
@@ -424,7 +430,11 @@ EOF
     fi
   fi
   systemctl daemon-reload >>"$LOG_FILE" 2>&1 || true
-  systemctl restart "$svc" >>"$LOG_FILE" 2>&1 || warn "重启 $svc 以应用 textfile 目录失败，请手动检查"
+  if systemctl restart "$svc" >>"$LOG_FILE" 2>&1; then
+    log "已重启 $svc（使 /etc/default 或 systemd drop-in 中的 textfile 等参数生效）"
+  else
+    warn "重启 $svc 以应用 textfile 目录失败，请手动检查: systemctl status $svc"
+  fi
 }
 
 _exporter_node_exporter_textfile_arg_in_ps() {
@@ -950,6 +960,9 @@ EOF
   TEXTFILE_DIR="$dir" SHELLSTACK_NGINX_STUB_URLS="$effective_urls" bash "$bin" >>"$LOG_FILE" 2>&1 || warn "首次执行 textfile 采集脚本失败"
   log "已部署宝塔/服务 textfile 采集: $bin → $dir/shellstack_baota.prom（cron: $cronf）"
   log "stub_status 探测 URL 列表（cron 已写入）: $effective_urls"
+  if [[ "${SHELLSTACK_EXPORTER_FORCE:-}" == "1" ]]; then
+    log "--force：已覆盖 $bin 与 $cronf；node_exporter 已在写入 textfile 目录配置后重启（见「已重启 prometheus-node-exporter」日志）"
+  fi
 }
 
 # 将参数规范为 Consul HTTP 基址（无尾部斜杠），默认端口 8500
