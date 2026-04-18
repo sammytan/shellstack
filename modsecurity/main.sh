@@ -124,8 +124,13 @@ SHELLSTACK_WITH_NGINX_MODULE_VTS="${SHELLSTACK_WITH_NGINX_MODULE_VTS:-1}"
 SHELLSTACK_MAIN_NON_EXPORTER_WORK=0
 # --force 先记入此变量，parse_args 结束后在 _shellstack_apply_cli_force_resolution 中判定：仅 exporter 时转为 SHELLSTACK_EXPORTER_FORCE
 SHELLSTACK_CLI_FORCE=0
+# 是否在命令行显式传入（用于区分「仅 --extend-btwaf-cache --force」与全套强制，避免误触发 Nginx 重编）
+SHELLSTACK_CLI_REQUESTED_DEPLOY_CONF=0
+SHELLSTACK_CLI_REQUESTED_BT_OPENRESTY=0
+SHELLSTACK_CLI_REQUESTED_PREFIX=0
+SHELLSTACK_CLI_REQUESTED_VERSION=0
 
-# 解析完参数后：--force 要么展开为 ModSecurity/宝塔全套，要么在「仅 exporter」场景下仅 export SHELLSTACK_EXPORTER_FORCE=1
+# 解析完参数后：--force 只加强「命令行已出现」的对应步骤（多项可同开，各自命中独立分支）；裸 --force 仍为「一键全套」
 _shellstack_apply_cli_force_resolution() {
   unset SHELLSTACK_EXPORTER_FORCE 2>/dev/null || true
   if [[ "${SHELLSTACK_CLI_FORCE:-0}" != "1" ]]; then
@@ -134,26 +139,74 @@ _shellstack_apply_cli_force_resolution() {
   if [[ "$ENABLE_EXPORTER" == "1" ]] && [[ "${SHELLSTACK_MAIN_NON_EXPORTER_WORK:-0}" == "0" ]]; then
     export SHELLSTACK_EXPORTER_FORCE=1
     log "启用 --force（仅作用于 exporter）：将强制重跑主机名/textfile/防火墙/Consul 注册等 exporter 步骤；不启动 ModSecurity/宝塔主流程。"
-    log "提示: 若需要「重编宝塔 Nginx + ModSecurity 全套」式 --force，请同时指定主安装参数（如 --deploy-conf、--extend-btwaf-cache、--version 等），或不要带 --with-exporter 单独使用 --force。"
+    log "提示: 需要重编宝塔 Nginx / 部署 CRS 等时，请显式加上 --bt-openresty、--deploy-conf、--extend-btwaf-cache 等；--force 不会自动替你展开这些参数。"
     return 0
   fi
-  if [[ "${BT_OPENRESTY_FROM_CLI:-0}" != "1" ]]; then
-    BT_OPENRESTY_VERSION="openresty"
-    BT_OPENRESTY_FROM_CLI=1
-    export BT_OPENRESTY_VERSION
+  # 仅 --extend-btwaf-cache（未显式 --deploy-conf / --bt-openresty）时：--force 不展开为 Nginx 重编与配置部署
+  if [[ "${EXTEND_BTWAF_CACHE:-0}" == "1" ]] && \
+     [[ "${SHELLSTACK_CLI_REQUESTED_DEPLOY_CONF:-0}" != "1" ]] && \
+     [[ "${SHELLSTACK_CLI_REQUESTED_BT_OPENRESTY:-0}" != "1" ]]; then
+    log "启用 --force（仅作用于 --extend-btwaf-cache）：不触发宝塔 Nginx/OpenResty 重编与 --deploy-conf；仅重跑 BTwaf 扩展流程（面板 install 仍遵循 SHELLSTACK_BTWAF_FORCE_PANEL_INSTALL，默认已装则跳过）。"
+    log "提示: 若需连同 Nginx 重编与 CRS/配置一并强制，请加上 --bt-openresty 或 --deploy-conf 后再使用 --force。"
+    return 0
   fi
-  DEPLOY_MODSEC_CONF=1
-  EXTEND_BTWAF_CACHE=1
-  MODSECURITY_FORCE_BT_NGINX_REBUILD=1
-  SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK=1
-  SHELLSTACK_BTWAF_FORCE_PANEL_INSTALL=1
-  SHELLSTACK_INSTALL_REDIS=1
-  export MODSECURITY_FORCE_BT_NGINX_REBUILD
-  export SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK
-  export SHELLSTACK_BTWAF_FORCE_PANEL_INSTALL
-  export SHELLSTACK_INSTALL_REDIS
-  SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
-  log "启用 --force：将强制执行 nginx 重编译、nginx.conf http 块重注入、BTwaf 面板重装及 Redis 安装流程（OpenResty 版本优先使用显式 --bt-openresty）。"
+
+  local _ss_baota=0
+  [[ "${SHELLSTACK_CLI_REQUESTED_DEPLOY_CONF:-0}" == "1" ]] && _ss_baota=1
+  [[ "${SHELLSTACK_CLI_REQUESTED_BT_OPENRESTY:-0}" == "1" ]] && _ss_baota=1
+  [[ "${EXTEND_BTWAF_CACHE:-0}" == "1" ]] && _ss_baota=1
+
+  if [[ "$_ss_baota" == "1" ]]; then
+    log "启用 --force：按命令行已指定的宝塔类参数分别加强（不自动追加未出现的 --deploy-conf / --bt-openresty / --extend-btwaf-cache）。"
+    if [[ "${SHELLSTACK_CLI_REQUESTED_BT_OPENRESTY:-0}" == "1" ]]; then
+      MODSECURITY_FORCE_BT_NGINX_REBUILD=1
+      SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK=1
+      export MODSECURITY_FORCE_BT_NGINX_REBUILD
+      export SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK
+      log "  → --bt-openresty：MODSECURITY_FORCE_BT_NGINX_REBUILD=1，SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK=1"
+    fi
+    if [[ "${SHELLSTACK_CLI_REQUESTED_DEPLOY_CONF:-0}" == "1" ]]; then
+      SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK=1
+      export SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK
+      log "  → --deploy-conf：SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK=1（未带 --bt-openresty 时不强制 Nginx 重编）"
+    fi
+    if [[ "${EXTEND_BTWAF_CACHE:-0}" == "1" ]]; then
+      SHELLSTACK_BTWAF_FORCE_PANEL_INSTALL=1
+      SHELLSTACK_INSTALL_REDIS=1
+      export SHELLSTACK_BTWAF_FORCE_PANEL_INSTALL
+      export SHELLSTACK_INSTALL_REDIS
+      log "  → --extend-btwaf-cache：SHELLSTACK_BTWAF_FORCE_PANEL_INSTALL=1，SHELLSTACK_INSTALL_REDIS=1"
+    fi
+  fi
+
+  if [[ "${SHELLSTACK_CLI_REQUESTED_VERSION:-0}" == "1" ]] || [[ "${SHELLSTACK_CLI_REQUESTED_PREFIX:-0}" == "1" ]]; then
+    export SHELLSTACK_FORCE_LIBMODSECURITY_REBUILD=1
+    log "启用 --force：已指定 --version 或 --prefix，将跳过「已安装 libmodsecurity」时的交互确认并进入重新编译流程。"
+  fi
+
+  # 裸 --force（及未将 SHELLSTACK_MAIN_NON_EXPORTER_WORK 置 1 的选项，如仅 --disable-*）：保持「一键全套」
+  if [[ "$_ss_baota" != "1" ]] && \
+     [[ "${SHELLSTACK_CLI_REQUESTED_VERSION:-0}" != "1" ]] && \
+     [[ "${SHELLSTACK_CLI_REQUESTED_PREFIX:-0}" != "1" ]] && \
+     [[ "${SHELLSTACK_MAIN_NON_EXPORTER_WORK:-0}" == "0" ]]; then
+    if [[ "${BT_OPENRESTY_FROM_CLI:-0}" != "1" ]]; then
+      BT_OPENRESTY_VERSION="openresty"
+      BT_OPENRESTY_FROM_CLI=1
+      export BT_OPENRESTY_VERSION
+    fi
+    DEPLOY_MODSEC_CONF=1
+    EXTEND_BTWAF_CACHE=1
+    MODSECURITY_FORCE_BT_NGINX_REBUILD=1
+    SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK=1
+    SHELLSTACK_BTWAF_FORCE_PANEL_INSTALL=1
+    SHELLSTACK_INSTALL_REDIS=1
+    export MODSECURITY_FORCE_BT_NGINX_REBUILD
+    export SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK
+    export SHELLSTACK_BTWAF_FORCE_PANEL_INSTALL
+    export SHELLSTACK_INSTALL_REDIS
+    SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
+    log "启用 --force：未指定其它主安装参数时，按「一键全套」强制执行 Nginx 重编、--deploy-conf、--extend-btwaf-cache（OpenResty 默认键 openresty，可先写 --bt-openresty=VER 再 --force 指定版本键）。"
+  fi
 }
 
 # 解析命令行参数
@@ -162,21 +215,25 @@ parse_args() {
     case "$1" in
       --prefix=*)
         MODSECURITY_PREFIX="${1#*=}"
+        SHELLSTACK_CLI_REQUESTED_PREFIX=1
         SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         shift
         ;;
       --prefix)
         MODSECURITY_PREFIX="$2"
+        SHELLSTACK_CLI_REQUESTED_PREFIX=1
         SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         shift 2
         ;;
       --version=*)
         MODSECURITY_VERSION="${1#*=}"
+        SHELLSTACK_CLI_REQUESTED_VERSION=1
         SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         shift
         ;;
       --version)
         MODSECURITY_VERSION="$2"
+        SHELLSTACK_CLI_REQUESTED_VERSION=1
         SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         shift 2
         ;;
@@ -256,13 +313,13 @@ parse_args() {
         shift
         ;;
       --force)
-        # 具体语义在 parse_args 末尾 _shellstack_apply_cli_force_resolution：
-        # 若仅有 exporter 类参数则只设 SHELLSTACK_EXPORTER_FORCE；否则展开为宝塔/OpenResty/ModSecurity 全套强制
+        # 语义见 _shellstack_apply_cli_force_resolution：与各主参数独立组合；裸 --force 仍为「一键全套」
         SHELLSTACK_CLI_FORCE=1
         shift
         ;;
       --deploy-conf)
         DEPLOY_MODSEC_CONF=1
+        SHELLSTACK_CLI_REQUESTED_DEPLOY_CONF=1
         SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         shift
         ;;
@@ -305,6 +362,7 @@ parse_args() {
       --bt-openresty=*)
         BT_OPENRESTY_VERSION="${1#*=}"
         BT_OPENRESTY_FROM_CLI=1
+        SHELLSTACK_CLI_REQUESTED_BT_OPENRESTY=1
         SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         export BT_OPENRESTY_VERSION
         shift
@@ -312,6 +370,7 @@ parse_args() {
       --bt-openresty)
         BT_OPENRESTY_VERSION="$2"
         BT_OPENRESTY_FROM_CLI=1
+        SHELLSTACK_CLI_REQUESTED_BT_OPENRESTY=1
         SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         export BT_OPENRESTY_VERSION
         shift 2
@@ -422,11 +481,15 @@ main_install() {
   SKIP_LIB_REINSTALL=0
   if [ -f "$MODSECURITY_PREFIX/lib/libmodsecurity.so" ] || [ -f "$MODSECURITY_PREFIX/lib/libmodsecurity.so.3" ]; then
     log "检测到已安装的 ModSecurity 核心库"
-    read -p "是否重新编译安装 libmodsecurity？[y/N] " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-      SKIP_LIB_REINSTALL=1
-      log "跳过 libmodsecurity 重新编译，继续后续步骤（宝塔 OpenResty / ModSecurity-nginx / --deploy-conf）"
+    if [[ "${SHELLSTACK_FORCE_LIBMODSECURITY_REBUILD:-0}" == "1" ]]; then
+      log "因 --force 与 --version / --prefix：跳过确认，将重新编译 libmodsecurity"
+    else
+      read -p "是否重新编译安装 libmodsecurity？[y/N] " -n 1 -r
+      echo
+      if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        SKIP_LIB_REINSTALL=1
+        log "跳过 libmodsecurity 重新编译，继续后续步骤（宝塔 OpenResty / ModSecurity-nginx / --deploy-conf）"
+      fi
     fi
   fi
 
@@ -543,7 +606,7 @@ main() {
   fi
 
   if [[ "$ENABLE_EXPORTER" == "1" ]]; then
-    log "提示: 当前将执行「完整 ModSecurity/宝塔」主流程（因已出现主安装类参数，例如 --deploy-conf、--bt-openresty、--version、--extend-btwaf-cache，或与上述同时出现的 --force 全套展开）。"
+    log "提示: 当前将执行 ModSecurity/宝塔主流程（因已出现主安装类参数，例如 --deploy-conf、--bt-openresty、--version、--extend-btwaf-cache 等）。--force 仅加强已写出的对应步骤，不会自动拼齐未指定的参数（裸 --force 除外，见帮助）。"
     log "提示: 「仅 exporter」时 --with-exporter/--with-consul-token 可省略 = 值；此场景下 --force 只强制重跑 exporter，不会触发本段主流程。"
   fi
 
