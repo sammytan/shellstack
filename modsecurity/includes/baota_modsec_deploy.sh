@@ -439,9 +439,28 @@ baota_deploy_modsecurity_conf() {
     fi
     cat <<'RULES'
 SecRule REMOTE_ADDR "@geoLookup" "id:10001,phase:1,pass,log"
-SecRule REQUEST_URI "@beginsWith /vts_status" "id:10002,phase:1,nolog,pass,ctl:ruleEngine=Off"
+
+# nginx-module-vts（与 shellstack_vts.conf 中 location /nginx-vts-status 等一致）
 SecRule REQUEST_URI "@beginsWith /nginx-vts-status" "id:10006,phase:1,nolog,pass,ctl:ruleEngine=Off"
+SecRule REQUEST_URI "@beginsWith /vts_status" "id:10002,phase:1,nolog,pass,ctl:ruleEngine=Off"
+
+# nginx stub_status（与 shellstack_status.conf 默认 URI 一致）
+SecRule REQUEST_URI "@beginsWith /nginx_stub_status" "id:10007,phase:1,nolog,pass,ctl:ruleEngine=Off"
+SecRule REQUEST_URI "@beginsWith /nginx_status" "id:10008,phase:1,nolog,pass,ctl:ruleEngine=Off"
+SecRule REQUEST_URI "@beginsWith /stub_status" "id:10009,phase:1,nolog,pass,ctl:ruleEngine=Off"
+
+# PHP-FPM status：PHP 5.6–8.1（宝塔目录键 56；70–75；80–81）。shellstack tag 为 exporter 的 ${ver//./_}（如 81、8_1）
+SecRule REQUEST_URI "@rx ^/shellstack-fpm-status-(56|5_6|70|71|72|73|74|75|80|81|8_0|8_1)(/|$|\?)" "id:10018,phase:1,nolog,pass,ctl:ruleEngine=Off"
+SecRule REQUEST_URI "@rx ^/phpfpm_(56|70|71|72|73|74|75|80|81)_status" "id:10019,phase:1,nolog,pass,ctl:ruleEngine=Off"
+
+# 帝国 CMS 后台（自用路径加白）
+SecRule REQUEST_URI "@beginsWith /eadmin/ADfr_jiUL5/" "id:10011,phase:1,nolog,pass,ctl:ruleEngine=Off"
+SecRule REQUEST_URI "@beginsWith /e/ADfr_jiUL5/" "id:10012,phase:1,nolog,pass,ctl:ruleEngine=Off"
 SecRule REQUEST_URI "@beginsWith /e/e_DliR28KktG1dpud/" "id:10003,phase:1,nolog,pass,ctl:ruleEngine=Off"
+SecRule REQUEST_URI "@beginsWith /e/jiayou/" "id:10014,phase:1,nolog,pass,ctl:ruleEngine=Off"
+SecRule REQUEST_URI "@beginsWith /eadmin/fengye-123/" "id:10015,phase:1,nolog,pass,ctl:ruleEngine=Off"
+SecRule REQUEST_URI "@beginsWith /e/fengye/" "id:10016,phase:1,nolog,pass,ctl:ruleEngine=Off"
+SecRule REQUEST_URI "@beginsWith /eadmin/fengye/" "id:10017,phase:1,nolog,pass,ctl:ruleEngine=Off"
 
 SecRule REMOTE_ADDR "@ipMatchFromFile /www/server/whitelist.txt" \
     "id:999,phase:1,allow,msg:'Allow access from whitelist IP'"
