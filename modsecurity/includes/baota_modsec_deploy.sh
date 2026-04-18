@@ -124,8 +124,9 @@ _baota_write_shellstack_vts_conf() {
   log "  → 输出: $out；监听: 127.0.0.1:${port}；URI 前缀: /nginx-vts-status"
   if _baota_nginx_has_modsecurity_module; then
     ms_line="    modsecurity off;"
-    log "  → server 块内将写入 modsecurity off;（避免 WAF 拦截本机状态）"
+    log "  → server 块内将写入 modsecurity off;（避免 ModSecurity 拦本机状态）"
   fi
+  log "  → server_name 使用 127.0.0.1 localhost（避免宝塔 waf.lua 将 server_name _ 判为「未绑定域名」并 ngx.exit 403）"
   umask 022
   {
     echo "# shellstack: nginx-module-vts (https://github.com/vozlt/nginx-module-vts)"
@@ -134,7 +135,8 @@ _baota_write_shellstack_vts_conf() {
     echo ""
     echo "server {"
     echo "    listen 127.0.0.1:${port};"
-    echo "    server_name _;"
+    echo "    # 勿用 server_name _：宝塔 BTwaf waf.lua 对「未绑定域名」会直接 ngx.exit(403)"
+    echo "    server_name 127.0.0.1 localhost;"
     if [[ -n "$ms_line" ]]; then
       echo "$ms_line"
     fi
