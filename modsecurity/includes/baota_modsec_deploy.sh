@@ -27,6 +27,10 @@ SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK="${SHELLSTACK_REFRESH_NGINX_HTTP_BLOCK:-0}"
 # nginx-module-vts：--deploy-conf 时写入 shellstack_vts.conf 并在 nginx.conf 中 include（需二进制已编入模块）
 SHELLSTACK_DEPLOY_NGINX_MODULE_VTS="${SHELLSTACK_DEPLOY_NGINX_MODULE_VTS:-1}"
 SHELLSTACK_VTS_LISTEN_PORT="${SHELLSTACK_VTS_LISTEN_PORT:-8898}"
+# --deploy-conf 时在宝塔 phpMyAdmin 站点 vhost 的每个 server{} 内写入 modsecurity off；0=跳过
+SHELLSTACK_DEPLOY_PHPMYADMIN_MODSECURITY_OFF="${SHELLSTACK_DEPLOY_PHPMYADMIN_MODSECURITY_OFF:-1}"
+# 覆盖宝塔 vhost 目录（默认 /www/server/panel/vhost/nginx）
+SHELLSTACK_BT_PANEL_VHOST_NGINX="${SHELLSTACK_BT_PANEL_VHOST_NGINX:-/www/server/panel/vhost/nginx}"
 BT_WHITELIST_FILE="${BT_WHITELIST_FILE:-/www/server/whitelist.txt}"
 CRS_GIT_BRANCH="${CRS_GIT_BRANCH:-v3.3.5}"
 CRS_GIT_URL="${CRS_GIT_URL:-https://github.com/coreruleset/coreruleset.git}"
@@ -335,6 +339,57 @@ _baota_crs_rule_files() {
   echo "RESPONSE-980-CORRELATION.conf"
 }
 
+# 宝塔 phpMyAdmin 虚拟主机：http{} 已 modsecurity on 时继承到站点，需在站点 server{} 内关闭，避免 CRS 误拦 SQL/导入等
+_baota_inject_modsecurity_off_phpmyadmin_vhosts() {
+  [[ "${SHELLSTACK_DEPLOY_PHPMYADMIN_MODSECURITY_OFF:-1}" == "1" ]] || {
+    log "SHELLSTACK_DEPLOY_PHPMYADMIN_MODSECURITY_OFF=0，跳过 phpMyAdmin vhost 的 modsecurity off"
+    return 0
+  }
+  _baota_nginx_has_modsecurity_module || return 0
+
+  local panel_dir="${SHELLSTACK_BT_PANEL_VHOST_NGINX:-/www/server/panel/vhost/nginx}"
+  if [[ ! -d "$panel_dir" ]]; then
+    warn "未找到宝塔 vhost 目录 $panel_dir，跳过 phpMyAdmin 的 modsecurity off"
+    return 0
+  fi
+
+  local -a files=()
+  local f
+  shopt -s nullglob
+  for f in "$panel_dir/phpmyadmin.conf" "$panel_dir/0.phpmyadmin.conf" "$panel_dir/"*phpmyadmin*.conf; do
+    [[ -f "$f" ]] && files+=("$f")
+  done
+  shopt -u nullglob
+
+  if [[ ${#files[@]} -eq 0 ]]; then
+    log "未发现 $panel_dir 下的 phpmyadmin.conf / 0.phpmyadmin.conf / *phpmyadmin*.conf；若 phpMyAdmin 在其它文件中，请在对应 server{} 内手工添加 modsecurity off;"
+    return 0
+  fi
+
+  local -A seen=()
+  for f in "${files[@]}"; do
+    [[ -n "${seen[$f]:-}" ]] && continue
+    seen[$f]=1
+    if grep -qF 'shellstack: phpMyAdmin' "$f" 2>/dev/null; then
+      log "phpMyAdmin vhost 已由 shellstack 注入 modsecurity off，跳过: $f"
+      continue
+    fi
+    if ! grep -qE '^[[:space:]]*server[[:space:]]*\{' "$f" 2>/dev/null; then
+      warn "phpMyAdmin 配置文件无 server{}，跳过: $f"
+      continue
+    fi
+    if ! command -v perl >/dev/null 2>&1; then
+      warn "未找到 perl，无法自动修改 $f；请在该文件每个 server{} 内手工加入: modsecurity off;"
+      continue
+    fi
+    if perl -0777 -i -pe 's/(^[\t ]*server[\t ]*\{[\t ]*\n)/$1    # shellstack: phpMyAdmin，关闭 ModSecurity（避免 CRS 对 SQL/导入导出等误拦）\n    modsecurity off;\n/mg' "$f" 2>>"${LOG_FILE:-/dev/null}"; then
+      log "已向 phpMyAdmin vhost 注入 modsecurity off（各 server{}）: $f"
+    else
+      warn "perl 改写失败: $f"
+    fi
+  done
+}
+
 _baota_detect_geoip_db_for_modsec() {
   local candidates=(
     "/usr/local/share/GeoIP/dbip-country-lite.mmdb"
@@ -499,6 +554,7 @@ RULES
   log "已写入 $BT_NGINX_CONF_DIR/custom_modsec_rules.conf"
 
   _baota_inject_shellstack_http_block_in_nginx_conf
+  _baota_inject_modsecurity_off_phpmyadmin_vhosts
   if [[ "${SHELLSTACK_DEPLOY_FASTCGI_CACHE:-1}" == "1" ]]; then
     _baota_inject_fastcgi_cache_into_enable_php_confs
   else
