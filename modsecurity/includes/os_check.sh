@@ -3,6 +3,47 @@
 # =====================================================================
 # 系统检测和版本检查
 # =====================================================================
+# 可选：SHELLSTACK_SKIP_LOCALE_NORMALIZE=1 跳过下方区域设置统一（保留 SSH/用户原有 LANG）
+
+# 在 apt/perl 等执行前统一 LANG 与 LC_*，避免「未安装 en_US.UTF-8」或 LC_CTYPE 与 LANG 不一致导致 perl locale 警告
+shellstack_normalize_locale() {
+  [[ "${SHELLSTACK_SKIP_LOCALE_NORMALIZE:-0}" == "1" ]] && return 0
+
+  local picked=""
+  if command -v locale >/dev/null 2>&1; then
+    local line
+    while IFS= read -r line; do
+      case "${line,,}" in
+        c.utf8|c.utf-8)
+          picked="$line"
+          break
+          ;;
+      esac
+    done < <(locale -a 2>/dev/null)
+    if [[ -z "$picked" ]]; then
+      while IFS= read -r line; do
+        case "${line,,}" in
+          en_us.utf8|en_us.utf-8)
+            picked="$line"
+            break
+            ;;
+        esac
+      done < <(locale -a 2>/dev/null)
+    fi
+  fi
+  [[ -n "$picked" ]] || picked="C"
+
+  unset LANGUAGE 2>/dev/null || true
+  unset LC_ADDRESS LC_COLLATE LC_CTYPE LC_IDENTIFICATION LC_MEASUREMENT \
+        LC_MESSAGES LC_MONETARY LC_NAME LC_NUMERIC LC_PAPER LC_TELEPHONE LC_TIME 2>/dev/null || true
+
+  export LC_ALL="$picked"
+  export LANG="$picked"
+
+  if declare -F log >/dev/null 2>&1; then
+    log "区域设置已统一为 LANG/LC_ALL=$picked（减轻 perl 等与 UTF-8 混用时的 locale 警告）"
+  fi
+}
 
 # 检测 Linux 发行版
 detect_distro() {
@@ -155,6 +196,7 @@ get_package_manager() {
 
 # 初始化系统检测
 init_os_check() {
+  shellstack_normalize_locale
   detect_distro
   detect_architecture
   check_system_support
