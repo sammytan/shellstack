@@ -1692,8 +1692,8 @@ optimize_kernel() {
       CURRENT_KERNEL=$(uname -r)
       log "当前内核版本: $CURRENT_KERNEL"
 
-      # 检查是否已经支持 BBR
-      if grep -q "tcp_bbr" /proc/sys/net/ipv4/tcp_available_congestion_control; then
+      # 检查是否已经支持 BBR（列表中为算法名 bbr，不是 tcp_bbr）
+      if grep -qE '(^|[[:space:]])bbr([[:space:]]|$)' /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
         log "当前内核已支持 BBR，无需安装新内核"
       else
         # 根据 Debian 版本安装对应的内核

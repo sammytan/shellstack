@@ -5,6 +5,18 @@
 # 包括 BBR 支持和内核参数优化
 # =====================================================================
 
+# 内核是否在拥塞控制列表中暴露 bbr（注意：文件中是算法名 bbr，不是 tcp_bbr）
+_shellstack_bbr_module_available() {
+  [[ -r /proc/sys/net/ipv4/tcp_available_congestion_control ]] || return 1
+  grep -qE '(^|[[:space:]])bbr([[:space:]]|$)' /proc/sys/net/ipv4/tcp_available_congestion_control
+}
+
+_shellstack_bbr_already_active() {
+  local cc
+  cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" || return 1
+  [[ "$cc" == "bbr" ]]
+}
+
 # 安装和配置 Google BBR 内核优化
 install_google_bbr_kernel() {
   log "开始安装和配置 Google BBR 内核优化..."
@@ -12,15 +24,22 @@ install_google_bbr_kernel() {
   # 创建内核优化文档目录
   mkdir -p /usr/local/share/doc/modsecurity
 
+  if _shellstack_bbr_module_available && _shellstack_bbr_already_active; then
+    log "当前内核已支持 BBR 且 tcp_congestion_control 已为 bbr，跳过内核安装、ELRepo/GRUB 与 sysctl 模板重复写入"
+    _shellstack_log_bbr_verification
+    log "若需重新应用 /etc/sysctl.d/99-sysctl.conf 中的其它调优项，可先 --disable-kernel-opt 跳过后再启用，或手动编辑该文件。"
+    return 0
+  fi
+
   # 备份当前内核参数
   log "备份当前内核参数..."
   sysctl -a > /usr/local/share/doc/modsecurity/sysctl.conf.bak.$(date +%Y%m%d%H%M%S) 2>/dev/null || warn "备份内核参数失败"
 
-  # 检查是否已经支持 BBR
-  if grep -q "tcp_bbr" /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
-    log "当前内核已支持 BBR，无需安装新内核"
+  # 已支持 BBR 时仅缺 sysctl 切换，无需装新内核
+  if _shellstack_bbr_module_available; then
+    log "当前内核已支持 BBR（无需安装 ELRepo/kernel-ml 或额外内核包），将仅写入 sysctl 并尝试启用 bbr"
   else
-    log "检查并安装 BBR 支持的内核..."
+    log "当前内核未暴露 bbr 拥塞控制，尝试安装带 BBR 的内核..."
 
     case "$SYSTEM_TYPE" in
       debian)
@@ -112,11 +131,15 @@ EOF
       ;;
     redhat)
       if command -v grub2-set-default >/dev/null 2>&1; then
-        NEW_KERNEL=$(rpm -q kernel-ml 2>/dev/null | sort -V | tail -n1)
-        if [ -n "$NEW_KERNEL" ]; then
-          log "设置默认启动内核: $NEW_KERNEL"
-          grub2-set-default "$NEW_KERNEL" >> "$LOG_FILE" 2>&1 || warn "设置默认内核失败"
-          grub2-mkconfig -o /boot/grub2/grub.cfg >> "$LOG_FILE" 2>&1 || warn "更新 grub 失败"
+        if rpm -q kernel-ml >/dev/null 2>&1; then
+          NEW_KERNEL=$(rpm -q kernel-ml 2>/dev/null | sort -V | tail -n1)
+          if [ -n "$NEW_KERNEL" ]; then
+            log "设置默认启动内核: $NEW_KERNEL"
+            grub2-set-default "$NEW_KERNEL" >> "$LOG_FILE" 2>&1 || warn "设置默认内核失败"
+            grub2-mkconfig -o /boot/grub2/grub.cfg >> "$LOG_FILE" 2>&1 || warn "更新 grub 失败"
+          fi
+        else
+          log "未安装 kernel-ml 软件包，跳过 GRUB 默认内核切换（发行版内核已含 BBR 或未使用 ELRepo 主线内核时属正常）"
         fi
       fi
       ;;
