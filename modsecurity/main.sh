@@ -616,7 +616,27 @@ main() {
       error "nginx 配置目录不存在: $BT_NGINX_CONF_DIR"
     fi
     baota_sync_custom_modsec_rules_only
-    log "完成。请执行: $BT_NGINX_BIN -t && (/etc/init.d/nginx reload 或 systemctl reload nginx)"
+    if [[ -n "${BT_NGINX_BIN:-}" ]] && [[ -x "$BT_NGINX_BIN" ]]; then
+      log "校验配置: $BT_NGINX_BIN -t"
+      local _ss_ngx_test=0
+      "$BT_NGINX_BIN" -t 2>&1 | tee -a "${LOG_FILE:-/dev/null}"
+      _ss_ngx_test=${PIPESTATUS[0]}
+      if [[ "$_ss_ngx_test" -ne 0 ]]; then
+        error "nginx -t 未通过（退出码 $_ss_ngx_test），已中止重启（请修正配置后重试）"
+      fi
+      log "nginx -t 通过"
+    else
+      warn "未找到可执行的 BT_NGINX_BIN=$BT_NGINX_BIN，跳过 nginx -t"
+    fi
+    if [[ -x /etc/init.d/nginx ]]; then
+      log "重启 Nginx: /etc/init.d/nginx restart"
+      if ! /etc/init.d/nginx restart >>"${LOG_FILE:-/dev/null}" 2>&1; then
+        error "/etc/init.d/nginx restart 失败，请检查 ${LOG_FILE:-/tmp/modsecurity_install.log} 或执行 /etc/init.d/nginx restart 查看终端输出"
+      fi
+      log "Nginx 已通过 /etc/init.d/nginx restart 重启"
+    else
+      error "未找到可执行文件 /etc/init.d/nginx，无法自动重启；请在本机安装宝塔 Nginx 或手动执行 /etc/init.d/nginx restart"
+    fi
     exit 0
   fi
 
