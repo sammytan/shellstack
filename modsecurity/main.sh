@@ -114,6 +114,8 @@ INSTALL_BAOTA_PANEL=0
 EXTEND_BTWAF_CACHE=0
 # 宝塔：部署 nginx.conf / CRS / 自定义规则（需配合 --deploy-conf）
 DEPLOY_MODSEC_CONF=0
+# 宝塔：仅拉取并写入 custom_modsec_rules.conf（不跑 CRS / 不重编 Nginx）
+UPDATE_MODESC_CONF=0
 # 宝塔 nginx.sh 的 OpenResty 版本参数：openresty | openresty127 等
 BT_OPENRESTY_VERSION="${BT_OPENRESTY_VERSION:-openresty127}"
 # 是否从命令行传入 --bt-openresty（用于与默认区分，触发宝塔环境预检）
@@ -320,6 +322,11 @@ parse_args() {
       --deploy-conf)
         DEPLOY_MODSEC_CONF=1
         SHELLSTACK_CLI_REQUESTED_DEPLOY_CONF=1
+        SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
+        shift
+        ;;
+      --update-modesc-conf)
+        UPDATE_MODESC_CONF=1
         SHELLSTACK_MAIN_NON_EXPORTER_WORK=1
         shift
         ;;
@@ -593,6 +600,25 @@ main_install() {
 main() {
   # 解析命令行参数
   parse_args "$@"
+
+  # 仅同步 custom_modsec_rules.conf（远程 wget/curl 正文 + 本机 GeoIP 头）
+  if [[ "${UPDATE_MODESC_CONF:-0}" == "1" ]]; then
+    source "$INCLUDES_DIR/shared.sh"
+    check_root
+    init_log
+    log "=========================================="
+    log "独立任务：仅同步 custom_modsec_rules.conf"
+    log "=========================================="
+    source "$INCLUDES_DIR/baota_require_check.sh"
+    shellstack_require_baota_panel_for_modsec_conf_sync
+    source "$INCLUDES_DIR/baota_modsec_deploy.sh"
+    if [[ ! -d "$BT_NGINX_CONF_DIR" ]]; then
+      error "nginx 配置目录不存在: $BT_NGINX_CONF_DIR"
+    fi
+    baota_sync_custom_modsec_rules_only
+    log "完成。请执行: $BT_NGINX_BIN -t && (/etc/init.d/nginx reload 或 systemctl reload nginx)"
+    exit 0
+  fi
 
   # 仅 --with-exporter / --with-consul-token（及可选 --disable-kernel-opt / --disable-terminal）时：不跑 ModSecurity 主安装，只执行 exporter + Consul
   if [[ "$ENABLE_EXPORTER" == "1" ]] && [[ "${SHELLSTACK_MAIN_NON_EXPORTER_WORK:-0}" == "0" ]]; then

@@ -32,7 +32,7 @@ BTwaf 在 `init.lua` 中通过 `cache = require "cache"` 加载 **`btwaf/lib/cac
 
 ### 与配置的关系
 
-`btwaf/lib/config.lua` 中另有 **cache 相关配置项**（如 `prefix`、`default_ttl`、`max_ttl`），与面板 JSON 配置配合使用；`cache.lua` 内 Redis 连接以环境变量 **`SHELLSTACK_REDIS_*`** 为准；页缓存键前缀、签名段、默认 TTL、**`PAGE_CACHE_HTML_PATH_HINTS`**、**`PAGE_CACHE_HONOR_NGINX_SKIP_CACHE`**（默认 `false`，与 FastCGI 的 `$skip_cache` 解耦；改为 `true` 则与 FastCGI 同步绕过）在 **`cache.lua` 顶部常量**中修改。
+运行时全局 **`Config`** 仍来自面板 **`/www/server/btwaf/config.json`**（与仓库无关）。ShellStack 整页 Redis 缓存的 **Redis 连接、键前缀、TTL、签名段、URI 跳过等** 集中在 **`btwaf/lib/shellstack_cache_config.lua`**；环境变量 **`SHELLSTACK_REDIS_*`** 可覆盖其中的 Redis 项。
 
 ### 依赖
 

@@ -37,6 +37,9 @@ CRS_GIT_URL="${CRS_GIT_URL:-https://github.com/coreruleset/coreruleset.git}"
 CRS_GIT_URL_FALLBACK="${CRS_GIT_URL_FALLBACK:-https://github.com/SpiderLabs/owasp-modsecurity-crs.git}"
 # 与 libmodsecurity 3.x 对齐的样例配置标签（用于 raw 回退下载）
 MODSECURITY_CONF_SAMPLES_TAG="${MODSECURITY_CONF_SAMPLES_TAG:-v3.0.10}"
+_BAOTA_MODSEC_DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 自定义规则「正文」远程地址（不含 SecGeoLookupDB 头；部署时与本机 GeoIP 路径拼接）。可覆盖为自建 CDN。
+CUSTOM_MODSEC_RULES_STATIC_URL="${CUSTOM_MODSEC_RULES_STATIC_URL:-${SHELLSTACK_BASE_URL:-https://shellstack.910918920801.xyz}/modsecurity/includes/custom_modsec_rules.conf}"
 
 _baota_git_clone_shallow() {
   local url="$1"
@@ -404,6 +407,66 @@ _baota_detect_geoip_db_for_modsec() {
   return 1
 }
 
+_baota_download_custom_modsec_rules_body() {
+  local dest_tmp="$1"
+  local url="${CUSTOM_MODSEC_RULES_STATIC_URL:-}"
+  local ok=0
+  rm -f "$dest_tmp"
+  if [[ -z "$url" ]]; then
+    error "CUSTOM_MODSEC_RULES_STATIC_URL 为空"
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    if wget -q -O "$dest_tmp" --timeout=120 "$url" >>"${LOG_FILE:-/dev/null}" 2>&1 && [[ -s "$dest_tmp" ]]; then
+      ok=1
+    fi
+  fi
+  if [[ "$ok" != "1" ]] && command -v curl >/dev/null 2>&1; then
+    rm -f "$dest_tmp"
+    if curl -fsSL --connect-timeout 15 --max-time 120 "$url" -o "$dest_tmp" >>"${LOG_FILE:-/dev/null}" 2>&1 && [[ -s "$dest_tmp" ]]; then
+      ok=1
+    fi
+  fi
+  if [[ "$ok" != "1" ]] && [[ -f "$_BAOTA_MODSEC_DEPLOY_DIR/custom_modsec_rules.conf" ]]; then
+    if \cp -a "$_BAOTA_MODSEC_DEPLOY_DIR/custom_modsec_rules.conf" "$dest_tmp" && [[ -s "$dest_tmp" ]]; then
+      ok=1
+      log "使用随脚本分发的 custom_modsec_rules.conf（wget/curl 未成功拉取远程时）"
+    fi
+  fi
+  if [[ "$ok" != "1" ]]; then
+    error "无法下载 custom_modsec_rules 正文: $url（可检查网络或设置 CUSTOM_MODSEC_RULES_STATIC_URL）"
+  fi
+}
+
+# 写入 custom_modsec_rules.conf：本机 GeoIP 头 + 远程（或本地回退）规则正文
+baota_write_custom_modsec_rules_conf() {
+  local geoip_db=""
+  geoip_db="$(_baota_detect_geoip_db_for_modsec 2>/dev/null || true)"
+  if [[ -n "$geoip_db" ]]; then
+    log "GeoIP 数据库检测: 使用 $geoip_db（优先 DB-IP Lite）"
+  else
+    warn "未检测到可用 GeoIP 数据库（dbip/GeoLite2），将不写入 SecGeoLookupDB，避免 nginx -t 失败。"
+  fi
+  local body_tmp
+  body_tmp="$(mktemp /tmp/shellstack-custom-modsec-body.XXXXXX)"
+  _baota_download_custom_modsec_rules_body "$body_tmp"
+  {
+    if [[ -n "$geoip_db" ]]; then
+      echo "SecGeoLookupDB $geoip_db"
+    else
+      echo "# SecGeoLookupDB /usr/local/share/GeoIP/dbip-country-lite.mmdb"
+      echo "# 未检测到 GeoIP 库，已注释以避免 nginx 启动失败"
+    fi
+    cat "$body_tmp"
+  } > "$BT_NGINX_CONF_DIR/custom_modsec_rules.conf"
+  rm -f "$body_tmp"
+  log "已写入 $BT_NGINX_CONF_DIR/custom_modsec_rules.conf（规则正文 URL: $CUSTOM_MODSEC_RULES_STATIC_URL）"
+}
+
+# 仅同步 custom_modsec_rules.conf（--update-modesc-conf；入口在 main.sh 已打日志）
+baota_sync_custom_modsec_rules_only() {
+  baota_write_custom_modsec_rules_conf
+}
+
 baota_deploy_modsecurity_conf() {
   if [[ ! -d "$BT_NGINX_CONF_DIR" ]]; then
     error "配置目录不存在: $BT_NGINX_CONF_DIR"
@@ -479,79 +542,7 @@ baota_deploy_modsecurity_conf() {
 
   touch "$BT_WHITELIST_FILE"
 
-  local geoip_db=""
-  geoip_db="$(_baota_detect_geoip_db_for_modsec 2>/dev/null || true)"
-  if [[ -n "$geoip_db" ]]; then
-    log "GeoIP 数据库检测: 使用 $geoip_db（优先 DB-IP Lite）"
-  else
-    warn "未检测到可用 GeoIP 数据库（dbip/GeoLite2），将不写入 SecGeoLookupDB，避免 nginx -t 失败。"
-  fi
-
-  {
-    if [[ -n "$geoip_db" ]]; then
-      echo "SecGeoLookupDB $geoip_db"
-    else
-      echo "# SecGeoLookupDB /usr/local/share/GeoIP/dbip-country-lite.mmdb"
-      echo "# 未检测到 GeoIP 库，已注释以避免 nginx 启动失败"
-    fi
-    cat <<'RULES'
-SecRule REMOTE_ADDR "@geoLookup" "id:10001,phase:1,pass,log"
-
-# nginx-module-vts（与 shellstack_vts.conf 中 location /nginx-vts-status 等一致）
-SecRule REQUEST_URI "@beginsWith /nginx-vts-status" "id:10006,phase:1,nolog,pass,ctl:ruleEngine=Off"
-SecRule REQUEST_URI "@beginsWith /vts_status" "id:10002,phase:1,nolog,pass,ctl:ruleEngine=Off"
-
-# nginx stub_status（与 shellstack_status.conf 默认 URI 一致）
-SecRule REQUEST_URI "@beginsWith /nginx_stub_status" "id:10007,phase:1,nolog,pass,ctl:ruleEngine=Off"
-SecRule REQUEST_URI "@beginsWith /nginx_status" "id:10008,phase:1,nolog,pass,ctl:ruleEngine=Off"
-SecRule REQUEST_URI "@beginsWith /stub_status" "id:10009,phase:1,nolog,pass,ctl:ruleEngine=Off"
-
-# PHP-FPM status：PHP 5.6–8.1（宝塔目录键 56；70–75；80–81）。shellstack tag 为 exporter 的 ${ver//./_}（如 81、8_1）
-SecRule REQUEST_URI "@rx ^/shellstack-fpm-status-(56|5_6|70|71|72|73|74|75|80|81|8_0|8_1)(/|$|\?)" "id:10018,phase:1,nolog,pass,ctl:ruleEngine=Off"
-SecRule REQUEST_URI "@rx ^/phpfpm_(56|70|71|72|73|74|75|80|81)_status" "id:10019,phase:1,nolog,pass,ctl:ruleEngine=Off"
-
-# 帝国 CMS 后台（自用路径加白）
-SecRule REQUEST_URI "@beginsWith /eadmin/ADfr_jiUL5/" "id:10011,phase:1,nolog,pass,ctl:ruleEngine=Off"
-SecRule REQUEST_URI "@beginsWith /e/ADfr_jiUL5/" "id:10012,phase:1,nolog,pass,ctl:ruleEngine=Off"
-SecRule REQUEST_URI "@beginsWith /e/e_DliR28KktG1dpud/" "id:10003,phase:1,nolog,pass,ctl:ruleEngine=Off"
-SecRule REQUEST_URI "@beginsWith /e/jiayou/" "id:10014,phase:1,nolog,pass,ctl:ruleEngine=Off"
-SecRule REQUEST_URI "@beginsWith /eadmin/fengye-123/" "id:10015,phase:1,nolog,pass,ctl:ruleEngine=Off"
-SecRule REQUEST_URI "@beginsWith /e/fengye/" "id:10016,phase:1,nolog,pass,ctl:ruleEngine=Off"
-SecRule REQUEST_URI "@beginsWith /eadmin/fengye/" "id:10017,phase:1,nolog,pass,ctl:ruleEngine=Off"
-
-SecRule REMOTE_ADDR "@ipMatchFromFile /www/server/whitelist.txt" \
-    "id:999,phase:1,allow,msg:'Allow access from whitelist IP'"
-
-SecRule REQUEST_URI "@rx ^/e/member/" \
-    "id:11000,phase:1,deny,status:403,msg:'Access to /e/member/ is denied'"
-
-SecRule REQUEST_URI "@rx ^//e/ShopSys/" \
-    "id:11001,phase:1,deny,status:403,msg:'Access to //e/ShopSys/ is denied'"
-
-SecRule ARGS "^([A-Za-z0-9+/]{64,}=*)$" \
-    "phase:2,deny,id:10004,log,msg:'参数值疑似Base64编码且长度超过64'"
-
-SecRule ARGS "^[A-Fa-f0-9]{64,}$" \
-    "phase:2,deny,id:10005,log,msg:'参数值疑似十六进制编码且长度超过64'"
-
-SecAction "id:1001,phase:1,nolog,pass,setvar:tx.html_rate_limit=2"
-SecRule REQUEST_URI "@endsWith .html" "id:1002,phase:2,t:none,pass,nolog,setvar:ip.html_request_counter=+1,expirevar:ip.html_request_counter=2"
-SecRule IP:html_request_counter "@gt 2" "id:1003,phase:2,log,deny,status:429,msg:'Too many requests for .html files from this IP',setvar:ip.html_exceed_counter=+1,expirevar:ip.html_exceed_counter=3600"
-
-SecRule IP:html_exceed_counter "@ge 3" "id:1004,phase:2,log,deny,status:403,msg:'IP temporarily banned for excessive requests to .html files',setvar:ip.block_time=+1,expirevar:ip.block_time=300,setvar:ip.html_exceed_counter=0"
-SecRule IP:block_time "@ge 2" "id:1005,phase:1,log,deny,status:403,msg:'IP is banned for 5 minutes'"
-
-SecRule RESPONSE_STATUS "@in 400,403,404,405,429,503" \
-    "id:2001,phase:3,pass,nolog,setvar:ip.error_request_counter=+1,expirevar:ip.error_request_counter=180"
-
-SecRule IP:error_request_counter "@gt 15" \
-    "id:2002,phase:3,log,deny,status:403,msg:'Too many error requests in 3 minutes , IP temporarily banned',setvar:ip.block_time=+1,expirevar:ip.block_time=3600,setvar:ip.error_request_counter=0"
-
-SecRule IP:block_time "@ge 1" \
-    "id:2003,phase:1,log,deny,status:403,msg:'IP is banned for 1 hour due to excessive error requests'"
-RULES
-  } > "$BT_NGINX_CONF_DIR/custom_modsec_rules.conf"
-  log "已写入 $BT_NGINX_CONF_DIR/custom_modsec_rules.conf"
+  baota_write_custom_modsec_rules_conf
 
   _baota_inject_shellstack_http_block_in_nginx_conf
   _baota_inject_modsecurity_off_phpmyadmin_vhosts

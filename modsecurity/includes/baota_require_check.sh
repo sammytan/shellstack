@@ -69,3 +69,11 @@ shellstack_require_baota_btwaf_for_modsecurity_flags() {
 
   log "环境检查: 已检测到宝塔面板与 BTwaf，继续执行宝塔相关选项。"
 }
+
+# --update-modesc-conf：仅需宝塔面板与可解析的 nginx 配置目录（不要求已装 BTwaf）
+shellstack_require_baota_panel_for_modsec_conf_sync() {
+  if ! _shellstack_detect_baota_panel; then
+    error "未检测到宝塔 Linux 面板；--update-modesc-conf 需在宝塔环境中执行（期望 /www/server/panel 等）。"
+  fi
+  log "环境检查: 已检测到宝塔面板；将仅写入 custom_modsec_rules.conf。"
+}

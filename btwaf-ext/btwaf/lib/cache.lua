@@ -10,23 +10,91 @@
 -- 若早于 WAF 命中并 ngx.exit，会跳过宝塔整段防火墙逻辑（与「仅缓存已放行响应」相悖）。
 -- 关闭响应头：SHELLSTACK_CACHE_HEADERS=0
 -- 排障：每请求 NOTICE 日志 SHELLSTACK_CACHE_TRACE=1（须 nginx env）
--- Redis：默认 127.0.0.1:6379；可设 SHELLSTACK_REDIS_HOST / SHELLSTACK_REDIS_PORT / SHELLSTACK_REDIS_DB（nginx 主配置须 env 指令声明）
+-- Redis：默认见 shellstack_cache_config.redis；环境变量可覆盖（SHELLSTACK_REDIS_*，nginx 主配置须 env 指令声明）
 local redis_ok, redis = pcall(require, "resty.redis")
 local cjson = require "cjson"
+local C = require "shellstack_cache_config"
+
+local CACHE_KEY_PREFIX = (type(C.key_prefix) == "string" and C.key_prefix ~= "") and C.key_prefix or "btwaf_cms_cache:"
+local PAGE_CACHE_TTL_SECONDS = tonumber(C.page_ttl_seconds) or 180
+local PAGE_CACHE_SIGN_COMPONENTS = (type(C.sign_components) == "table" and C.sign_components) or { "site", "uri", "args" }
+local PAGE_CACHE_HTML_PATH_HINTS = (type(C.html_path_hints) == "table" and C.html_path_hints) or {}
+local PAGE_CACHE_URI_PREFIX_SKIP = (type(C.uri_prefix_skip) == "table" and C.uri_prefix_skip) or {}
+local PAGE_CACHE_URI_SUFFIX_SKIP = (type(C.uri_suffix_skip) == "table" and C.uri_suffix_skip) or {}
+local PAGE_CACHE_HONOR_NGINX_SKIP_CACHE = C.honor_nginx_skip_cache == true
+local PAGE_CACHE_LEGACY_HASH_KEY = type(C.legacy_hash_key) == "string" and C.legacy_hash_key or "btwaf_cms_cache"
+
+local PAGE_CACHE_HEADER_SKIP = {}
+do
+    local list = C.response_header_skip
+    if type(list) == "table" then
+        for _, name in ipairs(list) do
+            if type(name) == "string" and name ~= "" then
+                PAGE_CACHE_HEADER_SKIP[string.lower(name)] = true
+            end
+        end
+    end
+    if next(PAGE_CACHE_HEADER_SKIP) == nil then
+        for _, name in ipairs({
+            "transfer-encoding",
+            "content-length",
+            "content-encoding",
+            "content-disposition",
+            "connection",
+            "keep-alive",
+            "proxy-connection",
+            "upgrade",
+            "trailer",
+            "content-md5",
+        }) do
+            PAGE_CACHE_HEADER_SKIP[name] = true
+        end
+    end
+end
+
+local function env_nonempty(key)
+    local v = os.getenv(key)
+    if v == nil or v == "" then
+        return nil
+    end
+    return v
+end
 
 local function get_redis_config()
-    local h = os.getenv("SHELLSTACK_REDIS_HOST")
-    if not h or h == "" then
-        h = "127.0.0.1"
+    local r = (type(C.redis) == "table") and C.redis or {}
+    local h = env_nonempty("SHELLSTACK_REDIS_HOST")
+    if not h then
+        h = (type(r.host) == "string" and r.host ~= "") and r.host or "127.0.0.1"
     end
-    local port = tonumber(os.getenv("SHELLSTACK_REDIS_PORT") or "") or 6379
-    local db = tonumber(os.getenv("SHELLSTACK_REDIS_DB") or "") or 0
-    return { host = h, port = port, db = db }
+    local port = tonumber(env_nonempty("SHELLSTACK_REDIS_PORT") or "")
+    if not port then
+        port = tonumber(r.port) or 6379
+    end
+    local db_raw = env_nonempty("SHELLSTACK_REDIS_DB")
+    local db = db_raw and tonumber(db_raw) or tonumber(r.db)
+    if db == nil then
+        db = 0
+    end
+    local timeout = tonumber(env_nonempty("SHELLSTACK_REDIS_TIMEOUT") or "")
+    if not timeout then
+        timeout = tonumber(r.timeout) or 1000
+    end
+    if timeout < 1 then
+        timeout = 1000
+    end
+    local password = env_nonempty("SHELLSTACK_REDIS_PASSWORD")
+    if password == nil and r.password ~= nil and r.password ~= "" then
+        password = tostring(r.password)
+    end
+    if password == "" then
+        password = nil
+    end
+    return { host = h, port = port, db = db, timeout = timeout, password = password }
 end
 
 local function redis_endpoint_hint()
     local c = get_redis_config()
-    return " endpoint=" .. c.host .. ":" .. tostring(c.port) .. " (set SHELLSTACK_REDIS_HOST/PORT or start Redis; Baota: software store Redis + bind 127.0.0.1:6379)"
+    return " endpoint=" .. c.host .. ":" .. tostring(c.port) .. " (shellstack_cache_config.redis or SHELLSTACK_REDIS_*; Baota: Redis bind 127.0.0.1:6379)"
 end
 
 -- ngx.timer 内连接失败可能每请求一条，用 spider 字典 90s 内只打一条详细 ERR
@@ -46,33 +114,7 @@ local function cache_log_redis_connect_err(event, err_msg)
     end
 end
 
--- Cache configuration（只改本段即可；无需为 key/TTL/签名设环境变量）
--- Redis **STRING**：key = CACHE_KEY_PREFIX .. md5(签名串)，过期 = SETEX(..., PAGE_CACHE_TTL_SECONDS, ...)
--- PAGE_CACHE_SIGN_COMPONENTS：参与 md5 的段，按顺序用 | 拼接。可选：
---   "site"|"server"|"domain"|"domain_server" → cache_page_site()
---   "uri" → ngx.var.uri
---   "args"|"query" → ngx.var.args
---   "ua"|"user_agent" → 与官方 waf 一致（无则 btwaf_null）；不需要 UA 分桶时从表中删掉 "ua" 即可
---   "referer"|"referrer" → ngx.var.http_referer（无则空串）
---   "headers" 或 "headers:all"|"headers:*" → 全部请求头（名小写、名字典序，多值逗号拼接）
---   "headers:cookie,accept-language" → 仅列出头（名小写后字典序；缺省头按空值参与签名）
-local CACHE_KEY_PREFIX = "btwaf_cms_cache:"
-local PAGE_CACHE_TTL_SECONDS = 180
-local PAGE_CACHE_SIGN_COMPONENTS = { "site", "uri", "args" }
--- 无扩展名 URL 在误标 application/octet-stream 时按「网页」做路径兜底（子串匹配 ngx.var.uri，plain find）。
--- 注意：此表 **不会** 禁止 Redis 缓存；若要不缓存某目录，请用下方 PAGE_CACHE_URI_PREFIX_SKIP。
--- 默认含 "/e/" 兼容常见帝国 CMS 伪静态；若站点不用可删掉或换成实际前缀（如 "/yourapp/extend/"）。
-local PAGE_CACHE_HTML_PATH_HINTS = { "/e/" }
--- 整页缓存 **跳过** 的 URI 前缀：ngx.var.uri 必须以该项开头（纯字符串，区分大小写）。access 不读 Redis、body 不写 Redis。
--- 统计/静态目录常见：/tjcss/、/tjjs/；不需要则改为 {}。
-local PAGE_CACHE_URI_PREFIX_SKIP = { "/tjcss/", "/tjjs/" }
--- 可选：按 URI 后缀跳过（如 ".json"）。默认空；填 { ".js" } 会跳过所有 .js（影响面大）。
-local PAGE_CACHE_URI_SUFFIX_SKIP = {}
--- 是否与 Nginx 变量 $skip_cache 联动。宝塔里 $skip_cache 主要给 **FastCGI 缓存**（fastcgi_no_cache / fastcgi_cache_bypass）用。
--- 默认 **false**：Redis 整页缓存与 FastCGI 缓存**解耦**，二者可同时开；POST/带 Cookie 等仍可按你站点规则绕过 FastCGI，不影响 ShellStack 读写 Redis。
--- 若希望 Redis 与 FastCGI **共用同一套绕过条件**，改为 true。
--- 仅跳过 Redis、不动 FastCGI 时：在 Nginx 里对特定 location `set $shellstack_skip_cache 1;`（须先在 server 里 `set $shellstack_skip_cache 0;` 初始化）。
-local PAGE_CACHE_HONOR_NGINX_SKIP_CACHE = false
+-- 页缓存键前缀、TTL、签名段、跳过规则等：**lib/shellstack_cache_config.lua**（本文件仅引用）
 
 local redis_missing_logged = false
 
@@ -313,19 +355,7 @@ local function cache_page_field_hex_for(site, uri, args, explicit_ua, opts)
     return ngx.md5(cache_field_signing_string_from_ctx(ctx))
 end
 
--- body_filter 里 whole 多为已解压正文，但 ngx.header 可能仍带 gzip / attachment，命中时若照搬会导致浏览器乱码或「变成下载」
-local PAGE_CACHE_HEADER_SKIP = {
-    ["transfer-encoding"] = true,
-    ["content-length"] = true,
-    ["content-encoding"] = true,
-    ["content-disposition"] = true,
-    ["connection"] = true,
-    ["keep-alive"] = true,
-    ["proxy-connection"] = true,
-    ["upgrade"] = true,
-    ["trailer"] = true,
-    ["content-md5"] = true,
-}
+-- 响应头跳过列表由 shellstack_cache_config.response_header_skip 生成 PAGE_CACHE_HEADER_SKIP
 
 local function page_cache_header_should_skip(name)
     local k = string.lower(tostring(name or ""))
@@ -763,6 +793,29 @@ local function cache_log_op(event, ...)
     end
 end
 
+-- 连接成功后：AUTH（若配置了密码）→ SELECT db
+local function redis_auth_and_select(client, cfg, log_errors)
+    if type(cfg.password) == "string" and cfg.password ~= "" then
+        local ok_a, err_a = client:auth(cfg.password)
+        if not ok_a then
+            if log_errors then
+                cache_log(ngx.ERR, "auth_fail", err_a or "")
+            end
+            return false
+        end
+    end
+    if cfg.db and cfg.db > 0 then
+        local ok_db, err_db = client:select(cfg.db)
+        if not ok_db then
+            if log_errors then
+                cache_log(ngx.ERR, "select_db_fail", err_db or "")
+            end
+            return false
+        end
+    end
+    return true
+end
+
 local function redis_available()
     if redis_ok and redis then
         return true
@@ -785,16 +838,13 @@ local function get_redis_client_quiet()
     end
     local cfg = get_redis_config()
     local client = redis:new()
-    client:set_timeout(1000)
+    client:set_timeout(cfg.timeout)
     local ok, err = client:connect(cfg.host, cfg.port)
     if not ok then
         return nil
     end
-    if cfg.db and cfg.db > 0 then
-        local ok_db, err_db = client:select(cfg.db)
-        if not ok_db then
-            return nil
-        end
+    if not redis_auth_and_select(client, cfg, false) then
+        return nil
     end
     return client
 end
@@ -806,19 +856,15 @@ local function get_redis_client()
     end
     local cfg = get_redis_config()
     local client = redis:new()
-    client:set_timeout(1000) -- 1秒超时
+    client:set_timeout(cfg.timeout)
     cache_log(ngx.INFO, "connect_try", cfg.host, ":", cfg.port)
     local ok, err = client:connect(cfg.host, cfg.port)
     if not ok then
         cache_log(ngx.ERR, "connect_fail", err or "", redis_endpoint_hint())
         return nil
     end
-    if cfg.db and cfg.db > 0 then
-        local ok_db, err_db = client:select(cfg.db)
-        if not ok_db then
-            cache_log(ngx.ERR, "select_db_fail", err_db or "")
-            return nil
-        end
+    if not redis_auth_and_select(client, cfg, true) then
+        return nil
     end
     cache_log(ngx.INFO, "connect_ok", "connected")
     return client
@@ -903,7 +949,7 @@ end
 local function clear_all_cache()
     local client = get_redis_client()
     if not client then return end
-    client:del("btwaf_cms_cache")
+    client:del(PAGE_CACHE_LEGACY_HASH_KEY)
     local keys, err = client:keys(CACHE_KEY_PREFIX .. "*")
     if keys and type(keys) == "table" then
         for _, key in ipairs(keys) do
@@ -927,14 +973,14 @@ local function async_redis_setex_page(premature, redis_key, ttl_sec, value)
     if not redis_available() then return end
     local cfg = get_redis_config()
     local red = redis:new()
-    red:set_timeout(1000)
+    red:set_timeout(cfg.timeout)
     local ok, err = red:connect(cfg.host, cfg.port)
     if not ok then
         cache_log_redis_connect_err("async_connect_fail", err or "connect failed")
         return
     end
-    if cfg.db and cfg.db > 0 then
-        red:select(cfg.db)
+    if not redis_auth_and_select(red, cfg, false) then
+        return
     end
     local ttl = tonumber(ttl_sec) or PAGE_CACHE_TTL_SECONDS
     if ttl < 1 then
