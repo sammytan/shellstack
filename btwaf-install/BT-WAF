@@ -1,0 +1,435 @@
+#!/www/server/panel/pyenv/bin/python
+# coding: utf-8
+# +-------------------------------------------------------------------
+# | 宝塔Linux面板
+# +-------------------------------------------------------------------
+# | Copyright (c) 2015-2099 宝塔软件(http://bt.cn) All rights reserved.
+# +-------------------------------------------------------------------
+# | Author:  <lkq@bt.cn>
+# +-------------------------------------------------------------------
+# +--------------------------------------------------------------------
+# |   宝塔防火墙计划任务-主要用途：发送邮件、等任务
+# +--------------------------------------------------------------------
+import os,sys
+import totle_db2
+import threading
+import time,json
+os.chdir('/www/server/panel')
+if not 'class/' in sys.path:
+    sys.path.insert(0,'class/')
+import public
+btwaf_path='/www/server/btwaf/'
+thread_dict={}
+def M2(table):
+    with totle_db2.Sql() as sql:
+        return sql.table(table)
+
+def get_msg_obj(msg):
+    '''
+        @name 获取消息对象
+        @param msg str 消息内容
+        @return dict
+    '''
+    #判断/www/server/panel/class/msg 目录是否存在
+    if not os.path.exists('/www/server/panel/class/msg'):
+        return False,None
+    obj=public.init_msg(msg)
+    if obj:
+        return True,obj
+    return False,None
+
+def get_msg_send_data(config):
+    '''
+        @name 获取消息发送数据
+        @param cc int cc攻击次数
+        @param attack int 攻击次数
+        @return dict
+    '''
+    cc = config['msg_send']['cc']
+    attack = config['msg_send']['attack']
+    '''
+    attack  漏洞攻击告警: 包括SQL注入、XSS攻击、命令执行、恶意下载、恶意爬虫、恶意扫描 
+    cc 包含 基础CC、人机验证 IDC拦截 堡塔云端恶意IP 堡塔恶意IP情报库IP 假蜘蛛拦截  
+    upload 包含 包含webshell防御、from-data拦截
+    drop_abroad  禁国外增强封锁
+    customize 自定义规则
+    user_agent  黑名单中只有UA黑名单才会记录日志
+    '''
+    # 如果 config['msg_send'] 中有 upload
+    upload = False
+    abroad = False
+    customize = False
+    uablack = False
+    if 'upload' in config['msg_send']:
+        upload = config['msg_send']['upload']
+    if 'abroad' in config['msg_send']:
+        abroad = config['msg_send']['abroad']
+    if 'customize' in config['msg_send']:
+        customize = config['msg_send']['customize']
+    if 'uablack' in config['msg_send']:
+        uablack = config['msg_send']['uablack']
+
+    data={"attack_count":0,"attack_top_ip":[],"cc_count":0,"cc_top_ip":[],"upload_count":0,"upload_top_ip":[],"abroad_count":0,"abroad_top_ip":[],"customize_count":0,"customize_top_ip":[],"uablack_count":0,"uablack_top_ip":[]}
+    if cc==0 and attack==0:
+        return data
+    if cc==False and attack==False:
+        return data
+    if cc==1 or cc==True:
+        cc=1
+    if attack==1 or attack==True:
+        attack=1
+    #获取消息发送数据
+    end_time = int(time.time())
+    start_time = end_time - 600
+    if attack:
+        count = M2('totla_log').field('time,ip').where("time>? and time<? and value_risk!=? and value_risk!=? and value_risk!=? and value_risk!=? and value_risk!=?",(start_time, end_time, "cc","drop_abroad","upload","customize","user_agent")).limit("1000").order('id desc').select()
+        if type(count) == str:
+            return data
+        if count:
+            data['attack_count']=len(count)
+            tmp_ip = {}
+            for i in count:
+                tmp_ip[i['ip']] = tmp_ip.get(i['ip'], 0) + 1
+            #取tmp_ip 前10个
+            tmp_ip = sorted(tmp_ip.items(), key=lambda x: x[1], reverse=True)
+            tmp2 = {}
+            count_ip= 0
+            for i in tmp_ip:
+                tmp2[i[0]] = i[1]
+                data['attack_top_ip'].append({"ip":i[0],"count":i[1]})
+                count_ip += 1
+                if count_ip >= 10:
+                    break
+    if cc:
+        count = M2('totla_log').field('time,ip').where("time>? and time<? and value_risk=?", (start_time, end_time, "cc")).limit("1000").order('id desc').select()
+        if type(count) == str:
+            return data
+        if count:
+            data['cc_count']=len(count)
+            tmp_ip = {}
+            for i in count:
+                tmp_ip[i['ip']] = tmp_ip.get(i['ip'], 0) + 1
+            #取tmp_ip 前10个
+            tmp_ip = sorted(tmp_ip.items(), key=lambda x: x[1], reverse=True)
+            tmp2 = {}
+            count_ip= 0
+            for i in tmp_ip:
+                tmp2[i[0]] = i[1]
+                data['cc_top_ip'].append({"ip":i[0],"count":i[1]})
+                count_ip += 1
+                if count_ip >= 10:
+                    break
+    if upload:
+        count = M2('totla_log').field('time,ip').where("time>? and time<? and value_risk=?", (start_time, end_time, "upload")).limit("1000").order('id desc').select()
+        if type(count) == str:
+            return data
+        if count:
+            data['upload_count'] += len(count)
+            tmp_ip = {}
+            for i in count:
+                tmp_ip[i['ip']] = tmp_ip.get(i['ip'], 0) + 1
+            #取tmp_ip 前10个
+            tmp_ip = sorted(tmp_ip.items(), key=lambda x: x[1], reverse=True)
+            tmp2 = {}
+            count_ip= 0
+            for i in tmp_ip:
+                tmp2[i[0]] = i[1]
+                data['upload_top_ip'].append({"ip":i[0],"count":i[1]})
+                count_ip += 1
+                if count_ip >= 10:
+                    break
+    if abroad:
+        count = M2('totla_log').field('time,ip').where("time>? and time<? and value_risk=?", (start_time, end_time, "drop_abroad")).limit("1000").order('id desc').select()
+        if type(count) == str:
+            return data
+        if count:
+            data['abroad_count'] += len(count)
+            tmp_ip = {}
+            for i in count:
+                tmp_ip[i['ip']] = tmp_ip.get(i['ip'], 0) + 1
+            #取tmp_ip 前10个
+            tmp_ip = sorted(tmp_ip.items(), key=lambda x: x[1], reverse=True)
+            tmp2 = {}
+            count_ip= 0
+            for i in tmp_ip:
+                tmp2[i[0]] = i[1]
+                data['abroad_top_ip'].append({"ip":i[0],"count":i[1]})
+                count_ip += 1
+                if count_ip >= 10:
+                    break
+    if customize:
+        count = M2('totla_log').field('time,ip').where("time>? and time<? and value_risk=?", (start_time, end_time, "customize")).limit("1000").order('id desc').select()
+        if type(count) == str:
+            return data
+        if count:
+            data['customize_count'] += len(count)
+            tmp_ip = {}
+            for i in count:
+                tmp_ip[i['ip']] = tmp_ip.get(i['ip'], 0) + 1
+            #取tmp_ip 前10个
+            tmp_ip = sorted(tmp_ip.items(), key=lambda x: x[1], reverse=True)
+            tmp2 = {}
+            count_ip= 0
+            for i in tmp_ip:
+                tmp2[i[0]] = i[1]
+                data['customize_top_ip'].append({"ip":i[0],"count":i[1]})
+                count_ip += 1
+                if count_ip >= 10:
+                    break
+    if uablack:
+        count = M2('totla_log').field('time,ip').where("time>? and time<? and value_risk=?", (start_time, end_time, "user_agent")).limit("1000").order('id desc').select()
+        if type(count) == str:
+            return data
+        if count:
+            data['uablack_count'] += len(count)
+            tmp_ip = {}
+            for i in count:
+                tmp_ip[i['ip']] = tmp_ip.get(i['ip'], 0) + 1
+            #取tmp_ip 前10个
+            tmp_ip = sorted(tmp_ip.items(), key=lambda x: x[1], reverse=True)
+            tmp2 = {}
+            count_ip= 0
+            for i in tmp_ip:
+                tmp2[i[0]] = i[1]
+                data['uablack_top_ip'].append({"ip":i[0],"count":i[1]})
+                count_ip += 1
+                if count_ip >= 10:
+                    break
+    return data
+
+
+def get_send_data(send_data):
+    '''
+        @name 获取发送数据
+        @param send_data dict 发送数据
+        @return str
+    '''
+    msg = '防火墙拦截记录告警: \n'
+    if send_data['cc_count'] > 0:
+        msg += '拦截CC攻击次数：' + str(send_data['cc_count']) + '\n'
+        msg += 'CC攻击IP：\n'
+        count = 1
+        for i in send_data['cc_top_ip']:
+            msg +="  排名第"+str(count)+"位:"+i['ip'] + ' ' + str(i['count']) + '次\n'
+            count += 1
+    if send_data['attack_count'] > 0:
+        msg += '拦截恶意攻击次数：' + str(send_data['attack_count']) + '\n'
+        msg += '恶意攻击IP Top10：\n'
+        count = 1
+        for i in send_data['attack_top_ip']:
+            msg +="  排名第"+str(count)+"位:"+i['ip'] + ' ' + str(i['count']) + '次\n'
+            count += 1
+    if send_data['upload_count'] > 0:
+        msg += '拦截恶意文件上传次数：' + str(send_data['upload_count']) + '\n'
+        msg += '恶意文件上传IP Top10：\n'
+        count = 1
+        for i in send_data['upload_top_ip']:
+            msg +="  排名第"+str(count)+"位:"+i['ip'] + ' ' + str(i['count']) + '次\n'
+            count += 1
+    if send_data['abroad_count'] > 0:
+        msg += '拦截国外IP次数：' + str(send_data['abroad_count']) + '\n'
+        msg += '国外IP Top10：\n'
+        count = 1
+        for i in send_data['abroad_top_ip']:
+            msg +="  排名第"+str(count)+"位:"+i['ip'] + ' ' + str(i['count']) + '次\n'
+            count += 1
+
+    if send_data['customize_count'] > 0:
+        msg += '拦截自定义规则次数：' + str(send_data['customize_count']) + '\n'
+        msg += '自定义规则 Top10：\n'
+        count = 1
+        for i in send_data['customize_top_ip']:
+            msg +="  排名第"+str(count)+"位:"+i['ip'] + ' ' + str(i['count']) + '次\n'
+            count += 1
+    if send_data['uablack_count'] > 0:
+        msg += '拦截UA黑名单次数：' + str(send_data['uablack_count']) + '\n'
+        msg += 'UA黑名单 Top10：\n'
+        count = 1
+        for i in send_data['uablack_top_ip']:
+            msg +="  排名第"+str(count)+"位:"+i['ip'] + ' ' + str(i['count']) + '次\n'
+            count += 1
+
+    msg+="\n告警时间："+time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(time.time()))+"\n（最多十分钟告警一次）"
+    return msg
+
+def msg_send():
+    while True:
+        try:
+            time.sleep(120)
+            if os.path.exists(btwaf_path + 'config.json'):
+                config = json.loads(public.readFile(btwaf_path + 'config.json'))
+                if not 'msg_send' in config or not 'open' in config['msg_send'] or config['msg_send']['open'] == False:
+                    time.sleep(120)
+                    continue
+                if not 'attack' in config['msg_send'] or not 'cc' in config['msg_send'] or not 'send_type' in config['msg_send']:
+                    time.sleep(120)
+                    continue
+                send_type=config['msg_send']['send_type']
+                if send_type=="":
+                    time.sleep(120)
+                    continue
+                if not send_type in ['feishu',"dingding","weixin"]:
+                    time.sleep(120)
+                    continue
+
+
+                status,msg_send_obj=get_msg_obj(send_type)
+                if not status:
+                    time.sleep(120)
+                    continue
+                send_data=get_msg_send_data(config)
+                print(send_data)
+                if send_data['cc_count']==0 and send_data['attack_count']==0 and send_data['upload_count']==0 and send_data['abroad_count']==0 and send_data['customize_count']==0 and send_data['uablack_count']==0:
+                    time.sleep(120)
+                    continue
+                msg=get_send_data(send_data)
+                if msg_send_obj:
+                    status=msg_send_obj.send_msg(msg)
+            time.sleep(500)
+        except:
+            time.sleep(120)
+
+def clear_upload_tmp():
+    while True:
+        try:
+            time.sleep(120)
+            import pwd
+            for  filenames in os.listdir("/tmp"):
+                if len(filenames)==9:
+                    if not filenames.startswith("php"):
+                        continue
+                    if os.stat("/tmp/"+filenames).st_mtime < time.time()-3600:
+                        uid=os.stat("/tmp/"+filenames).st_uid
+                        if uid == pwd.getpwnam("www").pw_uid:
+                            os.remove("/tmp/"+filenames)
+            time.sleep(3600)
+        except:
+            time.sleep(3600)
+
+
+
+def clear_total_monitor_ip():
+    while True:
+        try:
+            time.sleep(86400)
+            flag=False
+            import totle_db3_new
+            end_timeStamp=time.strftime("%Y-%m-%d", time.localtime(int(time.time())-86400*180))
+            count=totle_db3_new.Sql().dbfile("total_monitor").table("ip_total").where("date<=?",(end_timeStamp,)).count()
+            if type(count)==str:
+                return
+            if count>0:
+                flag=True
+                totle_db3_new.Sql().dbfile("total_monitor").table("ip_total").where("date<=?",(end_timeStamp,)).delete()
+
+            count=totle_db3_new.Sql().dbfile("total_monitor").table("url_total").where("date<=?",(end_timeStamp,)).count()
+            if type(count)==str:
+                return
+            if count>0:
+                flag=True
+                totle_db3_new.Sql().dbfile("total_monitor").table("url_total").where("date<=?",(end_timeStamp,)).delete()
+
+            #第一次清理
+            if not os.path.exists("/www/server/panel/data/btwaf_total_monitor_clear_2.json"):
+                for i in range(2,180):
+                    end_timeStamp=time.strftime("%Y-%m-%d", time.localtime(int(time.time())-86400*i))
+                    count=totle_db3_new.Sql().dbfile("total_monitor").table("ip_total").where("date=?",(end_timeStamp,)).count()
+                    if type(count)==str:
+                        continue
+                    if count<500:
+                        continue
+                    flag=True
+                    #获取前1000的id
+                    ids=totle_db3_new.Sql().dbfile("total_monitor").table("ip_total").where("date=?",(end_timeStamp,)).limit("500").order("count desc").field("id").select()
+                    id_list=[]
+                    for id in ids:
+                        id_list.append(id['id'])
+                    id_str=",".join([str(i) for i in id_list])
+                    totle_db3_new.Sql().dbfile("total_monitor").table("ip_total").where("date=? AND id NOT IN ({})".format(id_str),(end_timeStamp,)).delete()
+                    print("清理total_monitor {} 完成".format(end_timeStamp))
+                public.writeFile("/www/server/panel/data/btwaf_total_monitor_clear_2.json", "{}")
+                if flag:
+                    totle_db3_new.Sql().dbfile("total_monitor").execute("VACUUM")
+            #后每天清理一次
+            end_timeStamp = time.strftime("%Y-%m-%d", time.localtime(int(time.time()) - 86400*2))
+            count = totle_db3_new.Sql().dbfile("total_monitor").table("ip_total").where("date=?", (end_timeStamp,)).count()
+            if type(count) == str:
+                return
+            if count < 500:
+                return
+            # 获取前1000的ids
+            ids = totle_db3_new.Sql().dbfile("total_monitor").table("ip_total").where("date=?", (end_timeStamp,)).limit("500").order("count desc").field("id").select()
+            id_list = []
+            for id in ids:
+                id_list.append(id['id'])
+            id_str = ",".join([str(i) for i in id_list])
+            totle_db3_new.Sql().dbfile("total_monitor").table("ip_total").where("date=? AND id NOT IN ({})".format(id_str), (end_timeStamp,)).delete()
+            # 整理数据库文件大小
+            totle_db3_new.Sql().dbfile("total_monitor").execute("VACUUM")
+        except:
+            time.sleep(86400)
+
+
+def clear_total_monitor_url():
+    while True:
+        try:
+            time.sleep(86400)
+            import totle_db3_new
+            end_timeStamp=time.strftime("%Y-%m-%d", time.localtime(int(time.time())-86400*180))
+            count=totle_db3_new.Sql().dbfile("total_report").table("request_total").where("date<=?",(end_timeStamp,)).count()
+            flag=False
+            if type(count)==str:
+                return
+            if count>0:
+                flag=True
+                totle_db3_new.Sql().dbfile("total_report").table("request_total").where("date<=?",(end_timeStamp,)).delete()
+            end_timeStamp = time.strftime("%Y-%m-%d", time.localtime(int(time.time()) - 86400 * 3))
+            count = totle_db3_new.Sql().dbfile("total_report").table("request_total").where("date<=? and server_name!='global'",(end_timeStamp,)).count()
+            if count>100:
+                flag=True
+                totle_db3_new.Sql().dbfile("total_report").table("request_total").where("date<=? and server_name!='global'",(end_timeStamp,)).delete()
+            if flag:
+                totle_db3_new.Sql().dbfile("total_report").execute("VACUUM")
+        except:
+            time.sleep(86400)
+
+
+def run_thread():
+    '''
+        @name 运行线程集合
+        @return None
+    '''
+
+    thread_list = {
+        "msg_send": msg_send,
+        "clear_upload_tmp":clear_upload_tmp,
+        "clear_total_monitor_ip":clear_total_monitor_ip,
+        "clear_total_monitor_url":clear_total_monitor_url
+    }
+    for skey in thread_list.keys():
+            thread_dict[skey] = threading.Thread(target=thread_list[skey])
+            thread_dict[skey].setDaemon(True)
+            thread_dict[skey].start()
+
+    while True:
+        time.sleep(3600)
+
+def main():
+    main_pid = os.path.join('/www/server/panel', 'logs/btwaf_msg.pid')
+    if os.path.exists(main_pid):
+        os.system("kill -9 $(cat {}) &> /dev/null".format(main_pid))
+    pid = os.fork()
+    if pid:
+        sys.exit(0)
+    os.setsid()
+    _pid = os.fork()
+    if _pid:
+        public.writeFile(main_pid, str(_pid))
+        sys.exit(0)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    time.sleep(5)
+    run_thread()
+
+if __name__ == "__main__":
+    main()

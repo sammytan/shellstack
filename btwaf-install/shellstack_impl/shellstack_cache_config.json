@@ -1,0 +1,30 @@
+{
+  "redis": {
+    "host": "127.0.0.1",
+    "port": 6379,
+    "db": 0,
+    "password": "",
+    "timeout": 1000
+  },
+  "key_prefix": "btwaf_cms_cache:",
+  "page_ttl_seconds": 180,
+  "max_ttl": 86400,
+  "sign_components": ["site", "uri", "args"],
+  "html_path_hints": ["/e/"],
+  "uri_prefix_skip": ["/tjcss/", "/tjjs/"],
+  "uri_suffix_skip": [".js"],
+  "honor_nginx_skip_cache": false,
+  "response_header_skip": [
+    "transfer-encoding",
+    "content-length",
+    "content-encoding",
+    "content-disposition",
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "upgrade",
+    "trailer",
+    "content-md5"
+  ],
+  "legacy_hash_key": "btwaf_cms_cache"
+}

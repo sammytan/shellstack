@@ -1,0 +1,10 @@
+{
+	"IP白名单": true,
+	"IP黑名单": true,
+	"URI白名单": true,
+	"URI黑名单": true,
+	"UA白名单": true,
+	"UA黑名单": true,
+	"云端恶意IP库": true,
+	"地区限制": true
+}
